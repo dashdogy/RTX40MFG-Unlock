@@ -1,7 +1,8 @@
 # RTX 40 MFG Unlock for Cyberpunk 2077
 
-Experimental Cyber Engine Tweaks mod providing fixed 2x/3x/4x and Dynamic
-DLSS Frame Generation controls on RTX 40 series GPUs.
+Experimental Cyber Engine Tweaks mod providing fixed 2x through 6x and Dynamic
+DLSS Frame Generation controls on RTX 40 series GPUs. The 5x and 6x modes are
+especially experimental.
 
 This is an unsupported research mod. Modes above 2x may cause artifacts,
 latency, frozen presentation, black screens, or crashes.

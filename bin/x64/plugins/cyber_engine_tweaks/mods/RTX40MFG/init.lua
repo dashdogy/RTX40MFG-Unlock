@@ -1,7 +1,9 @@
 local MOD_NAME = "RTX 40 MFG Unlock"
 local CONFIG_PATH = "config.json"
 local STATUS_PATH = "bridge_status.json"
-local VALID_MULTIPLIERS = { [2] = true, [3] = true, [4] = true }
+local VALID_MULTIPLIERS = {
+    [2] = true, [3] = true, [4] = true, [5] = true, [6] = true
+}
 
 local overlayOpen = false
 local selectedMode = "fixed"
@@ -323,6 +325,18 @@ registerForEvent("onDraw", function()
     ImGui.SameLine()
     if ImGui.RadioButton("4x", selectedMode == "fixed" and selectedMultiplier == 4) then
         chooseFixed(4)
+    end
+    ImGui.SameLine()
+    if ImGui.RadioButton("5x*", selectedMode == "fixed" and selectedMultiplier == 5) then
+        chooseFixed(5)
+    end
+    ImGui.SameLine()
+    if ImGui.RadioButton("6x*", selectedMode == "fixed" and selectedMultiplier == 6) then
+        chooseFixed(6)
+    end
+
+    if selectedMode == "fixed" and selectedMultiplier >= 5 then
+        ImGui.Text("* Experimental")
     end
 
     if selectedMode == "dynamic" then

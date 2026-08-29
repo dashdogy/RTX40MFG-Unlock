@@ -73,6 +73,8 @@ std::wstring gExecutableDirectory;
 
 constexpr uint32_t kRouteLocal = 1u;
 constexpr uint32_t kRouteExternal = 2u;
+constexpr uint32_t kMinimumMultiplier = 2u;
+constexpr uint32_t kMaximumMultiplier = 6u;
 constexpr uint64_t kNotInitializedRetryDelayMs = 500;
 
 struct ControlConfig
@@ -228,7 +230,8 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
 
     const std::string content(data, size);
     ControlConfig parsed{};
-    if (!TryParseUnsigned(content, "multiplier", 2, 4, parsed.multiplier))
+    if (!TryParseUnsigned(content, "multiplier",
+        kMinimumMultiplier, kMaximumMultiplier, parsed.multiplier))
         return false;
 
     size_t modeOffset = 0;
@@ -280,7 +283,7 @@ ControlConfig ReadInitialControl()
     wchar_t value[16]{};
     const DWORD length = GetEnvironmentVariableW(
         L"RTX40_MFG_ACTIVE_MULTIPLIER", value, _countof(value));
-    if (length == 1 && value[0] >= L'2' && value[0] <= L'4')
+    if (length == 1 && value[0] >= L'2' && value[0] <= L'6')
         control.multiplier = static_cast<uint32_t>(value[0] - L'0');
 
     ControlConfig fileControl{};
@@ -337,7 +340,8 @@ ControlSnapshot ReadControlSnapshot()
 
 void PublishLiveBridge(const ControlConfig& control)
 {
-    wchar_t multiplier[2]{ static_cast<wchar_t>(L'0' + std::clamp(control.multiplier, 2u, 4u)), L'\0' };
+    wchar_t multiplier[2]{ static_cast<wchar_t>(L'0' + std::clamp(
+        control.multiplier, kMinimumMultiplier, kMaximumMultiplier)), L'\0' };
     wchar_t target[16]{};
     swprintf_s(target, L"%u", control.dynamicTargetFrameRate);
     SetEnvironmentVariableW(L"RTX40_MFG_ACTIVE_MULTIPLIER", multiplier);
@@ -510,7 +514,8 @@ sl::DLSSGOptions BuildAdjustedOptions(
     {
         adjusted.mode = sl::DLSSGMode::eOn;
         adjusted.numFramesToGenerate =
-            std::clamp(snapshot.control.multiplier, 2u, 4u) - 1;
+            std::clamp(snapshot.control.multiplier,
+                kMinimumMultiplier, kMaximumMultiplier) - 1;
     }
     return adjusted;
 }

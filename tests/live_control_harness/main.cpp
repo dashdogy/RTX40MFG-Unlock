@@ -144,6 +144,40 @@ int wmain()
         || status.find(expectedRetryCount) == std::string::npos)
         return 18;
 
+    if (!WriteControl("fixed", 5, 0))
+        return 25;
+    Sleep(400);
+    sl::DLSSGState fiveXState{};
+    if (getState(viewport, fiveXState, &options) != sl::Result::eOk)
+        return 26;
+    printf_s("experimental 5x actual=%u max-generated=%u\n",
+        fiveXState.numFramesActuallyPresented,
+        fiveXState.numFramesToGenerateMax);
+    if (fiveXState.numFramesActuallyPresented != 5
+        || fiveXState.numFramesToGenerateMax != 5)
+        return 27;
+
+    if (!WriteControl("fixed", 6, 0))
+        return 28;
+    Sleep(400);
+    sl::DLSSGState sixXState{};
+    if (getState(viewport, sixXState, &options) != sl::Result::eOk)
+        return 29;
+    printf_s("experimental 6x actual=%u max-generated=%u\n",
+        sixXState.numFramesActuallyPresented,
+        sixXState.numFramesToGenerateMax);
+    if (sixXState.numFramesActuallyPresented != 6
+        || sixXState.numFramesToGenerateMax != 5)
+        return 30;
+    Sleep(1200);
+    const std::string experimentalStatus = ReadStatus();
+    puts(experimentalStatus.c_str());
+    if (experimentalStatus.find("\"appliedMultiplier\":6") == std::string::npos
+        || experimentalStatus.find("\"actualFramesPresented\":6") == std::string::npos
+        || experimentalStatus.find("\"setOptionsResult\":0") == std::string::npos
+        || experimentalStatus.find("\"pending\":false") == std::string::npos)
+        return 31;
+
     if (!WriteControl("dynamic", 4, 120))
         return 19;
     Sleep(400);
@@ -176,7 +210,7 @@ int wmain()
         || warningStatus.find("\"pending\":false") == std::string::npos)
         return 24;
 
-    puts("LIVE_CONTROL_DYNAMIC_AND_VRAM_WARNING_HARNESS_OK");
+    puts("LIVE_CONTROL_2X_TO_6X_DYNAMIC_AND_VRAM_WARNING_HARNESS_OK");
     if (transientNotInitialized)
         puts("TRANSIENT_ERROR_21_RETRY_HARNESS_OK");
     return 0;
