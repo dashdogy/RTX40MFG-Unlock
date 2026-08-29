@@ -14,7 +14,7 @@ Frame Generation enabled. CET 1.37.1 was used during development.
 Extract `bin` into the Cyberpunk game directory, merge folders, then select a
 mode from the CET overlay. Changes apply live.
 
-## Method
+## How it works
 
 The ASI intercepts `slGetFeatureFunction`, watches modules actually loaded by
 the game, and identifies Streamline/NGX candidates by exports and exact code
@@ -25,17 +25,10 @@ The bridge becomes ready only after the active DLSS-G wrapper and loaded NGX
 module are verified and patched. It then adjusts `slDLSSGSetOptions` and reads
 actual presentation counts through `slDLSSGGetState`.
 
-## Porting
-
-The native method targets Streamline DLSS-G, not Cyberpunk's renderer:
-
-1. Load the DLL early using the target game's mod-loader or proxy mechanism.
-2. Hook its `slGetFeatureFunction` path.
-3. Retain loaded-module discovery and active-provider verification.
-4. Re-derive `kWrapperPattern` and `kNgxPattern` for its exact DLL versions.
-5. Replace the CET configuration/UI and validate 2x/3x/4x plus result 38/39.
-
-The included harness demonstrates the minimum call flow and deferred NGX load.
+The approach targets Streamline DLSS-G rather than Cyberpunk's renderer. In
+another Streamline game, only the early DLL-loading integration, UI, paths, and
+version-specific signatures would need to be adapted. The included harness
+demonstrates the expected call flow and deferred NGX loading.
 
 ## Build
 
