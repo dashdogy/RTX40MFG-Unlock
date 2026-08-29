@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <iterator>
 #include <mutex>
 #include <share.h>
 #include <string>
@@ -25,12 +26,15 @@ FILE* gLog = nullptr;
 std::atomic<uint32_t> gDesiredMultiplier{2};
 std::atomic<bool> gDesiredDynamicMode{false};
 std::atomic<uint32_t> gDynamicTargetFrameRate{0};
+std::atomic<bool> gDynamicExperimental56{false};
 std::atomic<uint64_t> gDesiredRevision{0};
 std::atomic<uint64_t> gAppliedRevision{0};
 std::atomic<uint64_t> gAttemptedRevision{0};
 std::atomic<uint64_t> gLastAttemptTick{0};
 std::atomic<bool> gControlReady{false};
 std::atomic<PFun_slGetFeatureFunction*> gOriginalGetFeatureFunction{nullptr};
+std::atomic<PFun_slSetTag*> gOriginalSetTag{nullptr};
+std::atomic<PFun_slSetTagForFrame*> gOriginalSetTagForFrame{nullptr};
 std::atomic<PFun_slDLSSGSetOptions*> gOriginalSetOptions{nullptr};
 std::atomic<PFun_slDLSSGGetState*> gOriginalGetState{nullptr};
 std::atomic<bool> gSetOptionsHookExposed{false};
@@ -43,6 +47,7 @@ std::atomic<int32_t> gLastGetStateResult{static_cast<int32_t>(sl::Result::eError
 std::atomic<bool> gAppliedDynamicMode{false};
 std::atomic<uint32_t> gAppliedMultiplier{0};
 std::atomic<uint32_t> gAppliedDynamicTargetFrameRate{0};
+std::atomic<bool> gAppliedDynamicExperimental56{false};
 std::atomic<uint32_t> gActualFramesPresented{0};
 std::atomic<uint32_t> gNumFramesToGenerateMax{0};
 std::atomic<uint32_t> gDlssgStatus{0};
@@ -54,6 +59,7 @@ std::atomic<uint64_t> gLiveReapplyCount{0};
 std::atomic<uint64_t> gNotInitializedRetryCount{0};
 std::atomic<bool> gDllNotificationRegistered{false};
 std::atomic<bool> gLiveHookInstalled{false};
+std::atomic<bool> gUiTagHookInstalled{false};
 std::atomic<uint32_t> gLoadedWrapperCandidates{0};
 std::atomic<uint32_t> gPatchedWrapperCandidates{0};
 std::atomic<uint32_t> gLoadedNgxCandidates{0};
@@ -63,10 +69,27 @@ std::atomic<uint32_t> gNgxRouteBits{0};
 std::atomic<bool> gActiveWrapperObserved{false};
 std::atomic<bool> gActiveWrapperPatched{false};
 std::atomic<uintptr_t> gActiveWrapperBase{0};
+std::atomic<uint32_t> gLastOptionsViewport{UINT32_MAX};
+std::atomic<uint32_t> gGameOptionsStructVersion{0};
+std::atomic<uint32_t> gGameColorWidth{0};
+std::atomic<uint32_t> gGameColorHeight{0};
+std::atomic<uint32_t> gGameHudlessBufferFormat{0};
+std::atomic<uint32_t> gGameUiBufferFormat{0};
+std::atomic<bool> gGameUiRecompositionEnabled{false};
+std::atomic<bool> gUiInputsReady{false};
+std::atomic<bool> gAppliedUiRecompositionEnabled{false};
+std::atomic<bool> gAppliedUiRecompositionForced{false};
+std::atomic<uint64_t> gSetTagCalls{0};
+std::atomic<uint64_t> gSetTagForFrameCalls{0};
+std::atomic<uint32_t> gRealFpsMilli{0};
+std::atomic<uint32_t> gDlssFpsMilli{0};
+std::atomic<uint32_t> gFpsSampleWindowMs{0};
+std::atomic<uint64_t> gFpsSampleTick{0};
 std::atomic<bool> gLogReady{false};
 std::mutex gStreamlineCallMutex;
 std::mutex gLastOptionsMutex;
 std::mutex gModuleMutex;
+std::mutex gUiTagMutex;
 std::wstring gConfigPath;
 std::wstring gStatusPath;
 std::wstring gExecutableDirectory;
@@ -75,13 +98,17 @@ constexpr uint32_t kRouteLocal = 1u;
 constexpr uint32_t kRouteExternal = 2u;
 constexpr uint32_t kMinimumMultiplier = 2u;
 constexpr uint32_t kMaximumMultiplier = 6u;
+constexpr uint8_t kStandardMaximumGeneratedFrames = 3u;
+constexpr uint8_t kExperimentalMaximumGeneratedFrames = 5u;
 constexpr uint64_t kNotInitializedRetryDelayMs = 500;
+constexpr uint64_t kUiTagFreshnessMs = 2500;
 
 struct ControlConfig
 {
     uint32_t multiplier = 2;
     bool dynamic = false;
     uint32_t dynamicTargetFrameRate = 0;
+    bool dynamicExperimental56 = false;
 };
 
 struct ControlSnapshot
@@ -104,14 +131,56 @@ struct ModuleRecord
     bool wrapperExport = false;
     bool wrapperCandidate = false;
     bool wrapperPatched = false;
+    uint8_t* wrapperMaximumImmediate = nullptr;
     bool ngxExport = false;
     bool ngxCandidate = false;
     bool ngxPatched = false;
     bool inventoryLogged = false;
 };
 
+struct UiResourceTagState
+{
+    bool active = false;
+    sl::ResourceLifecycle lifecycle = sl::ResourceLifecycle::eOnlyValidNow;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t top = 0;
+    uint32_t left = 0;
+    uint32_t format = 0;
+    uint64_t lastSeenTick = 0;
+};
+
+struct UiViewportTagState
+{
+    uint32_t viewport = UINT32_MAX;
+    UiResourceTagState hudless{};
+    UiResourceTagState uiAlpha{};
+    UiResourceTagState uiColorAlpha{};
+};
+
+struct UiInputSnapshot
+{
+    bool hudless = false;
+    bool uiAlpha = false;
+    bool uiColorAlpha = false;
+    bool dimensionsKnown = false;
+    bool dimensionsMatch = false;
+    bool ready = false;
+    uint32_t hudlessWidth = 0;
+    uint32_t hudlessHeight = 0;
+    uint32_t uiWidth = 0;
+    uint32_t uiHeight = 0;
+    uint32_t uiFormat = 0;
+    uint64_t oldestAgeMs = 0;
+};
+
 LastGameOptions gLastGameOptions;
 std::vector<ModuleRecord> gModuleRecords;
+std::vector<UiViewportTagState> gUiViewportTags;
+LARGE_INTEGER gFpsCounterFrequency{};
+LARGE_INTEGER gFpsWindowStart{};
+uint64_t gFpsWindowRealFrames = 0;
+uint64_t gFpsWindowPresentedFrames = 0;
 
 void ObserveActiveWrapperProvider(void* function);
 
@@ -131,6 +200,265 @@ void Log(const wchar_t* format, ...)
         fwprintf_s(gLog, L"%s\n", message);
         fflush(gLog);
     }
+}
+
+uint8_t RequestedMaximumGeneratedFrames(const ControlConfig& control)
+{
+    return control.dynamic && !control.dynamicExperimental56
+        ? kStandardMaximumGeneratedFrames
+        : kExperimentalMaximumGeneratedFrames;
+}
+
+bool SetWrapperMaximum(ModuleRecord& record, uint8_t maximum)
+{
+    uint8_t* address = record.wrapperMaximumImmediate;
+    if (!address || (*address != kStandardMaximumGeneratedFrames
+        && *address != kExperimentalMaximumGeneratedFrames))
+        return false;
+    if (*address == maximum)
+        return true;
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(address, 1, PAGE_EXECUTE_READWRITE, &oldProtection))
+    {
+        Log(L"Streamline maximum update failed (%lu): %s",
+            GetLastError(), record.path.c_str());
+        return false;
+    }
+    *address = maximum;
+    FlushInstructionCache(GetCurrentProcess(), address, 1);
+    DWORD ignoredProtection = 0;
+    const BOOL restored = VirtualProtect(address, 1, oldProtection, &ignoredProtection);
+    if (!restored)
+    {
+        Log(L"Streamline maximum protection restore failed (%lu): %s",
+            GetLastError(), record.path.c_str());
+        return false;
+    }
+
+    Log(L"Streamline maximum updated: generatedFrames=%u multiplier=%ux path=%s",
+        maximum, static_cast<uint32_t>(maximum) + 1, record.path.c_str());
+    return true;
+}
+
+void ApplyWrapperMaximum(const ControlConfig& control)
+{
+    const uint8_t maximum = RequestedMaximumGeneratedFrames(control);
+    std::lock_guard lock(gModuleMutex);
+    for (auto& record : gModuleRecords)
+    {
+        if (record.wrapperPatched && record.wrapperMaximumImmediate)
+            SetWrapperMaximum(record, maximum);
+    }
+}
+
+UiResourceTagState CaptureUiResourceTag(const sl::ResourceTag& tag, uint64_t tick)
+{
+    UiResourceTagState state{};
+    if (!tag.resource || !tag.resource->native)
+        return state;
+
+    state.active = true;
+    state.lifecycle = tag.lifecycle;
+    state.lastSeenTick = tick;
+    state.top = tag.extent.top;
+    state.left = tag.extent.left;
+    state.width = tag.extent.width != 0 ? tag.extent.width : tag.resource->width;
+    state.height = tag.extent.height != 0 ? tag.extent.height : tag.resource->height;
+    state.format = tag.resource->nativeFormat;
+    return state;
+}
+
+bool UiTagFresh(const UiResourceTagState& state, uint64_t now)
+{
+    return state.active && state.lastSeenTick != 0 && now >= state.lastSeenTick
+        && now - state.lastSeenTick <= kUiTagFreshnessMs;
+}
+
+UiInputSnapshot ReadUiInputSnapshot(uint32_t viewport)
+{
+    UiInputSnapshot snapshot{};
+    const uint64_t now = GetTickCount64();
+    std::lock_guard lock(gUiTagMutex);
+    const auto found = std::find_if(gUiViewportTags.begin(), gUiViewportTags.end(),
+        [&](const UiViewportTagState& state) { return state.viewport == viewport; });
+    if (found == gUiViewportTags.end())
+        return snapshot;
+
+    snapshot.hudless = UiTagFresh(found->hudless, now);
+    snapshot.uiAlpha = UiTagFresh(found->uiAlpha, now);
+    snapshot.uiColorAlpha = UiTagFresh(found->uiColorAlpha, now);
+    const UiResourceTagState* ui = snapshot.uiAlpha ? &found->uiAlpha
+        : snapshot.uiColorAlpha ? &found->uiColorAlpha : nullptr;
+    if (!snapshot.hudless || !ui)
+        return snapshot;
+
+    snapshot.hudlessWidth = found->hudless.width;
+    snapshot.hudlessHeight = found->hudless.height;
+    snapshot.uiWidth = ui->width;
+    snapshot.uiHeight = ui->height;
+    snapshot.uiFormat = ui->format;
+    snapshot.dimensionsKnown = snapshot.hudlessWidth != 0
+        && snapshot.hudlessHeight != 0 && snapshot.uiWidth != 0
+        && snapshot.uiHeight != 0;
+    snapshot.dimensionsMatch = snapshot.dimensionsKnown
+        && found->hudless.top == ui->top && found->hudless.left == ui->left
+        && snapshot.hudlessWidth == snapshot.uiWidth
+        && snapshot.hudlessHeight == snapshot.uiHeight;
+
+    const uint32_t colorWidth = gGameColorWidth.load(std::memory_order_relaxed);
+    const uint32_t colorHeight = gGameColorHeight.load(std::memory_order_relaxed);
+    if (snapshot.dimensionsMatch && colorWidth != 0 && colorHeight != 0)
+    {
+        snapshot.dimensionsMatch = snapshot.hudlessWidth == colorWidth
+            && snapshot.hudlessHeight == colorHeight;
+    }
+
+    const uint64_t hudlessAge = now - found->hudless.lastSeenTick;
+    const uint64_t uiAge = now - ui->lastSeenTick;
+    snapshot.oldestAgeMs = std::max(hudlessAge, uiAge);
+    snapshot.ready = snapshot.dimensionsMatch;
+    return snapshot;
+}
+
+void RefreshUiInputReadiness(uint32_t viewport)
+{
+    if (viewport == UINT32_MAX)
+        return;
+    const UiInputSnapshot snapshot = ReadUiInputSnapshot(viewport);
+    const bool previous = gUiInputsReady.exchange(snapshot.ready, std::memory_order_acq_rel);
+    if (previous == snapshot.ready)
+        return;
+
+    if (gControlReady.load(std::memory_order_acquire))
+        gDesiredRevision.fetch_add(1, std::memory_order_release);
+    Log(L"UI inputs changed: ready=%d viewport=%u hudless=%d uiAlpha=%d "
+        L"uiColorAlpha=%d dimensionsKnown=%d dimensionsMatch=%d "
+        L"hudless=%ux%u ui=%ux%u",
+        snapshot.ready, viewport, snapshot.hudless, snapshot.uiAlpha,
+        snapshot.uiColorAlpha, snapshot.dimensionsKnown, snapshot.dimensionsMatch,
+        snapshot.hudlessWidth, snapshot.hudlessHeight,
+        snapshot.uiWidth, snapshot.uiHeight);
+}
+
+void CaptureUiResourceTags(const sl::ViewportHandle& viewport,
+    const sl::ResourceTag* tags, uint32_t numTags)
+{
+    if (!tags || numTags == 0 || numTags > 1024)
+        return;
+
+    const uint32_t viewportValue = static_cast<uint32_t>(viewport);
+    const uint64_t tick = GetTickCount64();
+    bool relevant = false;
+    {
+        std::lock_guard lock(gUiTagMutex);
+        auto found = std::find_if(gUiViewportTags.begin(), gUiViewportTags.end(),
+            [&](const UiViewportTagState& state) { return state.viewport == viewportValue; });
+        if (found == gUiViewportTags.end())
+        {
+            gUiViewportTags.push_back({});
+            found = std::prev(gUiViewportTags.end());
+            found->viewport = viewportValue;
+        }
+
+        for (uint32_t index = 0; index < numTags; ++index)
+        {
+            const sl::ResourceTag& tag = tags[index];
+            UiResourceTagState* destination = nullptr;
+            if (tag.type == sl::kBufferTypeHUDLessColor)
+                destination = &found->hudless;
+            else if (tag.type == sl::kBufferTypeUIAlpha)
+                destination = &found->uiAlpha;
+            else if (tag.type == sl::kBufferTypeUIColorAndAlpha)
+                destination = &found->uiColorAlpha;
+            if (!destination)
+                continue;
+            *destination = CaptureUiResourceTag(tag, tick);
+            relevant = true;
+        }
+    }
+
+    const uint32_t activeViewport = gLastOptionsViewport.load(std::memory_order_acquire);
+    if (relevant && (activeViewport == UINT32_MAX || activeViewport == viewportValue))
+        RefreshUiInputReadiness(viewportValue);
+}
+
+void UpdateFpsTelemetry(uint32_t presentedFrames)
+{
+    LARGE_INTEGER now{};
+    if (!QueryPerformanceCounter(&now))
+        return;
+    if (gFpsCounterFrequency.QuadPart == 0
+        && !QueryPerformanceFrequency(&gFpsCounterFrequency))
+        return;
+    if (gFpsWindowStart.QuadPart == 0 || now.QuadPart <= gFpsWindowStart.QuadPart)
+    {
+        gFpsWindowStart = now;
+        gFpsWindowRealFrames = 0;
+        gFpsWindowPresentedFrames = 0;
+        return;
+    }
+
+    ++gFpsWindowRealFrames;
+    gFpsWindowPresentedFrames += presentedFrames;
+    const uint64_t elapsedTicks = static_cast<uint64_t>(
+        now.QuadPart - gFpsWindowStart.QuadPart);
+    const uint64_t minimumTicks = static_cast<uint64_t>(
+        gFpsCounterFrequency.QuadPart) / 2;
+    if (elapsedTicks < minimumTicks)
+        return;
+
+    const uint64_t frequency = static_cast<uint64_t>(gFpsCounterFrequency.QuadPart);
+    const auto rateMilli = [&](uint64_t frames) {
+        return static_cast<uint32_t>(std::min<uint64_t>(UINT32_MAX,
+            (frames * frequency * 1000u + elapsedTicks / 2u) / elapsedTicks));
+    };
+    gRealFpsMilli.store(rateMilli(gFpsWindowRealFrames), std::memory_order_relaxed);
+    gDlssFpsMilli.store(
+        rateMilli(gFpsWindowPresentedFrames), std::memory_order_relaxed);
+    gFpsSampleWindowMs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX,
+            (elapsedTicks * 1000u + frequency / 2u) / frequency)),
+        std::memory_order_relaxed);
+    gFpsSampleTick.store(GetTickCount64(), std::memory_order_release);
+    gFpsWindowStart = now;
+    gFpsWindowRealFrames = 0;
+    gFpsWindowPresentedFrames = 0;
+}
+
+void RecordDlssgStateResult(
+    sl::Result result, const sl::DLSSGState& state, bool fpsFrameSample)
+{
+    gGetStateCalls.fetch_add(1, std::memory_order_relaxed);
+    gGetStateSeen.store(true, std::memory_order_release);
+    gLastGetStateResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+    if (result != sl::Result::eOk)
+    {
+        if (fpsFrameSample)
+            UpdateFpsTelemetry(0);
+        return;
+    }
+
+    const uint32_t previous =
+        gActualFramesPresented.exchange(state.numFramesActuallyPresented,
+            std::memory_order_relaxed);
+    if (fpsFrameSample)
+        UpdateFpsTelemetry(state.numFramesActuallyPresented);
+    gDlssgStatus.store(static_cast<uint32_t>(state.status), std::memory_order_relaxed);
+    if (state.structVersion >= sl::kStructVersion2)
+        gNumFramesToGenerateMax.store(
+            state.numFramesToGenerateMax, std::memory_order_relaxed);
+    if (state.structVersion >= sl::kStructVersion4)
+        gDynamicMfgSupported.store(
+            state.bIsDynamicMFGSupported == sl::Boolean::eTrue,
+            std::memory_order_relaxed);
+    gStateSampleTick.store(GetTickCount64(), std::memory_order_release);
+
+    if (previous != state.numFramesActuallyPresented)
+        Log(L"DLSS-G actual presentation count: %ux (maximum generated frames=%u, status=%u)",
+            state.numFramesActuallyPresented,
+            gNumFramesToGenerateMax.load(std::memory_order_relaxed),
+            static_cast<uint32_t>(state.status));
 }
 
 std::wstring ParentPath(const std::wstring& path)
@@ -223,6 +551,24 @@ bool TryParseUnsigned(const std::string& content, const char* name,
     return true;
 }
 
+bool TryParseBoolean(const std::string& content, const char* name, bool& value)
+{
+    size_t offset = 0;
+    if (!FindJsonValue(content, name, offset))
+        return false;
+    if (content.compare(offset, 4, "true") == 0)
+    {
+        value = true;
+        return true;
+    }
+    if (content.compare(offset, 5, "false") == 0)
+    {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
 bool TryParseControl(const char* data, size_t size, ControlConfig& control)
 {
     if (!data || size == 0)
@@ -247,6 +593,12 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
     if (FindJsonValue(content, "dynamicTargetFrameRate", targetOffset)
         && !TryParseUnsigned(content, "dynamicTargetFrameRate", 0, 1000,
             parsed.dynamicTargetFrameRate))
+        return false;
+
+    size_t experimentalOffset = 0;
+    if (FindJsonValue(content, "dynamicExperimental56", experimentalOffset)
+        && !TryParseBoolean(content, "dynamicExperimental56",
+            parsed.dynamicExperimental56))
         return false;
 
     control = parsed;
@@ -311,9 +663,11 @@ std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableD
 
 uint64_t StoreControl(const ControlConfig& control)
 {
+    ApplyWrapperMaximum(control);
     gDesiredMultiplier.store(control.multiplier, std::memory_order_relaxed);
     gDesiredDynamicMode.store(control.dynamic, std::memory_order_relaxed);
     gDynamicTargetFrameRate.store(control.dynamicTargetFrameRate, std::memory_order_relaxed);
+    gDynamicExperimental56.store(control.dynamicExperimental56, std::memory_order_relaxed);
     const uint64_t revision = gDesiredRevision.fetch_add(1, std::memory_order_release) + 1;
     gControlReady.store(true, std::memory_order_release);
     return revision;
@@ -329,6 +683,8 @@ ControlSnapshot ReadControlSnapshot()
         snapshot.control.dynamic = gDesiredDynamicMode.load(std::memory_order_relaxed);
         snapshot.control.dynamicTargetFrameRate =
             gDynamicTargetFrameRate.load(std::memory_order_relaxed);
+        snapshot.control.dynamicExperimental56 =
+            gDynamicExperimental56.load(std::memory_order_relaxed);
         const uint64_t after = gDesiredRevision.load(std::memory_order_acquire);
         if (before == after)
         {
@@ -347,6 +703,8 @@ void PublishLiveBridge(const ControlConfig& control)
     SetEnvironmentVariableW(L"RTX40_MFG_ACTIVE_MULTIPLIER", multiplier);
     SetEnvironmentVariableW(L"RTX40_MFG_ACTIVE_MODE", control.dynamic ? L"dynamic" : L"fixed");
     SetEnvironmentVariableW(L"RTX40_MFG_DYNAMIC_TARGET", target);
+    SetEnvironmentVariableW(L"RTX40_MFG_DYNAMIC_EXPERIMENTAL_56",
+        control.dynamicExperimental56 ? L"1" : L"0");
     SetEnvironmentVariableW(L"RTX40_MFG_AUTO_BRIDGE", L"1");
 }
 
@@ -374,6 +732,9 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     if (gStatusPath.empty())
         return false;
 
+    const uint32_t uiViewport = gLastOptionsViewport.load(std::memory_order_acquire);
+    RefreshUiInputReadiness(uiViewport);
+    const UiInputSnapshot uiInputs = ReadUiInputSnapshot(uiViewport);
     const bool bridgeReady = BridgeReady();
     const char* route = PatchRouteName();
     const uint64_t desiredRevision = gDesiredRevision.load(std::memory_order_acquire);
@@ -395,23 +756,41 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     const uint64_t nowTick = GetTickCount64();
     const uint64_t stateAgeMs = stateTick == 0 || nowTick < stateTick
         ? 0 : nowTick - stateTick;
+    const uint64_t fpsTick = gFpsSampleTick.load(std::memory_order_acquire);
+    const uint64_t fpsAgeMs = fpsTick == 0 || nowTick < fpsTick
+        ? 0 : nowTick - fpsTick;
 
-    char json[3072]{};
+    char json[4096]{};
     const int length = sprintf_s(json,
-        "{\"version\":4,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
+        "{\"version\":6,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
         "\"bridgeReady\":%s,\"liveHookInstalled\":%s,"
+        "\"uiTagHookInstalled\":%s,"
         "\"activeWrapperObserved\":%s,\"activeWrapperPatched\":%s,"
         "\"loadedWrapperCandidates\":%u,\"patchedWrapperCandidates\":%u,"
         "\"loadedNgxCandidates\":%u,\"patchedNgxCandidates\":%u,"
         "\"mode\":\"%s\",\"multiplier\":%u,\"dynamicTargetFrameRate\":%u,"
+        "\"dynamicExperimental56\":%s,\"forcedMaximumMultiplier\":%u,"
         "\"requestRevision\":%llu,\"appliedRevision\":%llu,"
         "\"applied\":%s,\"pending\":%s,\"gameFrameGenerationOn\":%s,"
         "\"appliedMode\":\"%s\",\"appliedMultiplier\":%u,"
-        "\"appliedDynamicTargetFrameRate\":%u,\"setOptionsSeen\":%s,"
+        "\"appliedDynamicTargetFrameRate\":%u,"
+        "\"appliedDynamicExperimental56\":%s,\"setOptionsSeen\":%s,"
         "\"setOptionsAccepted\":%s,"
         "\"setOptionsResult\":%d,\"getStateSeen\":%s,\"getStateResult\":%d,"
         "\"actualFramesPresented\":%u,\"numFramesToGenerateMax\":%u,"
+        "\"realFpsMilli\":%u,\"dlssFpsMilli\":%u,"
+        "\"fpsSampleWindowMs\":%u,\"fpsSampleAgeMs\":%llu,"
         "\"dlssgStatus\":%u,\"dynamicMfgSupported\":%s,"
+        "\"gameOptionsStructVersion\":%u,\"gameUiRecompositionEnabled\":%s,"
+        "\"gameHudlessBufferFormat\":%u,\"gameUiBufferFormat\":%u,"
+        "\"hudlessTagActive\":%s,\"uiAlphaTagActive\":%s,"
+        "\"uiColorAlphaTagActive\":%s,\"uiDimensionsKnown\":%s,"
+        "\"uiDimensionsMatch\":%s,\"uiInputsReady\":%s,"
+        "\"uiRecompositionEnabled\":%s,\"uiRecompositionForced\":%s,"
+        "\"hudlessWidth\":%u,\"hudlessHeight\":%u,"
+        "\"uiWidth\":%u,\"uiHeight\":%u,\"uiTagFormat\":%u,"
+        "\"uiTagAgeMs\":%llu,\"setTagCalls\":%llu,"
+        "\"setTagForFrameCalls\":%llu,"
         "\"stateSampleAgeMs\":%llu,\"setOptionsCalls\":%llu,"
         "\"getStateCalls\":%llu,\"liveReapplyCount\":%llu,"
         "\"notInitializedRetryCount\":%llu}\n",
@@ -419,6 +798,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         static_cast<unsigned long long>(UnixTimeSeconds()), route,
         bridgeReady ? "true" : "false",
         gLiveHookInstalled.load(std::memory_order_relaxed) ? "true" : "false",
+        gUiTagHookInstalled.load(std::memory_order_relaxed) ? "true" : "false",
         gActiveWrapperObserved.load(std::memory_order_relaxed) ? "true" : "false",
         gActiveWrapperPatched.load(std::memory_order_relaxed) ? "true" : "false",
         gLoadedWrapperCandidates.load(std::memory_order_relaxed),
@@ -427,6 +807,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         gPatchedNgxCandidates.load(std::memory_order_relaxed),
         control.dynamic ? "dynamic" : "fixed", control.multiplier,
         control.dynamicTargetFrameRate,
+        control.dynamicExperimental56 ? "true" : "false",
+        static_cast<uint32_t>(RequestedMaximumGeneratedFrames(control)) + 1,
         static_cast<unsigned long long>(desiredRevision),
         static_cast<unsigned long long>(appliedRevision),
         applied ? "true" : "false", pending ? "true" : "false",
@@ -434,13 +816,36 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         gAppliedDynamicMode.load(std::memory_order_relaxed) ? "dynamic" : "fixed",
         gAppliedMultiplier.load(std::memory_order_relaxed),
         gAppliedDynamicTargetFrameRate.load(std::memory_order_relaxed),
+        gAppliedDynamicExperimental56.load(std::memory_order_relaxed) ? "true" : "false",
         setOptionsSeen ? "true" : "false",
         setOptionsAccepted ? "true" : "false", setOptionsResult,
         getStateSeen ? "true" : "false", getStateResult,
         gActualFramesPresented.load(std::memory_order_relaxed),
         gNumFramesToGenerateMax.load(std::memory_order_relaxed),
+        gRealFpsMilli.load(std::memory_order_relaxed),
+        gDlssFpsMilli.load(std::memory_order_relaxed),
+        gFpsSampleWindowMs.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(fpsAgeMs),
         gDlssgStatus.load(std::memory_order_relaxed),
         gDynamicMfgSupported.load(std::memory_order_relaxed) ? "true" : "false",
+        gGameOptionsStructVersion.load(std::memory_order_relaxed),
+        gGameUiRecompositionEnabled.load(std::memory_order_relaxed) ? "true" : "false",
+        gGameHudlessBufferFormat.load(std::memory_order_relaxed),
+        gGameUiBufferFormat.load(std::memory_order_relaxed),
+        uiInputs.hudless ? "true" : "false",
+        uiInputs.uiAlpha ? "true" : "false",
+        uiInputs.uiColorAlpha ? "true" : "false",
+        uiInputs.dimensionsKnown ? "true" : "false",
+        uiInputs.dimensionsMatch ? "true" : "false",
+        uiInputs.ready ? "true" : "false",
+        gAppliedUiRecompositionEnabled.load(std::memory_order_relaxed) ? "true" : "false",
+        gAppliedUiRecompositionForced.load(std::memory_order_relaxed) ? "true" : "false",
+        uiInputs.hudlessWidth, uiInputs.hudlessHeight,
+        uiInputs.uiWidth, uiInputs.uiHeight, uiInputs.uiFormat,
+        static_cast<unsigned long long>(uiInputs.oldestAgeMs),
+        static_cast<unsigned long long>(gSetTagCalls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gSetTagForFrameCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(stateAgeMs),
         static_cast<unsigned long long>(gSetOptionsCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(gGetStateCalls.load(std::memory_order_relaxed)),
@@ -497,7 +902,8 @@ sl::DLSSGOptions CopyKnownOptions(const sl::DLSSGOptions& source, bool preserveN
 }
 
 sl::DLSSGOptions BuildAdjustedOptions(
-    const sl::DLSSGOptions& source, const ControlSnapshot& snapshot, bool preserveNext)
+    const sl::DLSSGOptions& source, const ControlSnapshot& snapshot,
+    bool preserveNext, bool enableUiRecomposition)
 {
     sl::DLSSGOptions adjusted = CopyKnownOptions(source, preserveNext);
     if (snapshot.control.dynamic)
@@ -515,7 +921,13 @@ sl::DLSSGOptions BuildAdjustedOptions(
         adjusted.mode = sl::DLSSGMode::eOn;
         adjusted.numFramesToGenerate =
             std::clamp(snapshot.control.multiplier,
-                kMinimumMultiplier, kMaximumMultiplier) - 1;
+            kMinimumMultiplier, kMaximumMultiplier) - 1;
+    }
+    if (enableUiRecomposition)
+    {
+        adjusted.structVersion = std::max<size_t>(
+            adjusted.structVersion, sl::kStructVersion4);
+        adjusted.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
     }
     return adjusted;
 }
@@ -523,10 +935,24 @@ sl::DLSSGOptions BuildAdjustedOptions(
 void CaptureGameOptions(
     const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options)
 {
-    std::lock_guard lock(gLastOptionsMutex);
-    gLastGameOptions.viewport = viewport;
-    gLastGameOptions.options = CopyKnownOptions(options, false);
-    gLastGameOptions.valid = true;
+    {
+        std::lock_guard lock(gLastOptionsMutex);
+        gLastGameOptions.viewport = viewport;
+        gLastGameOptions.options = CopyKnownOptions(options, false);
+        gLastGameOptions.valid = true;
+    }
+    const uint32_t viewportValue = static_cast<uint32_t>(viewport);
+    gLastOptionsViewport.store(viewportValue, std::memory_order_release);
+    gGameOptionsStructVersion.store(
+        static_cast<uint32_t>(options.structVersion), std::memory_order_relaxed);
+    gGameColorWidth.store(options.colorWidth, std::memory_order_relaxed);
+    gGameColorHeight.store(options.colorHeight, std::memory_order_relaxed);
+    gGameHudlessBufferFormat.store(options.hudLessBufferFormat, std::memory_order_relaxed);
+    gGameUiBufferFormat.store(options.uiBufferFormat, std::memory_order_relaxed);
+    gGameUiRecompositionEnabled.store(options.structVersion >= sl::kStructVersion4
+        && options.enableUserInterfaceRecomposition == sl::Boolean::eTrue,
+        std::memory_order_relaxed);
+    RefreshUiInputReadiness(viewportValue);
 }
 
 bool ReadLastGameOptions(
@@ -541,7 +967,8 @@ bool ReadLastGameOptions(
     return true;
 }
 
-void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result, bool liveReapply)
+void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
+    bool liveReapply, bool uiRecompositionEnabled, bool uiRecompositionForced)
 {
     gSetOptionsSeen.store(true, std::memory_order_release);
     gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
@@ -558,6 +985,12 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result, bo
     gAppliedMultiplier.store(snapshot.control.multiplier, std::memory_order_relaxed);
     gAppliedDynamicTargetFrameRate.store(
         snapshot.control.dynamicTargetFrameRate, std::memory_order_relaxed);
+    gAppliedDynamicExperimental56.store(
+        snapshot.control.dynamicExperimental56, std::memory_order_relaxed);
+    gAppliedUiRecompositionEnabled.store(
+        uiRecompositionEnabled, std::memory_order_relaxed);
+    gAppliedUiRecompositionForced.store(
+        uiRecompositionForced, std::memory_order_relaxed);
     gAppliedRevision.store(snapshot.revision, std::memory_order_release);
     if (liveReapply)
         gLiveReapplyCount.fetch_add(1, std::memory_order_relaxed);
@@ -565,23 +998,57 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result, bo
     if (previous == snapshot.revision)
         return;
     if (snapshot.control.dynamic)
-        Log(L"%s dynamic MFG: target=%u FPS, result=%d",
+        Log(L"%s dynamic MFG: target=%u FPS experimental56=%d max=%ux result=%d",
             liveReapply ? L"Live-reapplied" : L"Applied",
-            snapshot.control.dynamicTargetFrameRate, static_cast<int>(result));
+            snapshot.control.dynamicTargetFrameRate,
+            snapshot.control.dynamicExperimental56,
+            static_cast<uint32_t>(RequestedMaximumGeneratedFrames(snapshot.control)) + 1,
+            static_cast<int>(result));
     else
         Log(L"%s fixed multiplier: %ux, result=%d",
             liveReapply ? L"Live-reapplied" : L"Applied",
             snapshot.control.multiplier, static_cast<int>(result));
+    Log(L"UI recomposition: enabled=%d forced=%d inputsReady=%d "
+        L"gameEnabled=%d optionsVersion=%u hudlessFormat=%u uiFormat=%u",
+        uiRecompositionEnabled, uiRecompositionForced,
+        gUiInputsReady.load(std::memory_order_relaxed),
+        gGameUiRecompositionEnabled.load(std::memory_order_relaxed),
+        gGameOptionsStructVersion.load(std::memory_order_relaxed),
+        gGameHudlessBufferFormat.load(std::memory_order_relaxed),
+        gGameUiBufferFormat.load(std::memory_order_relaxed));
 }
 
 sl::Result SubmitAdjustedOptions(
     PFun_slDLSSGSetOptions* original, const sl::ViewportHandle& viewport,
     const sl::DLSSGOptions& source, const ControlSnapshot& snapshot, bool liveReapply)
 {
-    const sl::DLSSGOptions adjusted =
-        BuildAdjustedOptions(source, snapshot, !liveReapply);
+    const UiInputSnapshot uiInputs = ReadUiInputSnapshot(
+        static_cast<uint32_t>(viewport));
+    const bool gameUiRecomposition = source.structVersion >= sl::kStructVersion4
+        && source.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
+    const bool forceUiRecomposition = uiInputs.ready && !gameUiRecomposition;
+    const sl::DLSSGOptions adjusted = BuildAdjustedOptions(
+        source, snapshot, !liveReapply, uiInputs.ready);
+    const bool uiRecompositionEnabled = adjusted.structVersion >= sl::kStructVersion4
+        && adjusted.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
     const sl::Result result = original(viewport, adjusted);
-    RecordAppliedControl(snapshot, result, liveReapply);
+    RecordAppliedControl(snapshot, result, liveReapply,
+        uiRecompositionEnabled, forceUiRecomposition);
+    if (!liveReapply
+        && (result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM))
+    {
+        auto* getState = gOriginalGetState.load(std::memory_order_acquire);
+        if (getState)
+        {
+            sl::DLSSGState state{};
+            const sl::Result stateResult = getState(viewport, state, &adjusted);
+            RecordDlssgStateResult(stateResult, state, true);
+        }
+        else
+        {
+            UpdateFpsTelemetry(0);
+        }
+    }
     // Cyberpunk treats every non-zero Result as a hard failure. Result 39 is a
     // warning rather than a rejected options update, so preserve it in the
     // bridge status while returning success to the host.
@@ -694,27 +1161,7 @@ sl::Result HookSlDLSSGGetState(
     std::lock_guard callLock(gStreamlineCallMutex);
     ReapplyPendingControl(viewport);
     const sl::Result result = original(viewport, state, options);
-    gGetStateCalls.fetch_add(1, std::memory_order_relaxed);
-    gGetStateSeen.store(true, std::memory_order_release);
-    gLastGetStateResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
-    if (result != sl::Result::eOk)
-        return result;
-
-    const uint32_t previous =
-        gActualFramesPresented.exchange(state.numFramesActuallyPresented, std::memory_order_relaxed);
-    gDlssgStatus.store(static_cast<uint32_t>(state.status), std::memory_order_relaxed);
-    if (state.structVersion >= sl::kStructVersion2)
-        gNumFramesToGenerateMax.store(state.numFramesToGenerateMax, std::memory_order_relaxed);
-    if (state.structVersion >= sl::kStructVersion4)
-        gDynamicMfgSupported.store(
-            state.bIsDynamicMFGSupported == sl::Boolean::eTrue, std::memory_order_relaxed);
-    gStateSampleTick.store(GetTickCount64(), std::memory_order_release);
-
-    if (previous != state.numFramesActuallyPresented)
-        Log(L"DLSS-G actual presentation count: %ux (maximum generated frames=%u, status=%u)",
-            state.numFramesActuallyPresented,
-            gNumFramesToGenerateMax.load(std::memory_order_relaxed),
-            static_cast<uint32_t>(state.status));
+    RecordDlssgStateResult(result, state, false);
     return result;
 }
 
@@ -749,7 +1196,35 @@ sl::Result HookSlGetFeatureFunction(
     return result;
 }
 
-bool HookMainExecutableImport(const char* importedModule, const char* importedFunction)
+sl::Result HookSlSetTag(const sl::ViewportHandle& viewport,
+    const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer)
+{
+    auto* original = gOriginalSetTag.load(std::memory_order_acquire);
+    if (!original)
+        return sl::Result::eErrorNotInitialized;
+    const sl::Result result = original(viewport, tags, numTags, cmdBuffer);
+    gSetTagCalls.fetch_add(1, std::memory_order_relaxed);
+    if (result == sl::Result::eOk)
+        CaptureUiResourceTags(viewport, tags, numTags);
+    return result;
+}
+
+sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
+    const sl::ViewportHandle& viewport, const sl::ResourceTag* tags,
+    uint32_t numTags, sl::CommandBuffer* cmdBuffer)
+{
+    auto* original = gOriginalSetTagForFrame.load(std::memory_order_acquire);
+    if (!original)
+        return sl::Result::eErrorNotInitialized;
+    const sl::Result result = original(frame, viewport, tags, numTags, cmdBuffer);
+    gSetTagForFrameCalls.fetch_add(1, std::memory_order_relaxed);
+    if (result == sl::Result::eOk)
+        CaptureUiResourceTags(viewport, tags, numTags);
+    return result;
+}
+
+bool HookMainExecutableImport(const char* importedModule, const char* importedFunction,
+    void* replacement, void*& original)
 {
     HMODULE module = GetModuleHandleW(nullptr);
     auto* base = reinterpret_cast<uint8_t*>(module);
@@ -789,16 +1264,14 @@ bool HookMainExecutableImport(const char* importedModule, const char* importedFu
 
             auto** slot = reinterpret_cast<void**>(&thunk->u1.Function);
             auto* current = *slot;
-            if (current == reinterpret_cast<void*>(&HookSlGetFeatureFunction))
+            if (current == replacement)
                 return true;
 
             DWORD oldProtection = 0;
             if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProtection))
                 return false;
-            gOriginalGetFeatureFunction.store(
-                reinterpret_cast<PFun_slGetFeatureFunction*>(current),
-                std::memory_order_release);
-            *slot = reinterpret_cast<void*>(&HookSlGetFeatureFunction);
+            original = current;
+            *slot = replacement;
             DWORD ignoredProtection = 0;
             const BOOL restored = VirtualProtect(
                 slot, sizeof(*slot), oldProtection, &ignoredProtection);
@@ -807,6 +1280,46 @@ bool HookMainExecutableImport(const char* importedModule, const char* importedFu
         }
     }
     return false;
+}
+
+bool InstallFeatureFunctionHook()
+{
+    void* original = nullptr;
+    const bool installed = HookMainExecutableImport("sl.interposer.dll",
+        "slGetFeatureFunction", reinterpret_cast<void*>(&HookSlGetFeatureFunction), original);
+    if (original)
+    {
+        gOriginalGetFeatureFunction.store(
+            reinterpret_cast<PFun_slGetFeatureFunction*>(original),
+            std::memory_order_release);
+    }
+    return installed;
+}
+
+bool InstallUiTagHooks()
+{
+    void* legacyOriginal = nullptr;
+    const bool legacyInstalled = HookMainExecutableImport("sl.interposer.dll",
+        "slSetTag", reinterpret_cast<void*>(&HookSlSetTag), legacyOriginal);
+    if (legacyOriginal)
+    {
+        gOriginalSetTag.store(reinterpret_cast<PFun_slSetTag*>(legacyOriginal),
+            std::memory_order_release);
+    }
+
+    void* frameOriginal = nullptr;
+    const bool frameInstalled = HookMainExecutableImport("sl.interposer.dll",
+        "slSetTagForFrame", reinterpret_cast<void*>(&HookSlSetTagForFrame), frameOriginal);
+    if (frameOriginal)
+    {
+        gOriginalSetTagForFrame.store(
+            reinterpret_cast<PFun_slSetTagForFrame*>(frameOriginal),
+            std::memory_order_release);
+    }
+
+    const bool installed = legacyInstalled || frameInstalled;
+    gUiTagHookInstalled.store(installed, std::memory_order_release);
+    return installed;
 }
 
 struct PatternPatch
@@ -844,6 +1357,7 @@ struct PatternPatchResult
 {
     bool candidate = false;
     bool patched = false;
+    uint8_t* match = nullptr;
 };
 
 const IMAGE_NT_HEADERS64* ImageHeaders(HMODULE module)
@@ -949,7 +1463,7 @@ PatternPatchResult PatchUniqueExecutablePattern(
     if (matchCount != 1 || !match)
     {
         Log(L"%s: expected one code pattern, found %zu: %s", patch.label, matchCount, path.c_str());
-        return {true, false};
+        return {true, false, nullptr};
     }
 
     uint8_t* address = match + patch.patchOffset;
@@ -957,19 +1471,19 @@ PatternPatchResult PatchUniqueExecutablePattern(
     {
         Log(L"%s: already patched at RVA 0x%zX: %s", patch.label,
             static_cast<size_t>(address - const_cast<uint8_t*>(base)), path.c_str());
-        return {true, true};
+        return {true, true, match};
     }
     if (memcmp(address, patch.original, patch.patchSize) != 0)
     {
         Log(L"%s: matched context but original bytes differ: %s", patch.label, path.c_str());
-        return {true, false};
+        return {true, false, match};
     }
 
     DWORD oldProtection = 0;
     if (!VirtualProtect(address, patch.patchSize, PAGE_EXECUTE_READWRITE, &oldProtection))
     {
         Log(L"%s: VirtualProtect failed (%lu): %s", patch.label, GetLastError(), path.c_str());
-        return {true, false};
+        return {true, false, match};
     }
     memcpy(address, patch.replacement, patch.patchSize);
     FlushInstructionCache(GetCurrentProcess(), address, patch.patchSize);
@@ -978,12 +1492,12 @@ PatternPatchResult PatchUniqueExecutablePattern(
     if (!restored)
     {
         Log(L"%s: protection restore failed (%lu): %s", patch.label, GetLastError(), path.c_str());
-        return {true, false};
+        return {true, false, match};
     }
 
     Log(L"%s: patched RVA 0x%zX: %s", patch.label,
         static_cast<size_t>(address - const_cast<uint8_t*>(base)), path.c_str());
-    return {true, true};
+    return {true, true, match};
 }
 
 std::wstring LoadedModulePath(HMODULE module)
@@ -1077,6 +1591,12 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
                     PatchUniqueExecutablePattern(module, path, kWrapperPatch);
                 record.wrapperCandidate = result.candidate;
                 record.wrapperPatched = result.patched;
+                if (result.patched && result.match)
+                {
+                    record.wrapperMaximumImmediate = result.match + 1;
+                    SetWrapperMaximum(record,
+                        RequestedMaximumGeneratedFrames(ReadControlSnapshot().control));
+                }
             }
             if (record.ngxExport)
             {
@@ -1272,17 +1792,20 @@ DWORD WINAPI PatchWorker(void* context)
     StoreControl(initialControl);
     FILETIME configWriteTime{};
     ReadLastWriteTime(gConfigPath, configWriteTime);
-    Log(L"Initial control: mode=%s multiplier=%ux dynamicTarget=%u FPS; config: %s",
+    Log(L"Initial control: mode=%s multiplier=%ux dynamicTarget=%u FPS "
+        L"dynamicExperimental56=%d; config: %s",
         initialControl.dynamic ? L"dynamic" : L"fixed", initialControl.multiplier,
-        initialControl.dynamicTargetFrameRate, gConfigPath.c_str());
+        initialControl.dynamicTargetFrameRate, initialControl.dynamicExperimental56,
+        gConfigPath.c_str());
 
     Log(L"Patch worker started for PID %lu", static_cast<unsigned long>(pid));
     Log(L"Early DLL notification registered: %d",
         gDllNotificationRegistered.load(std::memory_order_acquire));
-    const bool liveHookInstalled = HookMainExecutableImport(
-        "sl.interposer.dll", "slGetFeatureFunction");
+    const bool liveHookInstalled = InstallFeatureFunctionHook();
     gLiveHookInstalled.store(liveHookInstalled, std::memory_order_release);
     Log(L"Streamline feature-function interception installed: %d", liveHookInstalled);
+    const bool uiTagHookInstalled = InstallUiTagHooks();
+    Log(L"Streamline UI tag interception installed: %d", uiTagHookInstalled);
     InspectAlreadyLoadedModules();
     FlushModuleInventoryToLog();
     Log(L"Loaded-module discovery initialized: ready=%d route=%hs wrappers=%u/%u ngx=%u/%u",
@@ -1344,9 +1867,11 @@ DWORD WINAPI PatchWorker(void* context)
                 StoreControl(activeControl);
                 PublishLiveBridge(activeControl);
                 WriteBridgeStatus(activeControl, pid);
-                Log(L"Live control requested: mode=%s multiplier=%ux dynamicTarget=%u FPS",
+                Log(L"Live control requested: mode=%s multiplier=%ux dynamicTarget=%u FPS "
+                    L"dynamicExperimental56=%d",
                     activeControl.dynamic ? L"dynamic" : L"fixed", activeControl.multiplier,
-                    activeControl.dynamicTargetFrameRate);
+                    activeControl.dynamicTargetFrameRate,
+                    activeControl.dynamicExperimental56);
             }
         }
 
@@ -1383,8 +1908,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         wchar_t executablePath[32768]{};
         GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
         gExecutableDirectory = ParentPath(executablePath);
-        gLiveHookInstalled.store(HookMainExecutableImport(
-            "sl.interposer.dll", "slGetFeatureFunction"), std::memory_order_release);
+        gLiveHookInstalled.store(InstallFeatureFunctionHook(), std::memory_order_release);
+        InstallUiTagHooks();
         RegisterDllNotification();
         HANDLE thread = CreateThread(nullptr, 0, PatchWorker, instance, 0, nullptr);
         if (thread)

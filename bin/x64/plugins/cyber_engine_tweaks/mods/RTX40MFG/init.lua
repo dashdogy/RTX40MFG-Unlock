@@ -9,6 +9,7 @@ local overlayOpen = false
 local selectedMode = "fixed"
 local selectedMultiplier = 2
 local dynamicTargetFrameRate = 0
+local dynamicExperimental56 = false
 local lastCustomTarget = 120
 local nativeStatusDetected = false
 local nativeStatusVersion = nil
@@ -16,6 +17,7 @@ local liveBridgeDetected = false
 local activeMode = nil
 local activeMultiplier = nil
 local activeDynamicTarget = nil
+local activeDynamicExperimental56 = nil
 local activePatchRoute = nil
 local appliedMode = nil
 local appliedMultiplier = nil
@@ -29,6 +31,18 @@ local getStateSeen = false
 local getStateResult = nil
 local actualFramesPresented = nil
 local stateSampleAgeMs = nil
+local uiTagHookInstalled = false
+local hudlessTagActive = false
+local uiAlphaTagActive = false
+local uiColorAlphaTagActive = false
+local uiDimensionsKnown = false
+local uiDimensionsMatch = false
+local uiRecompositionEnabled = false
+local uiRecompositionForced = false
+local gameUiRecompositionEnabled = false
+local realFps = nil
+local dlssFps = nil
+local fpsSampleAgeMs = nil
 local statusMessage = ""
 local bridgePollElapsed = 0
 
@@ -62,10 +76,11 @@ local function readBridgeState()
         end
         local statusVersion = tonumber(data.version) or 1
         return {
-            bridgeReady = statusVersion >= 4 and data.bridgeReady == true,
+            bridgeReady = statusVersion >= 6 and data.bridgeReady == true,
             multiplier = multiplier,
             mode = mode,
             dynamicTargetFrameRate = target or 0,
+            dynamicExperimental56 = data.dynamicExperimental56 == true,
             patchRoute = route,
             appliedMode = data.appliedMode or mode,
             appliedMultiplier = tonumber(data.appliedMultiplier) or multiplier,
@@ -81,6 +96,18 @@ local function readBridgeState()
             getStateResult = tonumber(data.getStateResult),
             actualFramesPresented = tonumber(data.actualFramesPresented),
             stateSampleAgeMs = tonumber(data.stateSampleAgeMs),
+            uiTagHookInstalled = data.uiTagHookInstalled == true,
+            hudlessTagActive = data.hudlessTagActive == true,
+            uiAlphaTagActive = data.uiAlphaTagActive == true,
+            uiColorAlphaTagActive = data.uiColorAlphaTagActive == true,
+            uiDimensionsKnown = data.uiDimensionsKnown == true,
+            uiDimensionsMatch = data.uiDimensionsMatch == true,
+            uiRecompositionEnabled = data.uiRecompositionEnabled == true,
+            uiRecompositionForced = data.uiRecompositionForced == true,
+            gameUiRecompositionEnabled = data.gameUiRecompositionEnabled == true,
+            realFps = tonumber(data.realFpsMilli) and tonumber(data.realFpsMilli) / 1000 or nil,
+            dlssFps = tonumber(data.dlssFpsMilli) and tonumber(data.dlssFpsMilli) / 1000 or nil,
+            fpsSampleAgeMs = tonumber(data.fpsSampleAgeMs),
             statusVersion = statusVersion
         }
     end)
@@ -107,6 +134,7 @@ local function loadConfig()
             selectedMultiplier = multiplier
             selectedMode = mode
             dynamicTargetFrameRate = math.floor(target)
+            dynamicExperimental56 = data.dynamicExperimental56 == true
             if dynamicTargetFrameRate > 0 then
                 lastCustomTarget = dynamicTargetFrameRate
             end
@@ -137,7 +165,8 @@ local function saveConfig()
         mode = selectedMode,
         multiplier = selectedMultiplier,
         dynamicTargetFrameRate = dynamicTargetFrameRate,
-        version = 5
+        dynamicExperimental56 = dynamicExperimental56,
+        version = 6
     })
     if not ok then
         file:close()
@@ -168,6 +197,7 @@ local function refreshBridgeStatus()
         activeMode = nil
         activeMultiplier = nil
         activeDynamicTarget = nil
+        activeDynamicExperimental56 = nil
         activePatchRoute = nil
         appliedMode = nil
         appliedMultiplier = nil
@@ -181,6 +211,18 @@ local function refreshBridgeStatus()
         getStateResult = nil
         actualFramesPresented = nil
         stateSampleAgeMs = nil
+        uiTagHookInstalled = false
+        hudlessTagActive = false
+        uiAlphaTagActive = false
+        uiColorAlphaTagActive = false
+        uiDimensionsKnown = false
+        uiDimensionsMatch = false
+        uiRecompositionEnabled = false
+        uiRecompositionForced = false
+        gameUiRecompositionEnabled = false
+        realFps = nil
+        dlssFps = nil
+        fpsSampleAgeMs = nil
         return
     end
     local wasLive = liveBridgeDetected
@@ -190,6 +232,7 @@ local function refreshBridgeStatus()
     activeMode = state.mode
     activeMultiplier = state.multiplier
     activeDynamicTarget = state.dynamicTargetFrameRate
+    activeDynamicExperimental56 = state.dynamicExperimental56
     activePatchRoute = state.patchRoute
     appliedMode = state.appliedMode
     appliedMultiplier = state.appliedMultiplier
@@ -203,6 +246,18 @@ local function refreshBridgeStatus()
     getStateResult = state.getStateResult
     actualFramesPresented = state.actualFramesPresented
     stateSampleAgeMs = state.stateSampleAgeMs
+    uiTagHookInstalled = state.uiTagHookInstalled
+    hudlessTagActive = state.hudlessTagActive
+    uiAlphaTagActive = state.uiAlphaTagActive
+    uiColorAlphaTagActive = state.uiColorAlphaTagActive
+    uiDimensionsKnown = state.uiDimensionsKnown
+    uiDimensionsMatch = state.uiDimensionsMatch
+    uiRecompositionEnabled = state.uiRecompositionEnabled
+    uiRecompositionForced = state.uiRecompositionForced
+    gameUiRecompositionEnabled = state.gameUiRecompositionEnabled
+    realFps = state.realFps
+    dlssFps = state.dlssFps
+    fpsSampleAgeMs = state.fpsSampleAgeMs
     if liveBridgeDetected and not wasLive then
         if activePatchRoute == "ota" then
             statusMessage = "Native bridge connected through the NVIDIA App OTA override. Changes apply without restarting."
@@ -212,7 +267,7 @@ local function refreshBridgeStatus()
             statusMessage = "Automatic native bridge connected. Changes apply without restarting."
         end
         print(MOD_NAME .. ": " .. statusMessage)
-    elseif nativeStatusVersion < 4 then
+    elseif nativeStatusVersion < 6 then
         statusMessage = "Update RTX40MFG.asi; bridge protocol is outdated."
     elseif not liveBridgeDetected then
         statusMessage = "Waiting for the active DLSS-G wrapper and NGX module."
@@ -260,7 +315,7 @@ registerForEvent("onDraw", function()
         return
     end
 
-    ImGui.SetNextWindowSize(410, 245, ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(410, 320, ImGuiCond.FirstUseEver)
     ImGui.Begin(MOD_NAME)
 
     if liveBridgeDetected then
@@ -270,7 +325,8 @@ registerForEvent("onDraw", function()
             or (activePatchRoute == "mixed" and "Mixed" or "Local")))
         ImGui.Text("Bridge: Connected (" .. route .. ")")
         local requested = activeMode == "dynamic"
-            and ("Dynamic @ " .. (activeDynamicTarget == 0 and "refresh" or (tostring(activeDynamicTarget) .. " FPS")))
+            and ("Dynamic @ " .. (activeDynamicTarget == 0 and "refresh" or (tostring(activeDynamicTarget) .. " FPS"))
+                .. (activeDynamicExperimental56 and " | max 6x*" or " | max 4x"))
             or (tostring(activeMultiplier) .. "x")
         ImGui.Text("Requested: " .. requested)
 
@@ -299,8 +355,31 @@ registerForEvent("onDraw", function()
             statusValue = statusValue .. " | VRAM low"
         end
         ImGui.Text(statusLabel .. ": " .. statusValue)
+        if realFps and dlssFps and fpsSampleAgeMs and fpsSampleAgeMs <= 2000 then
+            ImGui.Text("FPS: " .. tostring(math.floor(realFps + 0.5))
+                .. " real | " .. tostring(math.floor(dlssFps + 0.5)) .. " DLSS")
+        else
+            ImGui.Text("FPS: Waiting")
+        end
+        local uiStatus = "Waiting for HUDless"
+        if not uiTagHookInstalled then
+            uiStatus = "Unavailable"
+        elseif uiRecompositionEnabled and uiRecompositionForced then
+            uiStatus = "Recomposition requested"
+        elseif gameUiRecompositionEnabled and uiRecompositionEnabled then
+            uiStatus = "Game managed"
+        elseif hudlessTagActive and (uiAlphaTagActive or uiColorAlphaTagActive)
+            and not uiDimensionsKnown then
+            uiStatus = "Buffer size unknown"
+        elseif hudlessTagActive and (uiAlphaTagActive or uiColorAlphaTagActive)
+            and not uiDimensionsMatch then
+            uiStatus = "Buffer size mismatch"
+        elseif hudlessTagActive then
+            uiStatus = "HUDless only"
+        end
+        ImGui.Text("UI: " .. uiStatus)
     elseif nativeStatusDetected then
-        if nativeStatusVersion and nativeStatusVersion < 4 then
+        if nativeStatusVersion and nativeStatusVersion < 6 then
             ImGui.Text("Bridge: Update RTX40MFG.asi")
         else
             ImGui.Text("Bridge: Waiting for active DLSS-G modules")
@@ -342,6 +421,15 @@ registerForEvent("onDraw", function()
     if selectedMode == "dynamic" then
         local autoTarget = dynamicTargetFrameRate == 0
         local changed = false
+        local experimental = dynamicExperimental56
+        experimental, changed = ImGui.Checkbox("Allow Dynamic 5x / 6x*", experimental)
+        if changed then
+            dynamicExperimental56 = experimental
+            saveConfig()
+        end
+        if dynamicExperimental56 then
+            ImGui.Text("* Experimental")
+        end
         autoTarget, changed = ImGui.Checkbox("Use display refresh", autoTarget)
         if changed then
             dynamicTargetFrameRate = autoTarget and 0 or lastCustomTarget

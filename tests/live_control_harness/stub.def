@@ -1,3 +1,5 @@
 LIBRARY "sl.interposer.dll"
 EXPORTS
     slGetFeatureFunction
+    slSetTag
+    slSetTagForFrame

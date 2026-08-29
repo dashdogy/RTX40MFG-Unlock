@@ -38,3 +38,16 @@ SL_API sl::Result slGetFeatureFunction(
         function = reinterpret_cast<void*>(GetProcAddress(wrapper, "FakeGetState"));
     return function ? sl::Result::eOk : sl::Result::eErrorFeatureMissing;
 }
+
+SL_API sl::Result slSetTag(const sl::ViewportHandle&, const sl::ResourceTag*,
+    uint32_t, sl::CommandBuffer*)
+{
+    return sl::Result::eOk;
+}
+
+SL_API sl::Result slSetTagForFrame(const sl::FrameToken&,
+    const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t,
+    sl::CommandBuffer*)
+{
+    return sl::Result::eOk;
+}

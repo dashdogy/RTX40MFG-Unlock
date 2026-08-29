@@ -5,10 +5,19 @@
 #include <atomic>
 #include <string>
 
+extern "C" void WrapperSignature();
+
 namespace
 {
 std::atomic<uint32_t> gActualMultiplier{1};
 std::atomic<bool> gTransientNotInitializedReturned{false};
+std::atomic<bool> gUiRecompositionEnabled{false};
+
+uint32_t MaximumGeneratedFrames()
+{
+    const auto* signature = reinterpret_cast<const uint8_t*>(&WrapperSignature);
+    return signature[0] == 0xBA ? signature[1] : 0;
+}
 
 bool EnvironmentEnabled(const wchar_t* name)
 {
@@ -35,6 +44,9 @@ extern "C" __declspec(dllexport) void* slGetPluginFunction(const char*)
 extern "C" __declspec(dllexport) sl::Result FakeSetOptions(
     const sl::ViewportHandle&, const sl::DLSSGOptions& options)
 {
+    gUiRecompositionEnabled.store(options.structVersion >= sl::kStructVersion4
+        && options.enableUserInterfaceRecomposition == sl::Boolean::eTrue,
+        std::memory_order_relaxed);
     const std::wstring ngxPath = NgxPath();
     if (!GetModuleHandleW(ngxPath.c_str())
         && !LoadLibraryW(ngxPath.c_str()))
@@ -48,11 +60,16 @@ extern "C" __declspec(dllexport) sl::Result FakeSetOptions(
     if (options.mode == sl::DLSSGMode::eOff)
         gActualMultiplier.store(0, std::memory_order_relaxed);
     else if (options.mode == sl::DLSSGMode::eDynamic)
-        gActualMultiplier.store(4, std::memory_order_relaxed);
+        gActualMultiplier.store(MaximumGeneratedFrames() + 1, std::memory_order_relaxed);
     else
         gActualMultiplier.store(options.numFramesToGenerate + 1, std::memory_order_relaxed);
     return options.mode == sl::DLSSGMode::eOn && options.numFramesToGenerate == 2
         ? sl::Result::eWarnOutOfVRAM : sl::Result::eOk;
+}
+
+extern "C" __declspec(dllexport) uint32_t FakeUiRecompositionEnabled()
+{
+    return gUiRecompositionEnabled.load(std::memory_order_relaxed) ? 1u : 0u;
 }
 
 extern "C" __declspec(dllexport) sl::Result FakeGetState(
@@ -61,7 +78,7 @@ extern "C" __declspec(dllexport) sl::Result FakeGetState(
     state.status = sl::DLSSGStatus::eOk;
     state.numFramesActuallyPresented = gActualMultiplier.load(std::memory_order_relaxed);
     if (state.structVersion >= sl::kStructVersion2)
-        state.numFramesToGenerateMax = 5;
+        state.numFramesToGenerateMax = MaximumGeneratedFrames();
     if (state.structVersion >= sl::kStructVersion4)
         state.bIsDynamicMFGSupported = sl::Boolean::eTrue;
     return sl::Result::eOk;

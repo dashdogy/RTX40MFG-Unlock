@@ -4,6 +4,10 @@ Experimental Cyber Engine Tweaks mod providing fixed 2x through 6x and Dynamic
 DLSS Frame Generation controls on RTX 40 series GPUs. The 5x and 6x modes are
 especially experimental.
 
+Dynamic defaults to a 4x ceiling. Its UI toggle allows experimental 5x and 6x.
+UI recomposition is requested only when matching HUDless and UI buffers are tagged.
+The panel reports rendered FPS and total DLSS output FPS.
+
 This is an unsupported research mod. Modes above 2x may cause artifacts,
 latency, frozen presentation, black screens, or crashes.
 
