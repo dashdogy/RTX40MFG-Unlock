@@ -1,0 +1,5 @@
+EXPORTS
+    slGetPluginFunction
+    FakeSetOptions
+    FakeGetState
+    WrapperSignature

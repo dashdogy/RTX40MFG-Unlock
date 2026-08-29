@@ -1,0 +1,4 @@
+EXPORTS
+    NVSDK_NGX_D3D12_CreateFeature
+    NVSDK_NGX_GetGPUArchitecture
+    NgxSignature

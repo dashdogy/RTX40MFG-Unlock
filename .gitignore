@@ -1,0 +1,5 @@
+/build/
+/build-tests/
+/outputs/
+/test_runs/
+**/bridge_status.json
