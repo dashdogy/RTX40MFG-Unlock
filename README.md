@@ -1,14 +1,14 @@
 # RTX 40 MFG Unlock for Cyberpunk 2077
 
 Experimental Cyber Engine Tweaks mod providing fixed 2x/3x/4x and Dynamic
-DLSS Frame Generation controls on RTX 40-series GPUs.
+DLSS Frame Generation controls on RTX 40 series GPUs.
 
 This is an unsupported research mod. Modes above 2x may cause artifacts,
 latency, frozen presentation, black screens, or crashes.
 
 ## Install
 
-Requires Cyberpunk 2077, Cyber Engine Tweaks, an RTX 40-series GPU, and DLSS
+Requires Cyberpunk 2077, Cyber Engine Tweaks, an RTX 40 series GPU, and DLSS
 Frame Generation enabled. CET 1.37.1 was used during development.
 
 Extract `bin` into the Cyberpunk game directory, merge folders, then select a
@@ -17,17 +17,17 @@ mode from the CET overlay. Changes apply live.
 ## How it works
 
 The ASI intercepts `slGetFeatureFunction`, watches modules actually loaded by
-the game, and identifies Streamline/NGX candidates by exports and exact code
-signatures. It patches only mapped process memory—never DLLs on disk—and does
+the game, and identifies Streamline and NGX candidates by exports and exact code
+signatures. It patches only mapped process memory, never DLLs on disk, and does
 not assume NVIDIA cache paths.
 
-The bridge becomes ready only after the active DLSS-G wrapper and loaded NGX
+The bridge becomes ready only after the active DLSS G wrapper and loaded NGX
 module are verified and patched. It then adjusts `slDLSSGSetOptions` and reads
 actual presentation counts through `slDLSSGGetState`.
 
-The approach targets Streamline DLSS-G rather than Cyberpunk's renderer. In
-another Streamline game, only the early DLL-loading integration, UI, paths, and
-version-specific signatures would need to be adapted. The included harness
+The approach targets Streamline DLSS G rather than Cyberpunk's renderer. In
+another Streamline game, only the early DLL loading integration, UI, paths, and
+version specific signatures would need to be adapted. The included harness
 demonstrates the expected call flow and deferred NGX loading.
 
 ## Build
@@ -40,4 +40,4 @@ cmake -S .\source\native -B .\build -G "Visual Studio 17 2022" -A x64 `
 cmake --build .\build --config Release --parallel
 ```
 
-Logs are written to `%TEMP%\MfgUnlock-<process-id>.log`.
+Logs are written to the temporary directory and include the process ID.
