@@ -28,6 +28,7 @@ std::atomic<uint32_t> gDynamicTargetFrameRate{0};
 std::atomic<uint64_t> gDesiredRevision{0};
 std::atomic<uint64_t> gAppliedRevision{0};
 std::atomic<uint64_t> gAttemptedRevision{0};
+std::atomic<uint64_t> gLastAttemptTick{0};
 std::atomic<bool> gControlReady{false};
 std::atomic<PFun_slGetFeatureFunction*> gOriginalGetFeatureFunction{nullptr};
 std::atomic<PFun_slDLSSGSetOptions*> gOriginalSetOptions{nullptr};
@@ -50,6 +51,7 @@ std::atomic<uint64_t> gStateSampleTick{0};
 std::atomic<uint64_t> gSetOptionsCalls{0};
 std::atomic<uint64_t> gGetStateCalls{0};
 std::atomic<uint64_t> gLiveReapplyCount{0};
+std::atomic<uint64_t> gNotInitializedRetryCount{0};
 std::atomic<bool> gDllNotificationRegistered{false};
 std::atomic<bool> gLiveHookInstalled{false};
 std::atomic<uint32_t> gLoadedWrapperCandidates{0};
@@ -71,6 +73,7 @@ std::wstring gExecutableDirectory;
 
 constexpr uint32_t kRouteLocal = 1u;
 constexpr uint32_t kRouteExternal = 2u;
+constexpr uint64_t kNotInitializedRetryDelayMs = 500;
 
 struct ControlConfig
 {
@@ -406,7 +409,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"actualFramesPresented\":%u,\"numFramesToGenerateMax\":%u,"
         "\"dlssgStatus\":%u,\"dynamicMfgSupported\":%s,"
         "\"stateSampleAgeMs\":%llu,\"setOptionsCalls\":%llu,"
-        "\"getStateCalls\":%llu,\"liveReapplyCount\":%llu}\n",
+        "\"getStateCalls\":%llu,\"liveReapplyCount\":%llu,"
+        "\"notInitializedRetryCount\":%llu}\n",
         static_cast<unsigned long>(pid),
         static_cast<unsigned long long>(UnixTimeSeconds()), route,
         bridgeReady ? "true" : "false",
@@ -436,7 +440,9 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         static_cast<unsigned long long>(stateAgeMs),
         static_cast<unsigned long long>(gSetOptionsCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(gGetStateCalls.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(gLiveReapplyCount.load(std::memory_order_relaxed)));
+        static_cast<unsigned long long>(gLiveReapplyCount.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gNotInitializedRetryCount.load(std::memory_order_relaxed)));
     if (length <= 0)
         return false;
 
@@ -534,6 +540,7 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result, bo
 {
     gSetOptionsSeen.store(true, std::memory_order_release);
     gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+    gLastAttemptTick.store(GetTickCount64(), std::memory_order_relaxed);
     gAttemptedRevision.store(snapshot.revision, std::memory_order_release);
     // eWarnOutOfVRAM is emitted after Streamline accepts work when DXGI reports
     // no remaining budget. Keep the raw warning for telemetry, but do not leave
@@ -585,14 +592,38 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
 
     const ControlSnapshot snapshot = ReadControlSnapshot();
     if (snapshot.revision == 0
-        || snapshot.revision == gAppliedRevision.load(std::memory_order_acquire)
-        || snapshot.revision == gAttemptedRevision.load(std::memory_order_acquire))
+        || snapshot.revision == gAppliedRevision.load(std::memory_order_acquire))
         return;
+
+    const uint64_t attemptedRevision =
+        gAttemptedRevision.load(std::memory_order_acquire);
+    bool retryNotInitialized = false;
+    if (snapshot.revision == attemptedRevision)
+    {
+        const int32_t result = gLastSetOptionsResult.load(std::memory_order_relaxed);
+        if (result != static_cast<int32_t>(sl::Result::eErrorNotInitialized))
+            return;
+        const uint64_t now = GetTickCount64();
+        const uint64_t previousAttempt =
+            gLastAttemptTick.load(std::memory_order_relaxed);
+        if (now < previousAttempt
+            || now - previousAttempt < kNotInitializedRetryDelayMs)
+            return;
+        retryNotInitialized = true;
+    }
 
     auto* original = gOriginalSetOptions.load(std::memory_order_acquire);
     sl::DLSSGOptions source{};
     if (!original || !ReadLastGameOptions(viewport, source))
         return;
+    if (retryNotInitialized)
+    {
+        const uint64_t retry =
+            gNotInitializedRetryCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        Log(L"Retrying request revision %llu after Streamline result 21 (retry %llu)",
+            static_cast<unsigned long long>(snapshot.revision),
+            static_cast<unsigned long long>(retry));
+    }
 
     gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
     const sl::Result result =

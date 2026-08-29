@@ -31,6 +31,22 @@ std::string ReadStatus()
     data << file.rdbuf();
     return data.str();
 }
+
+bool EnvironmentEnabled(const wchar_t* name)
+{
+    wchar_t value[8]{};
+    const DWORD length = GetEnvironmentVariableW(name, value, _countof(value));
+    return length > 0 && length < _countof(value) && value[0] != L'0';
+}
+
+std::wstring NgxPath()
+{
+    wchar_t path[32768]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"MFG_HARNESS_NGX_PATH", path, _countof(path));
+    return length > 0 && length < _countof(path)
+        ? std::wstring(path, length) : L"nvngx_dlssg.dll";
+}
 }
 
 int wmain()
@@ -45,6 +61,14 @@ int wmain()
     }
 
     Sleep(2000);
+    const bool transientNotInitialized =
+        EnvironmentEnabled(L"MFG_HARNESS_TRANSIENT_21");
+    if (transientNotInitialized && !LoadLibraryW(NgxPath().c_str()))
+    {
+        fputs("could not preload NGX stub\n", stderr);
+        return 11;
+    }
+
     void* setAddress = nullptr;
     void* getAddress = nullptr;
     const sl::Result setLookup = slGetFeatureFunction(
@@ -66,8 +90,22 @@ int wmain()
     options.structVersion = sl::kStructVersion3;
     options.mode = sl::DLSSGMode::eOn;
     options.numFramesToGenerate = 1;
-    if (setOptions(viewport, options) != sl::Result::eOk)
+    const sl::Result initialSetResult = setOptions(viewport, options);
+    if ((!transientNotInitialized && initialSetResult != sl::Result::eOk)
+        || (transientNotInitialized
+            && initialSetResult != sl::Result::eErrorNotInitialized))
         return 12;
+    if (transientNotInitialized)
+    {
+        sl::DLSSGState cooldownState{};
+        if (getState(viewport, cooldownState, &options) != sl::Result::eOk)
+            return 13;
+        printf_s("before retry cooldown actual=%u\n",
+            cooldownState.numFramesActuallyPresented);
+        if (cooldownState.numFramesActuallyPresented != 1)
+            return 14;
+        Sleep(700);
+    }
 
     sl::DLSSGState initialState{};
     if (getState(viewport, initialState, &options) != sl::Result::eOk)
@@ -95,9 +133,15 @@ int wmain()
     Sleep(1200);
     const std::string status = ReadStatus();
     puts(status.c_str());
+    const std::string expectedLiveReapplyCount = transientNotInitialized
+        ? "\"liveReapplyCount\":2" : "\"liveReapplyCount\":1";
+    const std::string expectedRetryCount = transientNotInitialized
+        ? "\"notInitializedRetryCount\":1"
+        : "\"notInitializedRetryCount\":0";
     if (status.find("\"actualFramesPresented\":4") == std::string::npos
         || status.find("\"pending\":false") == std::string::npos
-        || status.find("\"liveReapplyCount\":1") == std::string::npos)
+        || status.find(expectedLiveReapplyCount) == std::string::npos
+        || status.find(expectedRetryCount) == std::string::npos)
         return 18;
 
     if (!WriteControl("dynamic", 4, 120))
@@ -133,5 +177,7 @@ int wmain()
         return 24;
 
     puts("LIVE_CONTROL_DYNAMIC_AND_VRAM_WARNING_HARNESS_OK");
+    if (transientNotInitialized)
+        puts("TRANSIENT_ERROR_21_RETRY_HARNESS_OK");
     return 0;
 }

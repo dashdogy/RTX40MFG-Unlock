@@ -8,6 +8,14 @@
 namespace
 {
 std::atomic<uint32_t> gActualMultiplier{1};
+std::atomic<bool> gTransientNotInitializedReturned{false};
+
+bool EnvironmentEnabled(const wchar_t* name)
+{
+    wchar_t value[8]{};
+    const DWORD length = GetEnvironmentVariableW(name, value, _countof(value));
+    return length > 0 && length < _countof(value) && value[0] != L'0';
+}
 
 std::wstring NgxPath()
 {
@@ -31,6 +39,9 @@ extern "C" __declspec(dllexport) sl::Result FakeSetOptions(
     if (!GetModuleHandleW(ngxPath.c_str())
         && !LoadLibraryW(ngxPath.c_str()))
         return sl::Result::eErrorMissingOrInvalidAPI;
+    if (EnvironmentEnabled(L"MFG_HARNESS_TRANSIENT_21")
+        && !gTransientNotInitializedReturned.exchange(true, std::memory_order_relaxed))
+        return sl::Result::eErrorNotInitialized;
     if (options.mode == sl::DLSSGMode::eDynamic
         && options.structVersion < sl::kStructVersion5)
         return sl::Result::eErrorInvalidParameter;
