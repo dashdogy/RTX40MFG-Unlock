@@ -6,5 +6,3 @@ EXPORTS
     FakeTemporalSequenceValid
     FakeTemporalCalls
     NgxSignature
-    NgxSynthesisSignature
-    NgxMultiFrameMaximumSignature

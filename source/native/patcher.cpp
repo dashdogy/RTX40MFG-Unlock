@@ -1,10 +1,15 @@
 #include "shared.h"
+#include "present_probe.h"
+#include "ngx_output_probe.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <winternl.h>
+#include <d3d12.h>
 #include <sl.h>
+#include <sl_core_api.h>
 #include <sl_dlss_g.h>
+#include <nvsdk_ngx.h>
 
 #include <algorithm>
 #include <array>
@@ -14,7 +19,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <iterator>
+#include <intrin.h>
 #include <mutex>
 #include <share.h>
 #include <string>
@@ -22,21 +29,37 @@
 
 namespace
 {
+enum class FeatureRecycleStage : uint32_t
+{
+    eIdle = 0,
+    eWaitingForOffState = 1,
+    eWaitingForDrain = 2,
+    eReenabling = 3,
+};
+
+using D3D12CreateDeviceFn = HRESULT (WINAPI*)(
+    IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+
 FILE* gLog = nullptr;
 std::atomic<uint32_t> gDesiredMultiplier{2};
 std::atomic<bool> gDesiredDynamicMode{false};
 std::atomic<uint32_t> gDynamicTargetFrameRate{0};
 std::atomic<bool> gDynamicExperimental56{false};
+std::atomic<bool> gGeneratedOnlyDebug{false};
 std::atomic<uint64_t> gDesiredRevision{0};
 std::atomic<uint64_t> gAppliedRevision{0};
 std::atomic<uint64_t> gAttemptedRevision{0};
 std::atomic<uint64_t> gLastAttemptTick{0};
 std::atomic<bool> gControlReady{false};
 std::atomic<PFun_slGetFeatureFunction*> gOriginalGetFeatureFunction{nullptr};
+std::atomic<PFun_slSetD3DDevice*> gOriginalSetD3DDevice{nullptr};
+std::atomic<PFun_slUpgradeInterface*> gOriginalUpgradeInterface{nullptr};
+std::atomic<D3D12CreateDeviceFn> gOriginalD3D12CreateDevice{nullptr};
 std::atomic<PFun_slSetTag*> gOriginalSetTag{nullptr};
 std::atomic<PFun_slSetTagForFrame*> gOriginalSetTagForFrame{nullptr};
 std::atomic<PFun_slDLSSGSetOptions*> gOriginalSetOptions{nullptr};
 std::atomic<PFun_slDLSSGGetState*> gOriginalGetState{nullptr};
+std::atomic<PFun_slFreeResources*> gOriginalFreeResources{nullptr};
 std::atomic<bool> gSetOptionsHookExposed{false};
 std::atomic<bool> gGetStateHookExposed{false};
 std::atomic<bool> gSetOptionsSeen{false};
@@ -48,6 +71,7 @@ std::atomic<bool> gAppliedDynamicMode{false};
 std::atomic<uint32_t> gAppliedMultiplier{0};
 std::atomic<uint32_t> gAppliedDynamicTargetFrameRate{0};
 std::atomic<bool> gAppliedDynamicExperimental56{false};
+std::atomic<bool> gAppliedGeneratedOnlyDebug{false};
 std::atomic<uint32_t> gActualFramesPresented{0};
 std::atomic<uint32_t> gNumFramesToGenerateMax{0};
 std::atomic<uint32_t> gDlssgStatus{0};
@@ -57,13 +81,86 @@ std::atomic<uint64_t> gSetOptionsCalls{0};
 std::atomic<uint64_t> gGetStateCalls{0};
 std::atomic<uint64_t> gLiveReapplyCount{0};
 std::atomic<uint64_t> gNotInitializedRetryCount{0};
+std::atomic<bool> gStreamlineRebuildRequired{false};
+std::atomic<uint64_t> gDeferredLifecycleRevision{0};
+std::atomic<uint64_t> gLifecycleDeferralLoggedRevision{0};
+std::atomic<uint64_t> gCleanEnableApplyCount{0};
+std::atomic<uint64_t> gHostLifecycleResetCount{0};
+std::atomic<bool> gCleanEnableBoundaryAvailable{true};
+std::atomic<bool> gCleanEnableRetryPending{false};
+std::atomic<uint64_t> gMissedCleanEnableCount{0};
+std::atomic<uint32_t> gFeatureRecycleStage{
+    static_cast<uint32_t>(FeatureRecycleStage::eIdle)};
+std::atomic<uint64_t> gFeatureRecycleRevision{0};
+std::atomic<uint64_t> gFeatureRecycleCount{0};
+std::atomic<uint64_t> gFeatureRecycleFreeCalls{0};
+std::atomic<int32_t> gFeatureRecycleLastFreeResult{
+    static_cast<int32_t>(sl::Result::eErrorNotInitialized)};
+std::atomic<bool> gFeatureRecycleOffStateObserved{false};
+std::atomic<uint64_t> gFeatureRecycleStatePolls{0};
+std::atomic<uint64_t> gFeatureRecycleFenceValue{0};
+std::atomic<uint64_t> gFeatureRecycleFenceCompletedValue{0};
+std::atomic<uint32_t> gFeatureRecycleOutstandingOutputs{0};
+std::atomic<bool> gFeatureRecycleExplicitFreeSkipped{false};
+std::atomic<bool> gNgxEvaluateLookupHookInstalled{false};
+std::atomic<bool> gNgxEvaluateHookExposed{false};
+std::atomic<bool> gNgxEvaluateSeen{false};
+std::atomic<uint64_t> gNgxEvaluateCalls{0};
+std::atomic<uint64_t> gNgxTemporalValidCount{0};
+std::atomic<uint64_t> gNgxTemporalInvalidCount{0};
+std::atomic<uint32_t> gNgxSeenCountMask{0};
+std::atomic<uint32_t> gNgxSeenIndexMask{0};
+std::atomic<int32_t> gNgxLastCountGetResult{
+    static_cast<int32_t>(NVSDK_NGX_Result_FAIL_NotInitialized)};
+std::atomic<int32_t> gNgxLastIndexGetResult{
+    static_cast<int32_t>(NVSDK_NGX_Result_FAIL_NotInitialized)};
+std::atomic<int32_t> gNgxLastRawCount{0};
+std::atomic<int32_t> gNgxLastRawIndex{0};
+std::atomic<int32_t> gNgxLastFrameIdGetResult{
+    static_cast<int32_t>(NVSDK_NGX_Result_FAIL_NotInitialized)};
+std::atomic<int32_t> gNgxLastOutputGetResult{
+    static_cast<int32_t>(NVSDK_NGX_Result_FAIL_NotInitialized)};
+std::atomic<uint64_t> gNgxOutputCompleteBatches{0};
+std::atomic<uint64_t> gNgxOutputAliasedBatches{0};
+std::atomic<uint32_t> gNgxLastOutputUniqueCount{0};
+std::atomic<uint64_t> gNgxLastFrameId{0};
+std::atomic<uintptr_t> gNgxLastOutputInterpolated{0};
+std::atomic<bool> gNgxFullStateRepairActive{false};
+std::atomic<uint64_t> gNgxFullStateForcedCount{0};
+std::atomic<int32_t> gNgxLastDisableInterpolationGetResult{
+    static_cast<int32_t>(NVSDK_NGX_Result_FAIL_NotInitialized)};
+std::atomic<uintptr_t> gNgxLastDisableInterpolationResource{0};
+std::atomic<uint64_t> gNgxDisableInterpolationResourcePreservedCount{0};
+std::atomic<int32_t> gNgxLastResetGetResult{
+    static_cast<int32_t>(NVSDK_NGX_Result_FAIL_NotInitialized)};
+std::atomic<int32_t> gNgxLastRawReset{0};
+std::atomic<uint64_t> gNgxResetPreservedCount{0};
+std::atomic<bool> gForceFullNgxState{false};
+std::atomic<bool> gDisableAutomaticFullNgxState{false};
+std::atomic<bool> gExperimentalSm120Target{false};
+std::atomic<bool> gExperimentalDl4rtSm120Path{false};
+std::atomic<bool> gExperimentalTemporalPreEmphasis{false};
+std::atomic<bool> gExperimentalTemporalPreEmphasisPatchActive{false};
+std::atomic<bool> gPresentProbeEnvironmentEnabled{false};
+std::atomic<bool> gNgxOutputProbeEnvironmentEnabled{false};
+std::atomic<bool> gImmutableOutputEnvironmentEnabled{false};
+std::atomic<uint64_t> gForcedBackbufferFrameId{1};
+std::atomic<uint64_t> gNgxOutputBatchSequence{0};
 std::atomic<bool> gDllNotificationRegistered{false};
 std::atomic<bool> gLiveHookInstalled{false};
+std::atomic<bool> gD3DDeviceHookInstalled{false};
+std::atomic<bool> gD3D12CreateDeviceHookInstalled{false};
+std::atomic<bool> gSlUpgradeInterfaceHookInstalled{false};
+std::atomic<bool> gEarlyD3D12DeviceCaptured{false};
 std::atomic<bool> gUiTagHookInstalled{false};
 std::atomic<uint32_t> gLoadedWrapperCandidates{0};
 std::atomic<uint32_t> gPatchedWrapperCandidates{0};
 std::atomic<uint32_t> gLoadedNgxCandidates{0};
 std::atomic<uint32_t> gPatchedNgxCandidates{0};
+std::atomic<uint32_t> gLoadedNgxSynthesisCandidates{0};
+std::atomic<uint32_t> gPatchedNgxSynthesisCandidates{0};
+std::atomic<bool> gPerSampleSynthesisReady{false};
+std::atomic<uint64_t> gSynthesisFallbackLoggedRevision{0};
 std::atomic<uint32_t> gWrapperRouteBits{0};
 std::atomic<uint32_t> gNgxRouteBits{0};
 std::atomic<bool> gActiveWrapperObserved{false};
@@ -90,6 +187,9 @@ std::mutex gStreamlineCallMutex;
 std::mutex gLastOptionsMutex;
 std::mutex gModuleMutex;
 std::mutex gUiTagMutex;
+std::mutex gNgxEvaluateRouteMutex;
+std::mutex gNgxOutputBatchMutex;
+std::mutex gNgxForceStateMutex;
 std::wstring gConfigPath;
 std::wstring gStatusPath;
 std::wstring gExecutableDirectory;
@@ -109,6 +209,7 @@ struct ControlConfig
     bool dynamic = false;
     uint32_t dynamicTargetFrameRate = 0;
     bool dynamicExperimental56 = false;
+    bool generatedOnlyDebug = false;
 };
 
 struct ControlSnapshot
@@ -124,6 +225,15 @@ struct LastGameOptions
     bool valid = false;
 };
 
+struct FeatureRecycleContext
+{
+    FeatureRecycleStage stage = FeatureRecycleStage::eIdle;
+    ControlSnapshot snapshot{};
+    sl::ViewportHandle viewport{0u};
+    sl::DLSSGOptions source{};
+    uint64_t offSubmittedTick = 0;
+};
+
 struct ModuleRecord
 {
     HMODULE module = nullptr;
@@ -132,10 +242,47 @@ struct ModuleRecord
     bool wrapperCandidate = false;
     bool wrapperPatched = false;
     uint8_t* wrapperMaximumImmediate = nullptr;
+    bool ngxEvaluateLookupHooked = false;
     bool ngxExport = false;
     bool ngxCandidate = false;
     bool ngxPatched = false;
+    bool ngxAdaSynthesisCandidate = false;
+    bool ngxAdaSynthesisPatched = false;
+    bool ngxMultiFrameMaximumCandidate = false;
+    bool ngxMultiFrameMaximumPatched = false;
+    bool ngxCachedDlssgImplementation = false;
+    bool ngxTemporalPreEmphasisCandidate = false;
+    bool ngxTemporalPreEmphasisPatched = false;
     bool inventoryLogged = false;
+};
+
+using GetProcAddressFn = FARPROC (WINAPI*)(HMODULE, LPCSTR);
+using NgxD3D12EvaluateFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(
+    ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
+    const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+
+struct NgxEvaluateRoute
+{
+    HMODULE wrapper = nullptr;
+    GetProcAddressFn originalGetProcAddress = nullptr;
+    NgxD3D12EvaluateFeatureFn originalEvaluate = nullptr;
+};
+
+struct NgxOutputBatch
+{
+    const NVSDK_NGX_Handle* handle = nullptr;
+    uint64_t sequence = 0;
+    int count = 0;
+    std::array<uintptr_t, kExperimentalMaximumGeneratedFrames> outputs{};
+    uint32_t seenMask = 0;
+};
+
+struct NgxForceEpoch
+{
+    const NVSDK_NGX_Handle* handle = nullptr;
+    int count = 0;
+    uint32_t firstBatchSeenMask = 0;
+    bool firstBatchComplete = false;
 };
 
 struct UiResourceTagState
@@ -175,14 +322,22 @@ struct UiInputSnapshot
 };
 
 LastGameOptions gLastGameOptions;
+FeatureRecycleContext gFeatureRecycle;
 std::vector<ModuleRecord> gModuleRecords;
 std::vector<UiViewportTagState> gUiViewportTags;
+std::vector<NgxEvaluateRoute> gNgxEvaluateRoutes;
+std::vector<NgxOutputBatch> gNgxOutputBatches;
+std::vector<NgxForceEpoch> gNgxForceEpochs;
 LARGE_INTEGER gFpsCounterFrequency{};
 LARGE_INTEGER gFpsWindowStart{};
 uint64_t gFpsWindowRealFrames = 0;
 uint64_t gFpsWindowPresentedFrames = 0;
 
 void ObserveActiveWrapperProvider(void* function);
+FARPROC WINAPI HookWrapperGetProcAddress(HMODULE module, LPCSTR functionName);
+NVSDK_NGX_Result NVSDK_CONV HookNgxD3D12EvaluateFeature(
+    ID3D12GraphicsCommandList* commandList, const NVSDK_NGX_Handle* featureHandle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback);
 
 void Log(const wchar_t* format, ...)
 {
@@ -202,11 +357,24 @@ void Log(const wchar_t* format, ...)
     }
 }
 
+void ProbeLog(const wchar_t* message)
+{
+    Log(L"%s", message);
+}
+
 uint8_t RequestedMaximumGeneratedFrames(const ControlConfig& control)
 {
     return control.dynamic && !control.dynamicExperimental56
         ? kStandardMaximumGeneratedFrames
         : kExperimentalMaximumGeneratedFrames;
+}
+
+uint8_t RequestedActiveGeneratedFrames(const ControlConfig& control)
+{
+    return control.dynamic
+        ? RequestedMaximumGeneratedFrames(control)
+        : static_cast<uint8_t>(std::clamp(
+            control.multiplier, kMinimumMultiplier, kMaximumMultiplier) - 1u);
 }
 
 bool SetWrapperMaximum(ModuleRecord& record, uint8_t maximum)
@@ -448,11 +616,26 @@ void RecordDlssgStateResult(
     if (state.structVersion >= sl::kStructVersion2)
         gNumFramesToGenerateMax.store(
             state.numFramesToGenerateMax, std::memory_order_relaxed);
+    if (state.structVersion >= sl::kStructVersion3
+        && state.inputsProcessingCompletionFence
+        && state.lastPresentInputsProcessingCompletionFenceValue != 0)
+    {
+        ngx_output_probe::NotifyStreamlineCompletionFence(
+            static_cast<ID3D12Fence*>(state.inputsProcessingCompletionFence),
+            state.lastPresentInputsProcessingCompletionFenceValue);
+    }
     if (state.structVersion >= sl::kStructVersion4)
         gDynamicMfgSupported.store(
             state.bIsDynamicMFGSupported == sl::Boolean::eTrue,
             std::memory_order_relaxed);
     gStateSampleTick.store(GetTickCount64(), std::memory_order_release);
+
+    if (gFeatureRecycleStage.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(FeatureRecycleStage::eWaitingForOffState)
+        && state.numFramesActuallyPresented <= 1)
+    {
+        gFeatureRecycleOffStateObserved.store(true, std::memory_order_release);
+    }
 
     if (previous != state.numFramesActuallyPresented)
         Log(L"DLSS-G actual presentation count: %ux (maximum generated frames=%u, status=%u)",
@@ -491,6 +674,28 @@ bool BridgeReady()
         && gActiveWrapperObserved.load(std::memory_order_acquire)
         && gActiveWrapperPatched.load(std::memory_order_acquire)
         && gPatchedNgxCandidates.load(std::memory_order_acquire) > 0;
+}
+
+bool PerSampleSynthesisReady()
+{
+    return gPerSampleSynthesisReady.load(std::memory_order_acquire);
+}
+
+bool RequiresPerSampleSynthesis(const ControlConfig& control)
+{
+    return control.dynamic || control.multiplier > kMinimumMultiplier;
+}
+
+ControlSnapshot EffectiveControlSnapshot(const ControlSnapshot& requested)
+{
+    ControlSnapshot effective = requested;
+    if (RequiresPerSampleSynthesis(requested.control) && !PerSampleSynthesisReady())
+    {
+        effective.control.dynamic = false;
+        effective.control.multiplier = kMinimumMultiplier;
+        effective.control.dynamicExperimental56 = false;
+    }
+    return effective;
 }
 
 const char* PatchRouteName()
@@ -601,6 +806,12 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
             parsed.dynamicExperimental56))
         return false;
 
+    size_t generatedOnlyOffset = 0;
+    if (FindJsonValue(content, "generatedOnlyDebug", generatedOnlyOffset)
+        && !TryParseBoolean(content, "generatedOnlyDebug",
+            parsed.generatedOnlyDebug))
+        return false;
+
     control = parsed;
     return true;
 }
@@ -642,6 +853,14 @@ ControlConfig ReadInitialControl()
     return ReadControlFile(gConfigPath, fileControl) ? fileControl : control;
 }
 
+bool ReadEnvironmentFlag(const wchar_t* name)
+{
+    wchar_t value[8]{};
+    const DWORD length = GetEnvironmentVariableW(
+        name, value, static_cast<DWORD>(std::size(value)));
+    return length == 1 && value[0] == L'1';
+}
+
 std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableDirectory)
 {
     wchar_t explicitPath[32768]{};
@@ -663,11 +882,14 @@ std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableD
 
 uint64_t StoreControl(const ControlConfig& control)
 {
-    ApplyWrapperMaximum(control);
+    // Do not alter the active wrapper's allocation maximum from this watcher
+    // thread. Multiplier-shape changes are applied on the serialized render
+    // path only after DLSS-G has entered Off and its work has drained.
     gDesiredMultiplier.store(control.multiplier, std::memory_order_relaxed);
     gDesiredDynamicMode.store(control.dynamic, std::memory_order_relaxed);
     gDynamicTargetFrameRate.store(control.dynamicTargetFrameRate, std::memory_order_relaxed);
     gDynamicExperimental56.store(control.dynamicExperimental56, std::memory_order_relaxed);
+    gGeneratedOnlyDebug.store(control.generatedOnlyDebug, std::memory_order_relaxed);
     const uint64_t revision = gDesiredRevision.fetch_add(1, std::memory_order_release) + 1;
     gControlReady.store(true, std::memory_order_release);
     return revision;
@@ -685,6 +907,8 @@ ControlSnapshot ReadControlSnapshot()
             gDynamicTargetFrameRate.load(std::memory_order_relaxed);
         snapshot.control.dynamicExperimental56 =
             gDynamicExperimental56.load(std::memory_order_relaxed);
+        snapshot.control.generatedOnlyDebug =
+            gGeneratedOnlyDebug.load(std::memory_order_relaxed);
         const uint64_t after = gDesiredRevision.load(std::memory_order_acquire);
         if (before == after)
         {
@@ -692,6 +916,23 @@ ControlSnapshot ReadControlSnapshot()
             return snapshot;
         }
     }
+}
+
+ControlSnapshot ReadAppliedControlSnapshot()
+{
+    ControlSnapshot snapshot{};
+    snapshot.revision = gAppliedRevision.load(std::memory_order_acquire);
+    snapshot.control.dynamic =
+        gAppliedDynamicMode.load(std::memory_order_relaxed);
+    snapshot.control.multiplier =
+        gAppliedMultiplier.load(std::memory_order_relaxed);
+    snapshot.control.dynamicTargetFrameRate =
+        gAppliedDynamicTargetFrameRate.load(std::memory_order_relaxed);
+    snapshot.control.dynamicExperimental56 =
+        gAppliedDynamicExperimental56.load(std::memory_order_relaxed);
+    snapshot.control.generatedOnlyDebug =
+        gAppliedGeneratedOnlyDebug.load(std::memory_order_relaxed);
+    return snapshot;
 }
 
 void PublishLiveBridge(const ControlConfig& control)
@@ -705,6 +946,8 @@ void PublishLiveBridge(const ControlConfig& control)
     SetEnvironmentVariableW(L"RTX40_MFG_DYNAMIC_TARGET", target);
     SetEnvironmentVariableW(L"RTX40_MFG_DYNAMIC_EXPERIMENTAL_56",
         control.dynamicExperimental56 ? L"1" : L"0");
+    SetEnvironmentVariableW(L"RTX40_MFG_GENERATED_ONLY_DEBUG",
+        control.generatedOnlyDebug ? L"1" : L"0");
     SetEnvironmentVariableW(L"RTX40_MFG_AUTO_BRIDGE", L"1");
 }
 
@@ -736,6 +979,12 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     RefreshUiInputReadiness(uiViewport);
     const UiInputSnapshot uiInputs = ReadUiInputSnapshot(uiViewport);
     const bool bridgeReady = BridgeReady();
+    const bool perSampleSynthesisReady = PerSampleSynthesisReady();
+    const bool synthesisFallbackActive =
+        RequiresPerSampleSynthesis(control) && !perSampleSynthesisReady;
+    const uint32_t effectiveMaximumMultiplier = synthesisFallbackActive
+        ? kMinimumMultiplier
+        : static_cast<uint32_t>(RequestedMaximumGeneratedFrames(control)) + 1;
     const char* route = PatchRouteName();
     const uint64_t desiredRevision = gDesiredRevision.load(std::memory_order_acquire);
     const uint64_t appliedRevision = gAppliedRevision.load(std::memory_order_acquire);
@@ -749,9 +998,14 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         gLastGetStateResult.load(std::memory_order_relaxed);
     const bool setOptionsAccepted = setOptionsResult == static_cast<int32_t>(sl::Result::eOk)
         || setOptionsResult == static_cast<int32_t>(sl::Result::eWarnOutOfVRAM);
+    const uint32_t featureRecycleStage =
+        gFeatureRecycleStage.load(std::memory_order_acquire);
+    const bool featureRecycleActive = featureRecycleStage
+        != static_cast<uint32_t>(FeatureRecycleStage::eIdle);
     const bool applied = gameFrameGenerationOn && appliedRevision != 0
-        && setOptionsAccepted;
-    const bool pending = gameFrameGenerationOn && desiredRevision != appliedRevision;
+        && setOptionsAccepted && !featureRecycleActive;
+    const bool pending = gameFrameGenerationOn
+        && (desiredRevision != appliedRevision || featureRecycleActive);
     const uint64_t stateTick = gStateSampleTick.load(std::memory_order_acquire);
     const uint64_t nowTick = GetTickCount64();
     const uint64_t stateAgeMs = stateTick == 0 || nowTick < stateTick
@@ -759,22 +1013,59 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     const uint64_t fpsTick = gFpsSampleTick.load(std::memory_order_acquire);
     const uint64_t fpsAgeMs = fpsTick == 0 || nowTick < fpsTick
         ? 0 : nowTick - fpsTick;
+    const present_probe::Snapshot presentProbe = present_probe::ReadSnapshot();
+    const ngx_output_probe::Snapshot ngxOutputProbe =
+        ngx_output_probe::ReadSnapshot();
 
-    char json[4096]{};
+    char json[8192]{};
     const int length = sprintf_s(json,
-        "{\"version\":6,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
+        "{\"version\":23,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
         "\"bridgeReady\":%s,\"liveHookInstalled\":%s,"
+        "\"d3dDeviceHookInstalled\":%s,"
+        "\"d3d12CreateDeviceHookInstalled\":%s,"
+        "\"slUpgradeInterfaceHookInstalled\":%s,"
+        "\"earlyD3D12DeviceCaptured\":%s,"
         "\"uiTagHookInstalled\":%s,"
+        "\"ngxEvaluateLookupHookInstalled\":%s,"
+        "\"ngxEvaluateHookExposed\":%s,\"ngxEvaluateSeen\":%s,"
+        "\"presentFactoryImportHookInstalled\":%s,"
+        "\"presentNativeFactoryHookInstalled\":%s,"
+        "\"presentNativeSwapchainHookInstalled\":%s,"
+        "\"presentProbeEnabled\":%s,"
+        "\"nativePresentCalls\":%llu,"
+        "\"presentProbeScheduledFrames\":%llu,"
+        "\"presentProbeCapturedFrames\":%llu,"
+        "\"presentProbeDroppedFrames\":%llu,"
+        "\"ngxOutputProbeEnabled\":%s,"
+        "\"ngxOutputQueueHookInstalled\":%s,"
+        "\"ngxOutputProbeScheduled\":%llu,"
+        "\"ngxOutputProbeSubmitted\":%llu,"
+        "\"ngxOutputProbeCaptured\":%llu,"
+        "\"ngxOutputProbeDropped\":%llu,"
+        "\"ngxOutputProbeCompleteBatches\":%llu,"
+        "\"ngxOutputProbeDuplicateBatches\":%llu,"
+        "\"ngxImmutableOutputsEnabled\":%s,"
+        "\"ngxImmutablePrepared\":%llu,"
+        "\"ngxImmutableSubmitted\":%llu,"
+        "\"ngxImmutableRetired\":%llu,"
+        "\"ngxImmutableDropped\":%llu,"
+        "\"ngxImmutableReservationReclaims\":%llu,"
+        "\"ngxImmutableAllocated\":%u,"
         "\"activeWrapperObserved\":%s,\"activeWrapperPatched\":%s,"
         "\"loadedWrapperCandidates\":%u,\"patchedWrapperCandidates\":%u,"
         "\"loadedNgxCandidates\":%u,\"patchedNgxCandidates\":%u,"
+        "\"loadedNgxSynthesisCandidates\":%u,"
+        "\"patchedNgxSynthesisCandidates\":%u,"
+        "\"perSampleSynthesisReady\":%s,\"synthesisFallbackActive\":%s,"
         "\"mode\":\"%s\",\"multiplier\":%u,\"dynamicTargetFrameRate\":%u,"
-        "\"dynamicExperimental56\":%s,\"forcedMaximumMultiplier\":%u,"
+        "\"dynamicExperimental56\":%s,\"generatedOnlyDebug\":%s,"
+        "\"forcedMaximumMultiplier\":%u,"
         "\"requestRevision\":%llu,\"appliedRevision\":%llu,"
         "\"applied\":%s,\"pending\":%s,\"gameFrameGenerationOn\":%s,"
         "\"appliedMode\":\"%s\",\"appliedMultiplier\":%u,"
         "\"appliedDynamicTargetFrameRate\":%u,"
-        "\"appliedDynamicExperimental56\":%s,\"setOptionsSeen\":%s,"
+        "\"appliedDynamicExperimental56\":%s,"
+        "\"appliedGeneratedOnlyDebug\":%s,\"setOptionsSeen\":%s,"
         "\"setOptionsAccepted\":%s,"
         "\"setOptionsResult\":%d,\"getStateSeen\":%s,\"getStateResult\":%d,"
         "\"actualFramesPresented\":%u,\"numFramesToGenerateMax\":%u,"
@@ -793,22 +1084,96 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"setTagForFrameCalls\":%llu,"
         "\"stateSampleAgeMs\":%llu,\"setOptionsCalls\":%llu,"
         "\"getStateCalls\":%llu,\"liveReapplyCount\":%llu,"
-        "\"notInitializedRetryCount\":%llu}\n",
+        "\"notInitializedRetryCount\":%llu,"
+        "\"streamlineLifecyclePolicy\":\"clean-enable\","
+        "\"streamlineRebuildRequired\":%s,"
+        "\"deferredLifecycleRevision\":%llu,"
+        "\"cleanEnableApplyCount\":%llu,"
+        "\"hostLifecycleResetCount\":%llu,"
+        "\"cleanEnableBoundaryAvailable\":%s,"
+        "\"cleanEnableRetryPending\":%s,"
+        "\"missedCleanEnableCount\":%llu,"
+        "\"featureRecycleActive\":%s,\"featureRecycleStage\":%u,"
+        "\"featureRecycleRevision\":%llu,\"featureRecycleCount\":%llu,"
+        "\"featureRecycleFreeCalls\":%llu,\"featureRecycleLastFreeResult\":%d,"
+        "\"featureRecycleOffStateObserved\":%s,"
+        "\"featureRecycleStatePolls\":%llu,"
+        "\"featureRecycleFenceValue\":%llu,"
+        "\"featureRecycleFenceCompletedValue\":%llu,"
+        "\"featureRecycleOutstandingOutputs\":%u,"
+        "\"featureRecycleExplicitFreeSkipped\":%s,"
+        "\"ngxEvaluateCalls\":%llu,"
+        "\"ngxTemporalValidCount\":%llu,\"ngxTemporalInvalidCount\":%llu,"
+        "\"ngxSeenCountMask\":%u,\"ngxSeenIndexMask\":%u,"
+        "\"ngxCountGetResult\":%d,\"ngxIndexGetResult\":%d,"
+        "\"ngxRawCount\":%d,\"ngxRawIndex\":%d,"
+        "\"ngxFrameIdGetResult\":%d,\"ngxOutputGetResult\":%d,"
+        "\"ngxOutputCompleteBatches\":%llu,"
+        "\"ngxOutputAliasedBatches\":%llu,"
+        "\"ngxFullStateRepairActive\":%s,"
+        "\"ngxFullStateForcedCount\":%llu,"
+        "\"ngxDisableInterpolationGetResult\":%d,"
+        "\"ngxDisableInterpolationResource\":\"0x%llX\","
+        "\"ngxDisableInterpolationResourcePreservedCount\":%llu,"
+        "\"ngxResetGetResult\":%d,\"ngxRawReset\":%d,"
+        "\"ngxResetPreservedCount\":%llu,"
+        "\"ngxLastOutputUniqueCount\":%u,\"ngxLastFrameId\":%llu,"
+        "\"ngxLastOutputInterpolated\":\"0x%llX\"}\n",
         static_cast<unsigned long>(pid),
         static_cast<unsigned long long>(UnixTimeSeconds()), route,
         bridgeReady ? "true" : "false",
         gLiveHookInstalled.load(std::memory_order_relaxed) ? "true" : "false",
+        gD3DDeviceHookInstalled.load(std::memory_order_relaxed) ? "true" : "false",
+        gD3D12CreateDeviceHookInstalled.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        gSlUpgradeInterfaceHookInstalled.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        gEarlyD3D12DeviceCaptured.load(std::memory_order_relaxed)
+            ? "true" : "false",
         gUiTagHookInstalled.load(std::memory_order_relaxed) ? "true" : "false",
+        gNgxEvaluateLookupHookInstalled.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        gNgxEvaluateHookExposed.load(std::memory_order_relaxed) ? "true" : "false",
+        gNgxEvaluateSeen.load(std::memory_order_relaxed) ? "true" : "false",
+        presentProbe.factoryImportHookInstalled ? "true" : "false",
+        presentProbe.nativeFactoryHookInstalled ? "true" : "false",
+        presentProbe.nativeSwapchainHookInstalled ? "true" : "false",
+        presentProbe.enabled ? "true" : "false",
+        static_cast<unsigned long long>(presentProbe.nativePresentCalls),
+        static_cast<unsigned long long>(presentProbe.scheduledFrames),
+        static_cast<unsigned long long>(presentProbe.capturedFrames),
+        static_cast<unsigned long long>(presentProbe.droppedFrames),
+        ngxOutputProbe.enabled ? "true" : "false",
+        ngxOutputProbe.queueHookInstalled ? "true" : "false",
+        static_cast<unsigned long long>(ngxOutputProbe.scheduled),
+        static_cast<unsigned long long>(ngxOutputProbe.submitted),
+        static_cast<unsigned long long>(ngxOutputProbe.captured),
+        static_cast<unsigned long long>(ngxOutputProbe.dropped),
+        static_cast<unsigned long long>(ngxOutputProbe.completeBatches),
+        static_cast<unsigned long long>(ngxOutputProbe.duplicateBatches),
+        ngxOutputProbe.immutableEnabled ? "true" : "false",
+        static_cast<unsigned long long>(ngxOutputProbe.immutablePrepared),
+        static_cast<unsigned long long>(ngxOutputProbe.immutableSubmitted),
+        static_cast<unsigned long long>(ngxOutputProbe.immutableRetired),
+        static_cast<unsigned long long>(ngxOutputProbe.immutableDropped),
+        static_cast<unsigned long long>(
+            ngxOutputProbe.immutableReservationReclaims),
+        ngxOutputProbe.immutableAllocated,
         gActiveWrapperObserved.load(std::memory_order_relaxed) ? "true" : "false",
         gActiveWrapperPatched.load(std::memory_order_relaxed) ? "true" : "false",
         gLoadedWrapperCandidates.load(std::memory_order_relaxed),
         gPatchedWrapperCandidates.load(std::memory_order_relaxed),
         gLoadedNgxCandidates.load(std::memory_order_relaxed),
         gPatchedNgxCandidates.load(std::memory_order_relaxed),
+        gLoadedNgxSynthesisCandidates.load(std::memory_order_relaxed),
+        gPatchedNgxSynthesisCandidates.load(std::memory_order_relaxed),
+        perSampleSynthesisReady ? "true" : "false",
+        synthesisFallbackActive ? "true" : "false",
         control.dynamic ? "dynamic" : "fixed", control.multiplier,
         control.dynamicTargetFrameRate,
         control.dynamicExperimental56 ? "true" : "false",
-        static_cast<uint32_t>(RequestedMaximumGeneratedFrames(control)) + 1,
+        control.generatedOnlyDebug ? "true" : "false",
+        effectiveMaximumMultiplier,
         static_cast<unsigned long long>(desiredRevision),
         static_cast<unsigned long long>(appliedRevision),
         applied ? "true" : "false", pending ? "true" : "false",
@@ -817,6 +1182,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         gAppliedMultiplier.load(std::memory_order_relaxed),
         gAppliedDynamicTargetFrameRate.load(std::memory_order_relaxed),
         gAppliedDynamicExperimental56.load(std::memory_order_relaxed) ? "true" : "false",
+        gAppliedGeneratedOnlyDebug.load(std::memory_order_relaxed) ? "true" : "false",
         setOptionsSeen ? "true" : "false",
         setOptionsAccepted ? "true" : "false", setOptionsResult,
         getStateSeen ? "true" : "false", getStateResult,
@@ -851,7 +1217,76 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         static_cast<unsigned long long>(gGetStateCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(gLiveReapplyCount.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
-            gNotInitializedRetryCount.load(std::memory_order_relaxed)));
+            gNotInitializedRetryCount.load(std::memory_order_relaxed)),
+        gStreamlineRebuildRequired.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        static_cast<unsigned long long>(
+            gDeferredLifecycleRevision.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gCleanEnableApplyCount.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gHostLifecycleResetCount.load(std::memory_order_relaxed)),
+        gCleanEnableBoundaryAvailable.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        gCleanEnableRetryPending.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        static_cast<unsigned long long>(
+            gMissedCleanEnableCount.load(std::memory_order_relaxed)),
+        featureRecycleActive ? "true" : "false", featureRecycleStage,
+        static_cast<unsigned long long>(
+            gFeatureRecycleRevision.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gFeatureRecycleCount.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gFeatureRecycleFreeCalls.load(std::memory_order_relaxed)),
+        gFeatureRecycleLastFreeResult.load(std::memory_order_relaxed),
+        gFeatureRecycleOffStateObserved.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        static_cast<unsigned long long>(
+            gFeatureRecycleStatePolls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gFeatureRecycleFenceValue.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gFeatureRecycleFenceCompletedValue.load(std::memory_order_relaxed)),
+        gFeatureRecycleOutstandingOutputs.load(std::memory_order_relaxed),
+        gFeatureRecycleExplicitFreeSkipped.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        static_cast<unsigned long long>(gNgxEvaluateCalls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gNgxTemporalValidCount.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gNgxTemporalInvalidCount.load(std::memory_order_relaxed)),
+        gNgxSeenCountMask.load(std::memory_order_relaxed),
+        gNgxSeenIndexMask.load(std::memory_order_relaxed),
+        gNgxLastCountGetResult.load(std::memory_order_relaxed),
+        gNgxLastIndexGetResult.load(std::memory_order_relaxed),
+        gNgxLastRawCount.load(std::memory_order_relaxed),
+        gNgxLastRawIndex.load(std::memory_order_relaxed),
+        gNgxLastFrameIdGetResult.load(std::memory_order_relaxed),
+        gNgxLastOutputGetResult.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(
+            gNgxOutputCompleteBatches.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gNgxOutputAliasedBatches.load(std::memory_order_relaxed)),
+        gNgxFullStateRepairActive.load(std::memory_order_relaxed)
+            ? "true" : "false",
+        static_cast<unsigned long long>(
+            gNgxFullStateForcedCount.load(std::memory_order_relaxed)),
+        gNgxLastDisableInterpolationGetResult.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(
+            gNgxLastDisableInterpolationResource.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gNgxDisableInterpolationResourcePreservedCount.load(
+                std::memory_order_relaxed)),
+        gNgxLastResetGetResult.load(std::memory_order_relaxed),
+        gNgxLastRawReset.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(
+            gNgxResetPreservedCount.load(std::memory_order_relaxed)),
+        gNgxLastOutputUniqueCount.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(
+            gNgxLastFrameId.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gNgxLastOutputInterpolated.load(std::memory_order_relaxed)));
     if (length <= 0)
         return false;
 
@@ -923,6 +1358,12 @@ sl::DLSSGOptions BuildAdjustedOptions(
             std::clamp(snapshot.control.multiplier,
             kMinimumMultiplier, kMaximumMultiplier) - 1;
     }
+    if (snapshot.control.generatedOnlyDebug)
+    {
+        adjusted.flags = static_cast<sl::DLSSGFlags>(
+            static_cast<uint32_t>(adjusted.flags)
+            | static_cast<uint32_t>(sl::DLSSGFlags::eShowOnlyInterpolatedFrame));
+    }
     if (enableUiRecomposition)
     {
         adjusted.structVersion = std::max<size_t>(
@@ -967,6 +1408,147 @@ bool ReadLastGameOptions(
     return true;
 }
 
+bool AcceptedSetOptionsResult(sl::Result result)
+{
+    return result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM;
+}
+
+sl::Result HostSetOptionsResult(sl::Result result)
+{
+    // Cyberpunk treats every non-zero Result as a hard failure. Result 39 is a
+    // warning rather than a rejected options update, so retain it in telemetry
+    // while reporting success to the host.
+    return result == sl::Result::eWarnOutOfVRAM ? sl::Result::eOk : result;
+}
+
+PFun_slFreeResources* ResolveFreeResources()
+{
+    auto* cached = gOriginalFreeResources.load(std::memory_order_acquire);
+    if (cached)
+        return cached;
+
+    constexpr std::array<const wchar_t*, 3> moduleNames{
+        L"sl.interposer.dll", L"sl.common.dll", L"sl.api.dll"};
+    for (const wchar_t* moduleName : moduleNames)
+    {
+        HMODULE module = GetModuleHandleW(moduleName);
+        if (!module)
+            continue;
+        auto* resolved = reinterpret_cast<PFun_slFreeResources*>(
+            GetProcAddress(module, "slFreeResources"));
+        if (!resolved)
+            continue;
+        gOriginalFreeResources.store(resolved, std::memory_order_release);
+        return resolved;
+    }
+    return nullptr;
+}
+
+bool ControlNeedsFeatureRecycle(const ControlSnapshot& target)
+{
+    if (gAppliedRevision.load(std::memory_order_acquire) == 0)
+        return false;
+    ControlConfig applied{};
+    applied.dynamic = gAppliedDynamicMode.load(std::memory_order_relaxed);
+    applied.multiplier = gAppliedMultiplier.load(std::memory_order_relaxed);
+    applied.dynamicTargetFrameRate =
+        gAppliedDynamicTargetFrameRate.load(std::memory_order_relaxed);
+    applied.dynamicExperimental56 =
+        gAppliedDynamicExperimental56.load(std::memory_order_relaxed);
+    applied.generatedOnlyDebug =
+        gAppliedGeneratedOnlyDebug.load(std::memory_order_relaxed);
+    return applied.dynamic != target.control.dynamic
+        || RequestedActiveGeneratedFrames(applied)
+            != RequestedActiveGeneratedFrames(target.control);
+}
+
+void DeferLifecycleControl(const ControlSnapshot& target)
+{
+    gStreamlineRebuildRequired.store(true, std::memory_order_release);
+    gDeferredLifecycleRevision.store(target.revision, std::memory_order_relaxed);
+    if (gLifecycleDeferralLoggedRevision.exchange(
+            target.revision, std::memory_order_acq_rel) == target.revision)
+        return;
+
+    Log(L"Deferred multiplier-shape revision %llu until a clean DLSS-G enable; "
+        L"the active Streamline presentation swapchain remains unchanged",
+        static_cast<unsigned long long>(target.revision));
+}
+
+void ResetNgxFeatureEpoch()
+{
+    std::vector<uint64_t> abandonedBatches;
+    {
+        std::lock_guard lock(gNgxOutputBatchMutex);
+        abandonedBatches.reserve(gNgxOutputBatches.size());
+        for (const auto& batch : gNgxOutputBatches)
+            abandonedBatches.push_back(batch.sequence);
+        gNgxOutputBatches.clear();
+    }
+    for (const uint64_t batch : abandonedBatches)
+        ngx_output_probe::AbandonImmutableBatch(batch);
+    {
+        std::lock_guard lock(gNgxForceStateMutex);
+        gNgxForceEpochs.clear();
+    }
+    Log(L"Reset NGX temporal epoch for recreated DLSS-G feature (%zu partial batches)",
+        abandonedBatches.size());
+}
+
+sl::DLSSGOptions BuildRecycleOffOptions(const sl::DLSSGOptions& source)
+{
+    sl::DLSSGOptions off = CopyKnownOptions(source, false);
+    off.mode = sl::DLSSGMode::eOff;
+    off.flags = static_cast<sl::DLSSGFlags>(
+        static_cast<uint32_t>(off.flags)
+        & ~static_cast<uint32_t>(sl::DLSSGFlags::eRetainResourcesWhenOff));
+    return off;
+}
+
+sl::Result BeginFeatureRecycle(PFun_slDLSSGSetOptions* original,
+    const sl::ViewportHandle& viewport, const sl::DLSSGOptions& source,
+    const ControlSnapshot& requested)
+{
+    const ControlSnapshot target = EffectiveControlSnapshot(requested);
+    const sl::DLSSGOptions off = BuildRecycleOffOptions(source);
+    gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
+    const sl::Result result = original(viewport, off);
+    gSetOptionsSeen.store(true, std::memory_order_release);
+    gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+    gLastAttemptTick.store(GetTickCount64(), std::memory_order_relaxed);
+    if (!AcceptedSetOptionsResult(result))
+    {
+        gAttemptedRevision.store(target.revision, std::memory_order_release);
+        Log(L"DLSS-G feature recycle could not submit Off for revision %llu: result=%d",
+            static_cast<unsigned long long>(target.revision),
+            static_cast<int>(result));
+        return HostSetOptionsResult(result);
+    }
+
+    gFeatureRecycle.stage = FeatureRecycleStage::eWaitingForOffState;
+    gFeatureRecycle.snapshot = target;
+    gFeatureRecycle.viewport = viewport;
+    gFeatureRecycle.source = CopyKnownOptions(source, false);
+    gFeatureRecycle.offSubmittedTick = GetTickCount64();
+    gFeatureRecycleStage.store(
+        static_cast<uint32_t>(FeatureRecycleStage::eWaitingForOffState),
+        std::memory_order_release);
+    gFeatureRecycleRevision.store(target.revision, std::memory_order_relaxed);
+    gFeatureRecycleOffStateObserved.store(false, std::memory_order_release);
+    gFeatureRecycleFenceValue.store(0, std::memory_order_relaxed);
+    gFeatureRecycleFenceCompletedValue.store(0, std::memory_order_relaxed);
+    gFeatureRecycleOutstandingOutputs.store(0, std::memory_order_relaxed);
+    gFeatureRecycleExplicitFreeSkipped.store(false, std::memory_order_relaxed);
+    gFeatureRecycleLastFreeResult.store(
+        static_cast<int32_t>(sl::Result::eErrorNotInitialized),
+        std::memory_order_relaxed);
+    ngx_output_probe::BeginFeatureRecycle();
+    Log(L"DLSS-G feature recycle started for revision %llu: Off accepted, "
+        L"retain-resources flag cleared",
+        static_cast<unsigned long long>(target.revision));
+    return HostSetOptionsResult(result);
+}
+
 void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
     bool liveReapply, bool uiRecompositionEnabled, bool uiRecompositionForced)
 {
@@ -978,20 +1560,47 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
     // no remaining budget. Keep the raw warning for telemetry, but do not leave
     // a successfully submitted multiplier permanently marked as pending.
     if (result != sl::Result::eOk && result != sl::Result::eWarnOutOfVRAM)
+    {
+        if (result == sl::Result::eErrorNotInitialized
+            && gCleanEnableBoundaryAvailable.load(std::memory_order_acquire))
+            gCleanEnableRetryPending.store(true, std::memory_order_release);
         return;
+    }
 
     const uint64_t previous = gAppliedRevision.load(std::memory_order_acquire);
+    const bool cleanEnable =
+        gCleanEnableBoundaryAvailable.exchange(false, std::memory_order_acq_rel);
+    gCleanEnableRetryPending.store(false, std::memory_order_release);
+    gGameFrameGenerationOn.store(true, std::memory_order_release);
     gAppliedDynamicMode.store(snapshot.control.dynamic, std::memory_order_relaxed);
     gAppliedMultiplier.store(snapshot.control.multiplier, std::memory_order_relaxed);
     gAppliedDynamicTargetFrameRate.store(
         snapshot.control.dynamicTargetFrameRate, std::memory_order_relaxed);
     gAppliedDynamicExperimental56.store(
         snapshot.control.dynamicExperimental56, std::memory_order_relaxed);
+    gAppliedGeneratedOnlyDebug.store(
+        snapshot.control.generatedOnlyDebug, std::memory_order_relaxed);
+    present_probe::SetEnabled(snapshot.control.generatedOnlyDebug
+        || gPresentProbeEnvironmentEnabled.load(std::memory_order_acquire));
+    // Streamline owns the generated-frame surfaces and their presentation
+    // fences.  The immutable replacement ring is now diagnostic-only: making
+    // it part of normal >2x operation creates a second lifetime system which
+    // cannot safely outlive Streamline's swapchain queue in every integration.
+    ngx_output_probe::SetImmutableEnabled(
+        gImmutableOutputEnvironmentEnabled.load(std::memory_order_acquire));
     gAppliedUiRecompositionEnabled.store(
         uiRecompositionEnabled, std::memory_order_relaxed);
     gAppliedUiRecompositionForced.store(
         uiRecompositionForced, std::memory_order_relaxed);
     gAppliedRevision.store(snapshot.revision, std::memory_order_release);
+    if (previous == 0 && cleanEnable)
+        gCleanEnableApplyCount.fetch_add(1, std::memory_order_relaxed);
+    if (snapshot.revision
+        == gDesiredRevision.load(std::memory_order_acquire))
+    {
+        gStreamlineRebuildRequired.store(false, std::memory_order_release);
+        gDeferredLifecycleRevision.store(0, std::memory_order_relaxed);
+    }
     if (liveReapply)
         gLiveReapplyCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -1016,23 +1625,65 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
         gGameOptionsStructVersion.load(std::memory_order_relaxed),
         gGameHudlessBufferFormat.load(std::memory_order_relaxed),
         gGameUiBufferFormat.load(std::memory_order_relaxed));
+    Log(L"Generated-only diagnostic: enabled=%d",
+        snapshot.control.generatedOnlyDebug);
+}
+
+void RecordUnadjustedEnableResult(sl::Result result)
+{
+    gSetOptionsSeen.store(true, std::memory_order_release);
+    gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+    gLastAttemptTick.store(GetTickCount64(), std::memory_order_relaxed);
+    if (AcceptedSetOptionsResult(result))
+    {
+        const bool consumedCleanEnable =
+            gCleanEnableBoundaryAvailable.exchange(false, std::memory_order_acq_rel);
+        gCleanEnableRetryPending.store(false, std::memory_order_release);
+        gGameFrameGenerationOn.store(true, std::memory_order_release);
+        if (consumedCleanEnable)
+            gMissedCleanEnableCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (result == sl::Result::eErrorNotInitialized
+        && gCleanEnableBoundaryAvailable.load(std::memory_order_acquire))
+    {
+        if (gControlReady.load(std::memory_order_acquire))
+            gAttemptedRevision.store(
+                gDesiredRevision.load(std::memory_order_acquire),
+                std::memory_order_release);
+        gCleanEnableRetryPending.store(true, std::memory_order_release);
+    }
 }
 
 sl::Result SubmitAdjustedOptions(
     PFun_slDLSSGSetOptions* original, const sl::ViewportHandle& viewport,
     const sl::DLSSGOptions& source, const ControlSnapshot& snapshot, bool liveReapply)
 {
+    const ControlSnapshot effectiveSnapshot = EffectiveControlSnapshot(snapshot);
+    const bool synthesisFallback = effectiveSnapshot.control.dynamic
+            != snapshot.control.dynamic
+        || effectiveSnapshot.control.multiplier != snapshot.control.multiplier;
+    if (synthesisFallback
+        && gSynthesisFallbackLoggedRevision.exchange(
+            snapshot.revision, std::memory_order_acq_rel) != snapshot.revision)
+    {
+        Log(L"Requested MFG mode requires the per-sample synthesis patch; "
+            L"falling back to fixed 2x for this NVIDIA DLL revision");
+    }
+
+    ApplyWrapperMaximum(effectiveSnapshot.control);
     const UiInputSnapshot uiInputs = ReadUiInputSnapshot(
         static_cast<uint32_t>(viewport));
     const bool gameUiRecomposition = source.structVersion >= sl::kStructVersion4
         && source.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
     const bool forceUiRecomposition = uiInputs.ready && !gameUiRecomposition;
     const sl::DLSSGOptions adjusted = BuildAdjustedOptions(
-        source, snapshot, !liveReapply, uiInputs.ready);
+        source, effectiveSnapshot, !liveReapply, uiInputs.ready);
     const bool uiRecompositionEnabled = adjusted.structVersion >= sl::kStructVersion4
         && adjusted.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
+    gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
     const sl::Result result = original(viewport, adjusted);
-    RecordAppliedControl(snapshot, result, liveReapply,
+    RecordAppliedControl(effectiveSnapshot, result, liveReapply,
         uiRecompositionEnabled, forceUiRecomposition);
     if (!liveReapply
         && (result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM))
@@ -1049,17 +1700,177 @@ sl::Result SubmitAdjustedOptions(
             UpdateFpsTelemetry(0);
         }
     }
-    // Cyberpunk treats every non-zero Result as a hard failure. Result 39 is a
-    // warning rather than a rejected options update, so preserve it in the
-    // bridge status while returning success to the host.
-    return result == sl::Result::eWarnOutOfVRAM ? sl::Result::eOk : result;
+    return HostSetOptionsResult(result);
+}
+
+bool ProgressFeatureRecycle(const sl::ViewportHandle& viewport)
+{
+    if (gFeatureRecycle.stage == FeatureRecycleStage::eIdle)
+        return false;
+    if (static_cast<uint32_t>(gFeatureRecycle.viewport)
+        != static_cast<uint32_t>(viewport))
+        return true;
+
+    const ControlSnapshot latest = EffectiveControlSnapshot(ReadControlSnapshot());
+    if (latest.revision != 0
+        && latest.revision != gFeatureRecycle.snapshot.revision)
+    {
+        Log(L"DLSS-G feature recycle retargeted from revision %llu to %llu",
+            static_cast<unsigned long long>(gFeatureRecycle.snapshot.revision),
+            static_cast<unsigned long long>(latest.revision));
+        gFeatureRecycle.snapshot = latest;
+        gFeatureRecycleRevision.store(latest.revision, std::memory_order_relaxed);
+    }
+    sl::DLSSGOptions newestSource{};
+    if (ReadLastGameOptions(viewport, newestSource))
+        gFeatureRecycle.source = newestSource;
+
+    auto* original = gOriginalSetOptions.load(std::memory_order_acquire);
+    if (!original)
+        return true;
+
+    const auto tryReenable = [&]() {
+        if (gFeatureRecycle.stage == FeatureRecycleStage::eReenabling
+            && gLastSetOptionsResult.load(std::memory_order_relaxed)
+                == static_cast<int32_t>(sl::Result::eErrorNotInitialized))
+        {
+            const uint64_t now = GetTickCount64();
+            const uint64_t previous =
+                gLastAttemptTick.load(std::memory_order_relaxed);
+            if (now >= previous && now - previous < kNotInitializedRetryDelayMs)
+                return;
+            gNotInitializedRetryCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        const uint64_t revision = gFeatureRecycle.snapshot.revision;
+        const sl::Result enableResult = SubmitAdjustedOptions(
+            original, viewport, gFeatureRecycle.source,
+            gFeatureRecycle.snapshot, true);
+        if (enableResult == sl::Result::eOk)
+        {
+            gFeatureRecycleCount.fetch_add(1, std::memory_order_relaxed);
+            gFeatureRecycle.stage = FeatureRecycleStage::eIdle;
+            gFeatureRecycleStage.store(
+                static_cast<uint32_t>(FeatureRecycleStage::eIdle),
+                std::memory_order_release);
+            Log(L"DLSS-G feature recycle completed for revision %llu",
+                static_cast<unsigned long long>(revision));
+            return;
+        }
+        if (enableResult == sl::Result::eErrorNotInitialized)
+        {
+            Log(L"DLSS-G feature recycle re-enable will retry for revision %llu: result=21",
+                static_cast<unsigned long long>(revision));
+            return;
+        }
+
+        Log(L"DLSS-G feature recycle re-enable failed for revision %llu: result=%d",
+            static_cast<unsigned long long>(revision),
+            static_cast<int>(enableResult));
+        gFeatureRecycle.stage = FeatureRecycleStage::eIdle;
+        gFeatureRecycleStage.store(
+            static_cast<uint32_t>(FeatureRecycleStage::eIdle),
+            std::memory_order_release);
+    };
+
+    if (gFeatureRecycle.stage == FeatureRecycleStage::eReenabling)
+    {
+        tryReenable();
+        return true;
+    }
+
+    if (gFeatureRecycle.stage == FeatureRecycleStage::eWaitingForOffState)
+    {
+        // Some integrations (Cyberpunk included) stop calling GetState after
+        // initialization.  Poll the official state entry point ourselves while
+        // host On calls are suppressed, using the same Off options that began
+        // the recycle.  Otherwise an accepted Off request can wait forever for
+        // a callback that the host never makes.
+        if (!gFeatureRecycleOffStateObserved.load(std::memory_order_acquire))
+        {
+            auto* getState = gOriginalGetState.load(std::memory_order_acquire);
+            if (getState)
+            {
+                sl::DLSSGState state{};
+                const sl::DLSSGOptions off =
+                    BuildRecycleOffOptions(gFeatureRecycle.source);
+                gFeatureRecycleStatePolls.fetch_add(1, std::memory_order_relaxed);
+                const sl::Result stateResult = getState(viewport, state, &off);
+                RecordDlssgStateResult(stateResult, state, false);
+            }
+        }
+        if (!gFeatureRecycleOffStateObserved.load(std::memory_order_acquire))
+            return true;
+        gFeatureRecycle.stage = FeatureRecycleStage::eWaitingForDrain;
+        gFeatureRecycleStage.store(
+            static_cast<uint32_t>(FeatureRecycleStage::eWaitingForDrain),
+            std::memory_order_release);
+        Log(L"DLSS-G feature recycle observed the Off state; waiting for GPU drain");
+    }
+
+    const ngx_output_probe::FeatureDrainSnapshot drain =
+        ngx_output_probe::ReadFeatureDrainSnapshot();
+    gFeatureRecycleFenceValue.store(
+        drain.streamlineFenceValue, std::memory_order_relaxed);
+    gFeatureRecycleFenceCompletedValue.store(
+        drain.streamlineFenceCompletedValue, std::memory_order_relaxed);
+    gFeatureRecycleOutstandingOutputs.store(
+        drain.outstandingImmutableOutputs, std::memory_order_relaxed);
+    if (drain.outstandingImmutableOutputs != 0
+        || (drain.hasStreamlineFence && !drain.streamlineFenceComplete))
+        return true;
+    if (!ngx_output_probe::FinishFeatureRecycle())
+        return true;
+
+    gFeatureRecycle.stage = FeatureRecycleStage::eReenabling;
+    gFeatureRecycleStage.store(
+        static_cast<uint32_t>(FeatureRecycleStage::eReenabling),
+        std::memory_order_release);
+
+    if (drain.hasStreamlineFence && drain.streamlineFenceComplete)
+    {
+        auto* freeResources = ResolveFreeResources();
+        if (freeResources)
+        {
+            gFeatureRecycleFreeCalls.fetch_add(1, std::memory_order_relaxed);
+            const sl::Result freeResult = freeResources(
+                sl::kFeatureDLSS_G, viewport);
+            gFeatureRecycleLastFreeResult.store(
+                static_cast<int32_t>(freeResult), std::memory_order_relaxed);
+            Log(L"Explicitly freed drained DLSS-G resources for revision %llu: result=%d",
+                static_cast<unsigned long long>(gFeatureRecycle.snapshot.revision),
+                static_cast<int>(freeResult));
+        }
+        else
+        {
+            gFeatureRecycleExplicitFreeSkipped.store(true, std::memory_order_relaxed);
+            Log(L"slFreeResources was unavailable after the DLSS-G drain; "
+                L"the Off call already released resources because retention was cleared");
+        }
+    }
+    else
+    {
+        // The default Off behavior still frees DLSS-G resources. Do not invoke
+        // slFreeResources without a completion fence: NVIDIA documents that as
+        // unsafe while an evaluation command list may still be pending.
+        gFeatureRecycleExplicitFreeSkipped.store(true, std::memory_order_relaxed);
+        Log(L"No Streamline completion fence was exposed; relying on drained Off "
+            L"resource release and skipping unsafe explicit slFreeResources");
+    }
+
+    ResetNgxFeatureEpoch();
+    tryReenable();
+    return true;
 }
 
 void ReapplyPendingControl(const sl::ViewportHandle& viewport)
 {
+    const bool gameEnabled =
+        gGameFrameGenerationOn.load(std::memory_order_acquire);
+    const bool cleanEnableRetry =
+        gCleanEnableRetryPending.load(std::memory_order_acquire);
     if (!gControlReady.load(std::memory_order_acquire)
-        || !gGameFrameGenerationOn.load(std::memory_order_acquire)
-        || !BridgeReady())
+        || (!gameEnabled && !cleanEnableRetry) || !BridgeReady())
         return;
 
     const ControlSnapshot snapshot = ReadControlSnapshot();
@@ -1097,7 +1908,26 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
             static_cast<unsigned long long>(retry));
     }
 
-    gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
+    const ControlSnapshot effective = EffectiveControlSnapshot(snapshot);
+    if (!gCleanEnableBoundaryAvailable.load(std::memory_order_acquire)
+        && gAppliedRevision.load(std::memory_order_acquire) == 0)
+    {
+        // The host's first On call was accepted before the bridge could adjust
+        // it.  There is an active Streamline presentation swapchain, but no
+        // trustworthy applied shape to maintain.  Never reinterpret this as a
+        // fresh feature simply because our applied revision is still zero.
+        DeferLifecycleControl(snapshot);
+        return;
+    }
+    if (ControlNeedsFeatureRecycle(effective))
+    {
+        // A live feature-only recycle leaves Streamline's presentation queue,
+        // off-screen buffers, and swapchain lifetime configured for the old
+        // multiplier.  Defer shape changes until the host performs a genuine
+        // Off -> On lifecycle boundary (or the process starts fresh).
+        DeferLifecycleControl(snapshot);
+        return;
+    }
     const sl::Result result =
         SubmitAdjustedOptions(original, viewport, source, snapshot, true);
     if (result != sl::Result::eOk)
@@ -1113,40 +1943,88 @@ sl::Result HookSlDLSSGSetOptions(
         return sl::Result::eErrorNotInitialized;
 
     std::lock_guard callLock(gStreamlineCallMutex);
-    gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
 
     const bool enabled = options.mode == sl::DLSSGMode::eOn
         || options.mode == sl::DLSSGMode::eAuto
         || options.mode == sl::DLSSGMode::eDynamic;
-    gGameFrameGenerationOn.store(enabled, std::memory_order_release);
+    const bool previouslyEnabled =
+        gGameFrameGenerationOn.load(std::memory_order_acquire);
     if (!enabled)
     {
+        if (previouslyEnabled
+            || gFeatureRecycle.stage != FeatureRecycleStage::eIdle)
+        {
+            gFeatureRecycle.stage = FeatureRecycleStage::eIdle;
+            gFeatureRecycleStage.store(
+                static_cast<uint32_t>(FeatureRecycleStage::eIdle),
+                std::memory_order_release);
+            ngx_output_probe::BeginFeatureRecycle();
+            ResetNgxFeatureEpoch();
+        }
         gSetOptionsSeen.store(true, std::memory_order_release);
-        const sl::Result result = original(viewport, options);
+        gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
+        const sl::DLSSGOptions off = BuildRecycleOffOptions(options);
+        const sl::Result result = original(viewport, off);
         gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+        if (AcceptedSetOptionsResult(result))
+        {
+            // The next host On call is a clean creation boundary. Forget the
+            // previous applied shape so the saved target is submitted directly
+            // instead of entering the retired feature-only recycle path.
+            gAppliedRevision.store(0, std::memory_order_release);
+            gAttemptedRevision.store(0, std::memory_order_release);
+            gAppliedMultiplier.store(0, std::memory_order_relaxed);
+            gHostLifecycleResetCount.fetch_add(1, std::memory_order_relaxed);
+            gGameFrameGenerationOn.store(false, std::memory_order_release);
+            gCleanEnableBoundaryAvailable.store(true, std::memory_order_release);
+            gCleanEnableRetryPending.store(false, std::memory_order_release);
+            gStreamlineRebuildRequired.store(false, std::memory_order_release);
+            gDeferredLifecycleRevision.store(0, std::memory_order_relaxed);
+        }
         return result;
     }
 
     CaptureGameOptions(viewport, options);
     if (!gControlReady.load(std::memory_order_acquire))
     {
+        gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
         const sl::Result result = original(viewport, options);
-        gSetOptionsSeen.store(true, std::memory_order_release);
-        gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+        RecordUnadjustedEnableResult(result);
         return result;
     }
 
     if (!BridgeReady())
     {
+        gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
         const sl::Result result = original(viewport, options);
-        gSetOptionsSeen.store(true, std::memory_order_release);
-        gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
-        if (result != sl::Result::eOk || !BridgeReady())
-            return result;
-        Log(L"Active DLSS-G modules became ready during the native options call; applying saved control");
+        RecordUnadjustedEnableResult(result);
+        // If this call loaded NGX and completed bridge discovery, the native
+        // feature and presentation swapchain were still created from the
+        // unadjusted options.  Applying a second shape here would already be a
+        // mid-feature mutation, so wait for a genuine host Off -> On instead.
+        return result;
     }
 
     const ControlSnapshot snapshot = ReadControlSnapshot();
+    const ControlSnapshot effective = EffectiveControlSnapshot(snapshot);
+    if (!gCleanEnableBoundaryAvailable.load(std::memory_order_acquire)
+        && gAppliedRevision.load(std::memory_order_acquire) == 0)
+    {
+        DeferLifecycleControl(snapshot);
+        gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
+        const sl::Result result = original(viewport, options);
+        RecordUnadjustedEnableResult(result);
+        return result;
+    }
+    if (snapshot.revision
+            != gAppliedRevision.load(std::memory_order_acquire)
+        && ControlNeedsFeatureRecycle(effective))
+    {
+        DeferLifecycleControl(snapshot);
+        const ControlSnapshot applied = ReadAppliedControlSnapshot();
+        if (applied.revision != 0)
+            return SubmitAdjustedOptions(original, viewport, options, applied, false);
+    }
     return SubmitAdjustedOptions(original, viewport, options, snapshot, false);
 }
 
@@ -1196,6 +2074,72 @@ sl::Result HookSlGetFeatureFunction(
     return result;
 }
 
+bool RegisterObservedD3D12Device(
+    void* d3dInterface, const wchar_t* source, bool early)
+{
+    if (!d3dInterface)
+        return false;
+
+    ID3D12Device* device = nullptr;
+    if (FAILED(reinterpret_cast<IUnknown*>(d3dInterface)->QueryInterface(
+            IID_PPV_ARGS(&device))))
+        return false;
+
+    const bool registered = ngx_output_probe::RegisterDevice(device);
+    device->Release();
+    if (registered && early
+        && !gEarlyD3D12DeviceCaptured.exchange(true, std::memory_order_acq_rel))
+    {
+        Log(L"Captured early D3D12 device through %s before queue creation", source);
+    }
+    return registered;
+}
+
+HRESULT WINAPI HookD3D12CreateDevice(IUnknown* adapter,
+    D3D_FEATURE_LEVEL minimumFeatureLevel, REFIID interfaceId, void** device)
+{
+    const auto original =
+        gOriginalD3D12CreateDevice.load(std::memory_order_acquire);
+    if (!original)
+        return E_FAIL;
+
+    const HRESULT result = original(
+        adapter, minimumFeatureLevel, interfaceId, device);
+    if (SUCCEEDED(result) && device && *device)
+        RegisterObservedD3D12Device(*device, L"D3D12CreateDevice", true);
+    return result;
+}
+
+sl::Result HookSlUpgradeInterface(void** baseInterface)
+{
+    // Cyberpunk can create its native graphics queue before slSetD3DDevice.
+    // Capture the base device immediately before Streamline replaces it with
+    // a proxy, then capture the proxy as well so both submission layers are
+    // observable.
+    void* const base = baseInterface ? *baseInterface : nullptr;
+    RegisterObservedD3D12Device(base, L"slUpgradeInterface(base)", true);
+
+    auto* original = gOriginalUpgradeInterface.load(std::memory_order_acquire);
+    const sl::Result result = original
+        ? original(baseInterface) : sl::Result::eErrorNotInitialized;
+    if (baseInterface && *baseInterface && *baseInterface != base)
+    {
+        RegisterObservedD3D12Device(
+            *baseInterface, L"slUpgradeInterface(proxy)", true);
+    }
+    return result;
+}
+
+sl::Result HookSlSetD3DDevice(void* d3dDevice)
+{
+    if (RegisterObservedD3D12Device(
+            d3dDevice, L"slSetD3DDevice", false))
+        Log(L"Captured Streamline D3D12 device for late queue discovery");
+
+    auto* original = gOriginalSetD3DDevice.load(std::memory_order_acquire);
+    return original ? original(d3dDevice) : sl::Result::eErrorNotInitialized;
+}
+
 sl::Result HookSlSetTag(const sl::ViewportHandle& viewport,
     const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer)
 {
@@ -1223,10 +2167,9 @@ sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
     return result;
 }
 
-bool HookMainExecutableImport(const char* importedModule, const char* importedFunction,
-    void* replacement, void*& original)
+bool HookModuleImport(HMODULE module, const char* importedModule,
+    const char* importedFunction, void* replacement, void*& original)
 {
-    HMODULE module = GetModuleHandleW(nullptr);
     auto* base = reinterpret_cast<uint8_t*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -1282,6 +2225,464 @@ bool HookMainExecutableImport(const char* importedModule, const char* importedFu
     return false;
 }
 
+bool HookMainExecutableImport(const char* importedModule, const char* importedFunction,
+    void* replacement, void*& original)
+{
+    return HookModuleImport(GetModuleHandleW(nullptr), importedModule,
+        importedFunction, replacement, original);
+}
+
+HMODULE ModuleFromAddress(const void* address)
+{
+    if (!address)
+        return nullptr;
+    MEMORY_BASIC_INFORMATION memory{};
+    return VirtualQuery(address, &memory, sizeof(memory)) == sizeof(memory)
+        ? static_cast<HMODULE>(memory.AllocationBase) : nullptr;
+}
+
+bool InstallNgxEvaluateLookupHook(ModuleRecord& record)
+{
+    if (!record.wrapperExport)
+        return false;
+
+    void* original = nullptr;
+    const bool installed = HookModuleImport(record.module, "KERNEL32.dll",
+        "GetProcAddress", reinterpret_cast<void*>(&HookWrapperGetProcAddress), original);
+    if (!installed)
+        return false;
+
+    std::lock_guard lock(gNgxEvaluateRouteMutex);
+    auto route = std::find_if(gNgxEvaluateRoutes.begin(), gNgxEvaluateRoutes.end(),
+        [&](const NgxEvaluateRoute& candidate) {
+            return candidate.wrapper == record.module;
+        });
+    if (route == gNgxEvaluateRoutes.end())
+    {
+        NgxEvaluateRoute added{};
+        added.wrapper = record.module;
+        added.originalGetProcAddress = reinterpret_cast<GetProcAddressFn>(original);
+        gNgxEvaluateRoutes.push_back(added);
+    }
+    else if (original)
+    {
+        route->originalGetProcAddress = reinterpret_cast<GetProcAddressFn>(original);
+    }
+    record.ngxEvaluateLookupHooked = true;
+    gNgxEvaluateLookupHookInstalled.store(true, std::memory_order_release);
+    return true;
+}
+
+FARPROC WINAPI HookWrapperGetProcAddress(HMODULE module, LPCSTR functionName)
+{
+    const HMODULE caller = ModuleFromAddress(_ReturnAddress());
+    GetProcAddressFn original = nullptr;
+    {
+        std::lock_guard lock(gNgxEvaluateRouteMutex);
+        const auto route = std::find_if(gNgxEvaluateRoutes.begin(), gNgxEvaluateRoutes.end(),
+            [&](const NgxEvaluateRoute& candidate) {
+                return candidate.wrapper == caller;
+            });
+        if (route != gNgxEvaluateRoutes.end())
+            original = route->originalGetProcAddress;
+    }
+    if (!original)
+        return nullptr;
+
+    FARPROC function = original(module, functionName);
+    if (reinterpret_cast<uintptr_t>(functionName) <= 0xFFFFu
+        || !functionName
+        || strcmp(functionName, "NVSDK_NGX_D3D12_EvaluateFeature") != 0
+        || !function)
+        return function;
+
+    bool firstExposure = false;
+    {
+        std::lock_guard lock(gNgxEvaluateRouteMutex);
+        const auto route = std::find_if(gNgxEvaluateRoutes.begin(), gNgxEvaluateRoutes.end(),
+            [&](const NgxEvaluateRoute& candidate) {
+                return candidate.wrapper == caller;
+            });
+        if (route == gNgxEvaluateRoutes.end())
+            return function;
+        firstExposure = route->originalEvaluate == nullptr;
+        route->originalEvaluate = reinterpret_cast<NgxD3D12EvaluateFeatureFn>(function);
+    }
+
+    gNgxEvaluateHookExposed.store(true, std::memory_order_release);
+    if (firstExposure)
+        Log(L"Intercepted NVSDK_NGX_D3D12_EvaluateFeature for temporal-index validation");
+    return reinterpret_cast<FARPROC>(&HookNgxD3D12EvaluateFeature);
+}
+
+NVSDK_NGX_Result NVSDK_CONV HookNgxD3D12EvaluateFeature(
+    ID3D12GraphicsCommandList* commandList, const NVSDK_NGX_Handle* featureHandle,
+    const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback)
+{
+    void* returnAddress = _ReturnAddress();
+    const HMODULE caller = ModuleFromAddress(returnAddress);
+    const uintptr_t callerRva = caller
+        ? reinterpret_cast<uintptr_t>(returnAddress)
+            - reinterpret_cast<uintptr_t>(caller)
+        : 0;
+    const uint64_t call = gNgxEvaluateCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    gNgxEvaluateSeen.store(true, std::memory_order_release);
+
+    int rawCount = 0;
+    int rawIndex = 0;
+    int rawMultiFrameCountMax = 0;
+    int rawMustCallEval = 0;
+    ID3D12Resource* outputDisableInterpolation = nullptr;
+    int rawNotRenderingGameFrames = 0;
+    int rawStreamlineMode = 0;
+    int rawReset = 0;
+    int rawEvalFlags = 0;
+    unsigned long long rawFrameId = 0;
+    ID3D12Resource* outputInterpolated = nullptr;
+    ID3D12Resource* outputReal = nullptr;
+    NVSDK_NGX_Result countResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result indexResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result maxResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result mustCallResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result disableInterpolationResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result notRenderingResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result streamlineModeResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result resetResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result evalFlagsResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result frameIdResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result outputResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    NVSDK_NGX_Result outputRealResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
+    if (parameters)
+    {
+        countResult = parameters->Get("DLSSG.MultiFrameCount", &rawCount);
+        indexResult = parameters->Get("DLSSG.MultiFrameIndex", &rawIndex);
+        maxResult = parameters->Get(
+            "DLSSG.MultiFrameCountMax", &rawMultiFrameCountMax);
+        mustCallResult = parameters->Get("DLSSG.MustCallEval", &rawMustCallEval);
+        disableInterpolationResult = parameters->Get(
+            "DLSSG.OutputDisableInterpolation", &outputDisableInterpolation);
+        notRenderingResult = parameters->Get(
+            "DLSSG.NotRenderingGameFrames", &rawNotRenderingGameFrames);
+        streamlineModeResult = parameters->Get(
+            "DLSSG.StreamlineMode", &rawStreamlineMode);
+        resetResult = parameters->Get("DLSSG.Reset", &rawReset);
+        evalFlagsResult = parameters->Get("DLSSG.EvalFlags", &rawEvalFlags);
+        frameIdResult = parameters->Get("DLSSG.BackbufferFrameID", &rawFrameId);
+        outputResult = parameters->Get(
+            "DLSSG.OutputInterpolated", &outputInterpolated);
+        outputRealResult = parameters->Get("DLSSG.OutputReal", &outputReal);
+    }
+
+    const bool dynamic = gAppliedDynamicMode.load(std::memory_order_acquire);
+    const uint32_t appliedMultiplier = gAppliedMultiplier.load(std::memory_order_acquire);
+    const uint32_t expectedCount = !dynamic && appliedMultiplier >= 2
+        && appliedMultiplier <= kMaximumMultiplier ? appliedMultiplier - 1 : 0;
+    const bool countValid = countResult == NVSDK_NGX_Result_Success
+        && rawCount >= 1 && rawCount <= static_cast<int>(kExperimentalMaximumGeneratedFrames)
+        && (expectedCount == 0 || rawCount == static_cast<int>(expectedCount));
+    const bool indexValid = indexResult == NVSDK_NGX_Result_Success
+        && rawIndex >= 1 && rawIndex <= rawCount;
+    const bool temporalParametersValid = countValid && indexValid;
+    unsigned long long forcedFrameId = 0;
+    int preservedReset = rawReset;
+    const bool automaticFullStateRepair = dynamic
+        || appliedMultiplier > kMinimumMultiplier;
+    const bool forceFullState = temporalParametersValid
+        && parameters
+        && ((automaticFullStateRepair
+                && !gDisableAutomaticFullNgxState.load(std::memory_order_acquire))
+            || gForceFullNgxState.load(std::memory_order_acquire));
+    gNgxFullStateRepairActive.store(
+        forceFullState, std::memory_order_relaxed);
+    if (forceFullState)
+    {
+        gNgxFullStateForcedCount.fetch_add(1, std::memory_order_relaxed);
+        auto* mutableParameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
+        forcedFrameId = gForcedBackbufferFrameId.fetch_add(
+            1, std::memory_order_relaxed);
+        mutableParameters->Set("DLSSG.BackbufferFrameID", forcedFrameId);
+        mutableParameters->Set("DLSSG.MultiFrameCountMax",
+            static_cast<int>(kExperimentalMaximumGeneratedFrames));
+        mutableParameters->Set("DLSSG.MustCallEval", 1);
+        // OutputDisableInterpolation is a D3D12 resource written by NGX and
+        // consumed asynchronously by Streamline.  Replacing it with scalar 0
+        // destroys NVIDIA's reset/warm-up suppression signal and causes the
+        // history-seeding batch to be presented as repeated generated frames.
+        // Preserve the native resource exactly as supplied by Streamline.
+        if (disableInterpolationResult == NVSDK_NGX_Result_Success
+            && outputDisableInterpolation)
+        {
+            gNgxDisableInterpolationResourcePreservedCount.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        mutableParameters->Set("DLSSG.NotRenderingGameFrames", 0);
+        // Reset is the namespaced DLSSG.Reset input owned by Streamline.  Do
+        // not synthesize generic Reset or hold reset across all five temporal
+        // evaluations: either corrupts NVIDIA's per-frame history boundary.
+        mutableParameters->Set("DLSSG.StreamlineMode", 1);
+        mutableParameters->Set("DLSSG.EvalFlags", 0);
+        if (resetResult == NVSDK_NGX_Result_Success)
+            gNgxResetPreservedCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    NgxD3D12EvaluateFeatureFn original = nullptr;
+    {
+        std::lock_guard lock(gNgxEvaluateRouteMutex);
+        auto route = std::find_if(gNgxEvaluateRoutes.begin(), gNgxEvaluateRoutes.end(),
+            [&](const NgxEvaluateRoute& candidate) {
+                return candidate.wrapper == caller;
+            });
+        if (route == gNgxEvaluateRoutes.end() && gNgxEvaluateRoutes.size() == 1)
+            route = gNgxEvaluateRoutes.begin();
+        if (route != gNgxEvaluateRoutes.end())
+            original = route->originalEvaluate;
+    }
+
+    gNgxLastCountGetResult.store(static_cast<int32_t>(countResult), std::memory_order_relaxed);
+    gNgxLastIndexGetResult.store(static_cast<int32_t>(indexResult), std::memory_order_relaxed);
+    gNgxLastRawCount.store(rawCount, std::memory_order_relaxed);
+    gNgxLastRawIndex.store(rawIndex, std::memory_order_relaxed);
+    gNgxLastFrameIdGetResult.store(
+        static_cast<int32_t>(frameIdResult), std::memory_order_relaxed);
+    gNgxLastOutputGetResult.store(
+        static_cast<int32_t>(outputResult), std::memory_order_relaxed);
+    gNgxLastDisableInterpolationGetResult.store(
+        static_cast<int32_t>(disableInterpolationResult),
+        std::memory_order_relaxed);
+    gNgxLastDisableInterpolationResource.store(
+        reinterpret_cast<uintptr_t>(outputDisableInterpolation),
+        std::memory_order_relaxed);
+    gNgxLastResetGetResult.store(
+        static_cast<int32_t>(resetResult), std::memory_order_relaxed);
+    gNgxLastRawReset.store(rawReset, std::memory_order_relaxed);
+    gNgxLastFrameId.store(rawFrameId, std::memory_order_relaxed);
+    gNgxLastOutputInterpolated.store(
+        reinterpret_cast<uintptr_t>(outputInterpolated), std::memory_order_relaxed);
+    if (temporalParametersValid)
+    {
+        gNgxTemporalValidCount.fetch_add(1, std::memory_order_relaxed);
+        gNgxSeenCountMask.fetch_or(1u << static_cast<uint32_t>(rawCount),
+            std::memory_order_relaxed);
+        gNgxSeenIndexMask.fetch_or(1u << static_cast<uint32_t>(rawIndex - 1),
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        gNgxTemporalInvalidCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t outputBatchSequence = 0;
+    bool outputBatchComplete = false;
+    std::vector<uint64_t> abandonedOutputBatchSequences;
+    if (temporalParametersValid
+        && outputResult == NVSDK_NGX_Result_Success
+        && outputInterpolated)
+    {
+        std::lock_guard lock(gNgxOutputBatchMutex);
+        // BackbufferFrameID is not part of every native NGX parameter block.
+        // Cyberpunk alternates multiple handles and can deliver the five output
+        // indices out of order.  Match each index to the oldest incomplete batch
+        // for that handle which has not seen it yet.  Repeated indices naturally
+        // open another in-flight batch.
+        for (auto candidate = gNgxOutputBatches.begin();
+            candidate != gNgxOutputBatches.end();)
+        {
+            if (candidate->handle == featureHandle
+                && candidate->count != rawCount)
+            {
+                abandonedOutputBatchSequences.push_back(candidate->sequence);
+                candidate = gNgxOutputBatches.erase(candidate);
+            }
+            else
+            {
+                ++candidate;
+            }
+        }
+        const uint32_t slot = static_cast<uint32_t>(rawIndex - 1);
+        const uint32_t slotMask = 1u << slot;
+        auto outputBatchIt = std::find_if(gNgxOutputBatches.begin(),
+            gNgxOutputBatches.end(), [&](const NgxOutputBatch& candidate) {
+                return candidate.handle == featureHandle
+                    && candidate.count == rawCount
+                    && (candidate.seenMask & slotMask) == 0;
+            });
+        if (outputBatchIt == gNgxOutputBatches.end())
+        {
+            size_t pendingForHandle = static_cast<size_t>(std::count_if(
+                gNgxOutputBatches.begin(), gNgxOutputBatches.end(),
+                [&](const NgxOutputBatch& candidate) {
+                    return candidate.handle == featureHandle
+                        && candidate.count == rawCount;
+                }));
+            if (pendingForHandle >= 4)
+            {
+                auto oldest = std::find_if(gNgxOutputBatches.begin(),
+                    gNgxOutputBatches.end(), [&](const NgxOutputBatch& candidate) {
+                        return candidate.handle == featureHandle
+                            && candidate.count == rawCount;
+                    });
+                if (oldest != gNgxOutputBatches.end())
+                {
+                    abandonedOutputBatchSequences.push_back(oldest->sequence);
+                    gNgxOutputBatches.erase(oldest);
+                }
+            }
+            gNgxOutputBatches.push_back({});
+            outputBatchIt = std::prev(gNgxOutputBatches.end());
+            outputBatchIt->handle = featureHandle;
+            outputBatchIt->sequence = gNgxOutputBatchSequence.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            outputBatchIt->count = rawCount;
+        }
+        NgxOutputBatch& outputBatch = *outputBatchIt;
+
+        outputBatchSequence = outputBatch.sequence;
+        outputBatch.outputs[slot] =
+            reinterpret_cast<uintptr_t>(outputInterpolated);
+        outputBatch.seenMask |= slotMask;
+        const uint32_t expectedMask = (1u << static_cast<uint32_t>(rawCount)) - 1u;
+        outputBatchComplete = outputBatch.seenMask == expectedMask;
+        if (outputBatchComplete)
+        {
+            uint32_t uniqueCount = 0;
+            for (int index = 0; index < rawCount; ++index)
+            {
+                bool first = true;
+                for (int previous = 0; previous < index; ++previous)
+                {
+                    if (outputBatch.outputs[previous]
+                        == outputBatch.outputs[index])
+                    {
+                        first = false;
+                        break;
+                    }
+                }
+                if (first)
+                    ++uniqueCount;
+            }
+            gNgxLastOutputUniqueCount.store(uniqueCount, std::memory_order_relaxed);
+            gNgxOutputCompleteBatches.fetch_add(1, std::memory_order_relaxed);
+            if (uniqueCount != static_cast<uint32_t>(rawCount))
+                gNgxOutputAliasedBatches.fetch_add(1, std::memory_order_relaxed);
+            if (call <= 128)
+            {
+                Log(L"NGX output batch: handle=%p frame=%llu count=%d "
+                    L"uniqueOutputs=%u aliased=%d",
+                    featureHandle, rawFrameId, rawCount, uniqueCount,
+                    uniqueCount != static_cast<uint32_t>(rawCount));
+            }
+            gNgxOutputBatches.erase(outputBatchIt);
+        }
+    }
+    for (const uint64_t abandonedBatch : abandonedOutputBatchSequences)
+        ngx_output_probe::AbandonImmutableBatch(abandonedBatch);
+
+    if (call <= 128)
+    {
+        Log(L"NGX temporal sample #%llu: callerRva=0x%llX handle=%p count=%d index=%d "
+            L"frame=%llu output=%p outputReal=%p getCount=0x%08X "
+            L"getIndex=0x%08X getFrame=0x%08X getOutput=0x%08X "
+            L"getOutputReal=0x%08X expectedCount=%u valid=%d",
+            static_cast<unsigned long long>(call),
+            static_cast<unsigned long long>(callerRva),
+            featureHandle, rawCount, rawIndex,
+            rawFrameId, outputInterpolated, outputReal,
+            static_cast<uint32_t>(countResult), static_cast<uint32_t>(indexResult),
+            static_cast<uint32_t>(frameIdResult), static_cast<uint32_t>(outputResult),
+            static_cast<uint32_t>(outputRealResult),
+            expectedCount, temporalParametersValid);
+        Log(L"NGX full state #%llu: max=%d mustCallEval=%d disableInterpolation=%p "
+            L"notRendering=%d streamlineMode=%d reset=%d evalFlags=%d "
+            L"frameObserved=%llu frameForced=%llu resetPreserved=%d force=%d results="
+            L"[%08X,%08X,%08X,%08X,%08X,%08X,%08X]",
+            static_cast<unsigned long long>(call), rawMultiFrameCountMax,
+            rawMustCallEval, outputDisableInterpolation,
+            rawNotRenderingGameFrames, rawStreamlineMode, rawReset, rawEvalFlags,
+            rawFrameId, forcedFrameId, preservedReset, forceFullState,
+            static_cast<uint32_t>(maxResult),
+            static_cast<uint32_t>(mustCallResult),
+            static_cast<uint32_t>(disableInterpolationResult),
+            static_cast<uint32_t>(notRenderingResult),
+            static_cast<uint32_t>(streamlineModeResult),
+            static_cast<uint32_t>(resetResult),
+            static_cast<uint32_t>(evalFlagsResult));
+    }
+
+    const ngx_output_probe::ImmutableOutput immutableOutput =
+        temporalParametersValid
+            && outputResult == NVSDK_NGX_Result_Success
+            && outputInterpolated && parameters
+        ? ngx_output_probe::PrepareImmutableOutput(commandList,
+            outputInterpolated, const_cast<NVSDK_NGX_Parameter*>(parameters),
+            outputBatchSequence, rawCount, rawIndex, outputBatchComplete)
+        : ngx_output_probe::ImmutableOutput{};
+    if (immutableOutput && call <= 128)
+    {
+        Log(L"NGX immutable output #%llu: original=%p immutable=%p slot=%u sequence=%llu",
+            static_cast<unsigned long long>(call), outputInterpolated,
+            immutableOutput.resource, immutableOutput.slot,
+            static_cast<unsigned long long>(immutableOutput.sequence));
+    }
+
+    const NVSDK_NGX_Result evaluateResult = original
+        ? original(commandList, featureHandle, parameters, callback)
+        : NVSDK_NGX_Result_FAIL_NotInitialized;
+    if (gExperimentalTemporalPreEmphasis.load(std::memory_order_relaxed)
+        && temporalParametersValid && rawCount > 1 && call <= 128)
+    {
+        // The environment-gated module patch replaces NGX's internal
+        // index/(count+1) calculation with index-count/2.  Keep the public
+        // MultiFrameIndex untouched so its normal range validation and all
+        // downstream indexing continue to see [1, count].
+        const float nativeRatio = static_cast<float>(rawIndex)
+            / static_cast<float>(rawCount + 1);
+        const float suppliedRatio = static_cast<float>(rawIndex)
+            - static_cast<float>(rawCount) * 0.5f;
+        Log(L"NGX temporal pre-emphasis #%llu: count=%d nativeIndex=%d "
+            L"nativeRatio=%.6f suppliedRatio=%.6f patchActive=%d evaluate=0x%08X",
+            static_cast<unsigned long long>(call), rawCount, rawIndex,
+            nativeRatio, suppliedRatio,
+            gExperimentalTemporalPreEmphasisPatchActive.load(
+                std::memory_order_relaxed),
+            static_cast<uint32_t>(evaluateResult));
+    }
+    ID3D12Resource* capturedOutput = outputInterpolated;
+    if (immutableOutput)
+    {
+        if (evaluateResult == NVSDK_NGX_Result_Success
+            && ngx_output_probe::FinalizeImmutableOutput(
+                commandList, outputInterpolated, immutableOutput))
+        {
+            capturedOutput = immutableOutput.resource;
+        }
+        else
+        {
+            ngx_output_probe::CancelImmutableOutput(
+                const_cast<NVSDK_NGX_Parameter*>(parameters),
+                outputInterpolated, immutableOutput);
+        }
+    }
+    if (evaluateResult == NVSDK_NGX_Result_Success
+        && temporalParametersValid
+        && capturedOutput
+        && outputBatchSequence != 0)
+    {
+        if (rawIndex == 1
+            && outputRealResult == NVSDK_NGX_Result_Success
+            && outputReal)
+        {
+            ngx_output_probe::CaptureAfterEvaluate(commandList, outputReal,
+                featureHandle, outputBatchSequence,
+                forceFullState ? forcedFrameId : rawFrameId,
+                rawCount, 0, ngx_output_probe::CapturedOutputKind::eReal);
+        }
+        ngx_output_probe::CaptureAfterEvaluate(commandList, capturedOutput,
+            featureHandle, outputBatchSequence,
+            forceFullState ? forcedFrameId : rawFrameId,
+            rawCount, rawIndex);
+    }
+    return evaluateResult;
+}
+
 bool InstallFeatureFunctionHook()
 {
     void* original = nullptr;
@@ -1293,6 +2694,57 @@ bool InstallFeatureFunctionHook()
             reinterpret_cast<PFun_slGetFeatureFunction*>(original),
             std::memory_order_release);
     }
+    return installed;
+}
+
+bool InstallEarlyD3D12Hooks()
+{
+    void* createOriginal = nullptr;
+    bool createInstalled = HookMainExecutableImport("sl.interposer.dll",
+        "D3D12CreateDevice", reinterpret_cast<void*>(&HookD3D12CreateDevice),
+        createOriginal);
+    if (!createInstalled)
+    {
+        createInstalled = HookMainExecutableImport("d3d12.dll",
+            "D3D12CreateDevice", reinterpret_cast<void*>(&HookD3D12CreateDevice),
+            createOriginal);
+    }
+    if (createOriginal)
+    {
+        gOriginalD3D12CreateDevice.store(
+            reinterpret_cast<D3D12CreateDeviceFn>(createOriginal),
+            std::memory_order_release);
+    }
+    gD3D12CreateDeviceHookInstalled.store(
+        createInstalled, std::memory_order_release);
+
+    void* upgradeOriginal = nullptr;
+    const bool upgradeInstalled = HookMainExecutableImport("sl.interposer.dll",
+        "slUpgradeInterface", reinterpret_cast<void*>(&HookSlUpgradeInterface),
+        upgradeOriginal);
+    if (upgradeOriginal)
+    {
+        gOriginalUpgradeInterface.store(
+            reinterpret_cast<PFun_slUpgradeInterface*>(upgradeOriginal),
+            std::memory_order_release);
+    }
+    gSlUpgradeInterfaceHookInstalled.store(
+        upgradeInstalled, std::memory_order_release);
+    return createInstalled || upgradeInstalled;
+}
+
+bool InstallD3DDeviceHook()
+{
+    void* original = nullptr;
+    const bool installed = HookMainExecutableImport("sl.interposer.dll",
+        "slSetD3DDevice", reinterpret_cast<void*>(&HookSlSetD3DDevice), original);
+    if (original)
+    {
+        gOriginalSetD3DDevice.store(
+            reinterpret_cast<PFun_slSetD3DDevice*>(original),
+            std::memory_order_release);
+    }
+    gD3DDeviceHookInstalled.store(installed, std::memory_order_release);
     return installed;
 }
 
@@ -1351,6 +2803,190 @@ static constexpr std::array<uint8_t, 6> kNgxReplacement{ 0x90, 0x90, 0x90, 0x90,
 static const PatternPatch kNgxPatch{
     L"NGX device support", kNgxPattern.data(), kNgxPattern.size(), 2,
     kNgxOriginal.data(), kNgxReplacement.data(), kNgxOriginal.size()
+};
+
+// Feature initialization stores a dedicated multi-frame capability byte after
+// comparing the real GPU architecture with Blackwell (0x1B0).  Patch only that
+// stored capability.  Spoofing the architecture export itself changes other
+// architecture-dependent paths and crashes Ada during renderer startup.
+static constexpr std::array<uint8_t, 15> kNgxAdaSynthesisPattern{
+    0x3D, 0xB0, 0x01, 0x00, 0x00,
+    0x0F, 0x93, 0xC0,
+    0x88, 0x47, 0x28,
+    0x40, 0x88, 0x77, 0x29
+};
+static constexpr std::array<uint8_t, 3> kNgxAdaSynthesisOriginal{
+    0x0F, 0x93, 0xC0
+};
+static constexpr std::array<uint8_t, 3> kNgxAdaSynthesisReplacement{
+    0xB0, 0x01, 0x90
+};
+static const PatternPatch kNgxAdaSynthesisPatch{
+    L"NGX architecture capability", kNgxAdaSynthesisPattern.data(),
+    kNgxAdaSynthesisPattern.size(), 5, kNgxAdaSynthesisOriginal.data(),
+    kNgxAdaSynthesisReplacement.data(), kNgxAdaSynthesisOriginal.size()
+};
+
+// Parameter population independently clamps DLSSG.MultiFrameCountMax to one
+// below Blackwell.  Lower only this parameter's threshold to Ada (0x190).
+// The global architecture export must retain the real GPU architecture because
+// other architecture-dependent backend paths are not safe to spoof.
+static constexpr std::array<uint8_t, 17> kNgxMultiFrameMaximumPattern{
+    0x81, 0xFD, 0xB0, 0x01, 0x00, 0x00,
+    0x0F, 0x8C, 0x9F, 0x00, 0x00, 0x00,
+    0xBF, 0x05, 0x00, 0x00, 0x00
+};
+static constexpr std::array<uint8_t, 6> kNgxMultiFrameMaximumOriginal{
+    0x81, 0xFD, 0xB0, 0x01, 0x00, 0x00
+};
+static constexpr std::array<uint8_t, 6> kNgxMultiFrameMaximumReplacement{
+    0x81, 0xFD, 0x90, 0x01, 0x00, 0x00
+};
+static const PatternPatch kNgxMultiFrameMaximumPatch{
+    L"NGX multi-frame parameter maximum", kNgxMultiFrameMaximumPattern.data(),
+    kNgxMultiFrameMaximumPattern.size(), 0,
+    kNgxMultiFrameMaximumOriginal.data(),
+    kNgxMultiFrameMaximumReplacement.data(),
+    kNgxMultiFrameMaximumOriginal.size()
+};
+
+// NGX selects its embedded DL4RT target from the real GPU architecture.  This
+// opt-in diagnostic redirects only the Ada (0x190) branch from the sm89 target
+// block to the adjacent sm120 target block.  It is intentionally environment
+// gated: sm120 code may be rejected by an Ada driver/device, and this test is
+// only meant to establish whether the remaining boundary is model/kernel
+// selection rather than Streamline parameter propagation.
+static constexpr std::array<uint8_t, 21> kNgxExperimentalSm120Pattern{
+    0x83, 0xE9, 0x10, 0x74, 0x75,
+    0x83, 0xE9, 0x10, 0x74, 0x60,
+    0x83, 0xE9, 0x10, 0x74, 0x4B,
+    0x44, 0x88, 0x3A, 0x83, 0xF9, 0x20
+};
+static constexpr std::array<uint8_t, 1> kNgxExperimentalSm120Original{ 0x4B };
+static constexpr std::array<uint8_t, 1> kNgxExperimentalSm120Replacement{ 0x2B };
+static const PatternPatch kNgxExperimentalSm120Patch{
+    L"NGX experimental Ada-to-sm120 target", kNgxExperimentalSm120Pattern.data(),
+    kNgxExperimentalSm120Pattern.size(), 14,
+    kNgxExperimentalSm120Original.data(),
+    kNgxExperimentalSm120Replacement.data(),
+    kNgxExperimentalSm120Original.size()
+};
+
+// EndpointDL4RTWrapper selects separate DL1/DL2 network implementations for
+// SM < 89, SM == 89, and SM > 89.  Lowering the equality threshold by one sends
+// Ada's reported SM 89 through the same constructors selected on Blackwell.
+// Keep both sites gated and DLSS-G-scoped; these constructors can still reject
+// Ada if the selected graph or kernels require Blackwell hardware.
+static constexpr std::array<uint8_t, 11> kNgxDl4rtDl1Sm120Pattern{
+    0xB9, 0x88, 0x14, 0x00, 0x00,
+    0x83, 0xF8, 0x59,
+    0x7E, 0x21, 0xE8
+};
+static constexpr std::array<uint8_t, 11> kNgxDl4rtDl2Sm120Pattern{
+    0xB9, 0x60, 0x20, 0x00, 0x00,
+    0x83, 0xF8, 0x59,
+    0x7E, 0x21, 0xE8
+};
+static constexpr std::array<uint8_t, 1> kNgxDl4rtSm89Original{ 0x59 };
+static constexpr std::array<uint8_t, 1> kNgxDl4rtSm120Replacement{ 0x58 };
+static const PatternPatch kNgxDl4rtDl1Sm120Patch{
+    L"NGX experimental DL4RT DL1 Blackwell path",
+    kNgxDl4rtDl1Sm120Pattern.data(), kNgxDl4rtDl1Sm120Pattern.size(), 7,
+    kNgxDl4rtSm89Original.data(), kNgxDl4rtSm120Replacement.data(), 1
+};
+static const PatternPatch kNgxDl4rtDl2Sm120Patch{
+    L"NGX experimental DL4RT DL2 Blackwell path",
+    kNgxDl4rtDl2Sm120Pattern.data(), kNgxDl4rtDl2Sm120Pattern.size(), 7,
+    kNgxDl4rtSm89Original.data(), kNgxDl4rtSm120Replacement.data(), 1
+};
+
+// ComputeAndValidateTimeFactor normally stores:
+//
+//   temporalRatio = MultiFrameIndex / (MultiFrameCount + 1)
+//
+// The Ada multi-frame output probe behaves as if that value is contracted
+// around 0.5 once more.  This opt-in sample experiment pre-emphasizes the
+// internal float without changing or bypassing the validated public indices:
+//
+//   temporalRatio = MultiFrameIndex - MultiFrameCount / 2
+//
+// For count=1 this remains 0.5.  For count=5 it supplies
+// [-1.5, -0.5, 0.5, 1.5, 2.5].  The replacement is the same size as NVIDIA's
+// original ratio-calculation block and preserves the following success path.
+static constexpr std::array<uint8_t, 44> kNgxTemporalPreEmphasisPattern{
+    0x0F, 0x57, 0xC9,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC9,
+    0x41, 0x8B, 0xC0,
+    0x0F, 0x57, 0xC0,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+    0xF3, 0x0F, 0x58, 0x05, 0xA7, 0x97, 0x03, 0x00,
+    0xF3, 0x0F, 0x5E, 0xC8,
+    0xF3, 0x0F, 0x11, 0x8B, 0xF4, 0x04, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00
+};
+static constexpr std::array<uint8_t, 39> kNgxTemporalPreEmphasisOriginal{
+    0x0F, 0x57, 0xC9,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC9,
+    0x41, 0x8B, 0xC0,
+    0x0F, 0x57, 0xC0,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+    0xF3, 0x0F, 0x58, 0x05, 0xA7, 0x97, 0x03, 0x00,
+    0xF3, 0x0F, 0x5E, 0xC8,
+    0xF3, 0x0F, 0x11, 0x8B, 0xF4, 0x04, 0x00, 0x00
+};
+static constexpr std::array<uint8_t, 39> kNgxTemporalPreEmphasisReplacement{
+    0x8D, 0x0C, 0x09,                         // lea ecx,[rcx+rcx]
+    0x44, 0x29, 0xC1,                         // sub ecx,r8d
+    0x0F, 0x57, 0xC9,                         // xorps xmm1,xmm1
+    0xF3, 0x0F, 0x2A, 0xC9,                   // cvtsi2ss xmm1,ecx
+    0xB8, 0x00, 0x00, 0x00, 0x3F,             // mov eax,0.5f
+    0x66, 0x0F, 0x6E, 0xC0,                   // movd xmm0,eax
+    0xF3, 0x0F, 0x59, 0xC8,                   // mulss xmm1,xmm0
+    0xF3, 0x0F, 0x11, 0x8B, 0xF4, 0x04, 0x00, 0x00,
+    0x90, 0x90, 0x90, 0x90, 0x90
+};
+static const PatternPatch kNgxTemporalPreEmphasisPatch{
+    L"NGX experimental temporal-ratio pre-emphasis",
+    kNgxTemporalPreEmphasisPattern.data(),
+    kNgxTemporalPreEmphasisPattern.size(), 0,
+    kNgxTemporalPreEmphasisOriginal.data(),
+    kNgxTemporalPreEmphasisReplacement.data(),
+    kNgxTemporalPreEmphasisOriginal.size()
+};
+
+// NVIDIA's downloaded DLSS-G implementation contains the same function with
+// a 0x20 RVA shift.  The RIP-relative address inside the matched block is
+// therefore 0x20 smaller even though the replacement itself is identical.
+// Keep this separate from the exported/front DLL signature so the experimental
+// patch remains exact and fails closed if NVIDIA changes either image.
+static constexpr std::array<uint8_t, 44> kNgxCachedTemporalPreEmphasisPattern{
+    0x0F, 0x57, 0xC9,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC9,
+    0x41, 0x8B, 0xC0,
+    0x0F, 0x57, 0xC0,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+    0xF3, 0x0F, 0x58, 0x05, 0x87, 0x97, 0x03, 0x00,
+    0xF3, 0x0F, 0x5E, 0xC8,
+    0xF3, 0x0F, 0x11, 0x8B, 0xF4, 0x04, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00
+};
+static constexpr std::array<uint8_t, 39> kNgxCachedTemporalPreEmphasisOriginal{
+    0x0F, 0x57, 0xC9,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC9,
+    0x41, 0x8B, 0xC0,
+    0x0F, 0x57, 0xC0,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+    0xF3, 0x0F, 0x58, 0x05, 0x87, 0x97, 0x03, 0x00,
+    0xF3, 0x0F, 0x5E, 0xC8,
+    0xF3, 0x0F, 0x11, 0x8B, 0xF4, 0x04, 0x00, 0x00
+};
+static const PatternPatch kNgxCachedTemporalPreEmphasisPatch{
+    L"NGX cached-backend temporal-ratio pre-emphasis",
+    kNgxCachedTemporalPreEmphasisPattern.data(),
+    kNgxCachedTemporalPreEmphasisPattern.size(), 0,
+    kNgxCachedTemporalPreEmphasisOriginal.data(),
+    kNgxTemporalPreEmphasisReplacement.data(),
+    kNgxCachedTemporalPreEmphasisOriginal.size()
 };
 
 struct PatternPatchResult
@@ -1514,6 +3150,10 @@ void RecomputeModuleStateLocked()
     uint32_t patchedWrappers = 0;
     uint32_t ngxCandidates = 0;
     uint32_t patchedNgx = 0;
+    uint32_t ngxSynthesisCandidates = 0;
+    uint32_t patchedNgxSynthesis = 0;
+    bool perSampleSynthesisReady = false;
+    bool temporalPreEmphasisBackendReady = false;
     uint32_t wrapperRouteBits = 0;
     uint32_t ngxRouteBits = 0;
     for (const auto& record : gModuleRecords)
@@ -1532,24 +3172,76 @@ void RecomputeModuleStateLocked()
             ++patchedNgx;
             ngxRouteBits |= ClassifyLoadedRoute(record.path);
         }
+        if (record.ngxAdaSynthesisCandidate)
+            ++ngxSynthesisCandidates;
+        if (record.ngxAdaSynthesisPatched)
+            ++patchedNgxSynthesis;
+        if (record.ngxPatched && record.ngxAdaSynthesisPatched
+            && record.ngxMultiFrameMaximumPatched)
+            perSampleSynthesisReady = true;
+        if (record.ngxCachedDlssgImplementation
+            && record.ngxTemporalPreEmphasisPatched)
+            temporalPreEmphasisBackendReady = true;
     }
     gLoadedWrapperCandidates.store(wrapperCandidates, std::memory_order_release);
     gPatchedWrapperCandidates.store(patchedWrappers, std::memory_order_release);
     gLoadedNgxCandidates.store(ngxCandidates, std::memory_order_release);
     gPatchedNgxCandidates.store(patchedNgx, std::memory_order_release);
+    gLoadedNgxSynthesisCandidates.store(
+        ngxSynthesisCandidates, std::memory_order_release);
+    gPatchedNgxSynthesisCandidates.store(
+        patchedNgxSynthesis, std::memory_order_release);
+    gExperimentalTemporalPreEmphasisPatchActive.store(
+        temporalPreEmphasisBackendReady, std::memory_order_release);
+    const bool wasSynthesisReady = gPerSampleSynthesisReady.exchange(
+        perSampleSynthesisReady, std::memory_order_acq_rel);
+    if (perSampleSynthesisReady && !wasSynthesisReady)
+    {
+        // A high-multiplier request may have been safely submitted as 2x while
+        // the OTA backend was still loading. Let the next render-thread state
+        // call reapply that same request now that the guarded patch is ready.
+        gAppliedRevision.store(0, std::memory_order_release);
+        gAttemptedRevision.store(0, std::memory_order_release);
+    }
     gWrapperRouteBits.store(wrapperRouteBits, std::memory_order_release);
     gNgxRouteBits.store(ngxRouteBits, std::memory_order_release);
 }
 
 void LogModuleInventory(const ModuleRecord& record)
 {
-    if (!record.wrapperExport && !record.ngxExport)
+    if (!record.wrapperExport && !record.ngxExport
+        && !record.ngxCachedDlssgImplementation)
         return;
     Log(L"Loaded module: wrapperExport=%d wrapperCandidate=%d wrapperPatched=%d "
-        L"ngxExport=%d ngxCandidate=%d ngxPatched=%d path=%s",
+        L"ngxEvaluateLookupHooked=%d "
+        L"ngxExport=%d ngxCandidate=%d ngxPatched=%d "
+        L"ngxAdaSynthesisCandidate=%d ngxAdaSynthesisPatched=%d "
+        L"ngxMultiFrameMaximumCandidate=%d ngxMultiFrameMaximumPatched=%d "
+        L"ngxCachedDlssgImplementation=%d temporalPreEmphasisCandidate=%d "
+        L"temporalPreEmphasisPatched=%d path=%s",
         record.wrapperExport, record.wrapperCandidate, record.wrapperPatched,
+        record.ngxEvaluateLookupHooked,
         record.ngxExport, record.ngxCandidate, record.ngxPatched,
+        record.ngxAdaSynthesisCandidate, record.ngxAdaSynthesisPatched,
+        record.ngxMultiFrameMaximumCandidate,
+        record.ngxMultiFrameMaximumPatched,
+        record.ngxCachedDlssgImplementation,
+        record.ngxTemporalPreEmphasisCandidate,
+        record.ngxTemporalPreEmphasisPatched,
         record.path.c_str());
+}
+
+bool IsCachedDlssgImplementationPath(const std::wstring& path)
+{
+    std::wstring normalized = path;
+    std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+        [](wchar_t character) {
+            return static_cast<wchar_t>(std::towlower(character));
+        });
+    return normalized.ends_with(L".bin")
+        && normalized.find(L"\\nvidia\\ngx\\models\\dlssg\\")
+            != std::wstring::npos;
 }
 
 ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPath)
@@ -1583,7 +3275,10 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             record.wrapperExport = ModuleExportsFunction(module, "slGetPluginFunction");
             record.ngxExport = ModuleExportsFunction(module, "NVSDK_NGX_D3D12_CreateFeature")
                 && ModuleExportsFunction(module, "NVSDK_NGX_GetGPUArchitecture");
-            if (!record.wrapperExport && !record.ngxExport)
+            record.ngxCachedDlssgImplementation =
+                IsCachedDlssgImplementationPath(path);
+            if (!record.wrapperExport && !record.ngxExport
+                && !record.ngxCachedDlssgImplementation)
                 return record;
             if (record.wrapperExport)
             {
@@ -1597,6 +3292,7 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
                     SetWrapperMaximum(record,
                         RequestedMaximumGeneratedFrames(ReadControlSnapshot().control));
                 }
+                InstallNgxEvaluateLookupHook(record);
             }
             if (record.ngxExport)
             {
@@ -1604,6 +3300,63 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
                     PatchUniqueExecutablePattern(module, path, kNgxPatch);
                 record.ngxCandidate = result.candidate;
                 record.ngxPatched = result.patched;
+
+                const PatternPatchResult synthesisResult =
+                    PatchUniqueExecutablePattern(module, path, kNgxAdaSynthesisPatch);
+                record.ngxAdaSynthesisCandidate = synthesisResult.candidate;
+                record.ngxAdaSynthesisPatched = synthesisResult.patched;
+
+                const PatternPatchResult maximumResult =
+                    PatchUniqueExecutablePattern(module, path,
+                        kNgxMultiFrameMaximumPatch);
+                record.ngxMultiFrameMaximumCandidate = maximumResult.candidate;
+                record.ngxMultiFrameMaximumPatched = maximumResult.patched;
+
+                // The architecture-to-target helper is shared by several NGX
+                // features.  Apply this experiment only to a module that also
+                // matched both DLSS-G-specific multi-frame patches.
+                if (gExperimentalSm120Target.load(std::memory_order_acquire)
+                    && synthesisResult.candidate
+                    && maximumResult.candidate)
+                {
+                    PatchUniqueExecutablePattern(module, path,
+                        kNgxExperimentalSm120Patch);
+                }
+                if (gExperimentalDl4rtSm120Path.load(std::memory_order_acquire)
+                    && synthesisResult.candidate
+                    && maximumResult.candidate)
+                {
+                    PatchUniqueExecutablePattern(module, path,
+                        kNgxDl4rtDl1Sm120Patch);
+                    PatchUniqueExecutablePattern(module, path,
+                        kNgxDl4rtDl2Sm120Patch);
+                }
+                if (gExperimentalTemporalPreEmphasis.load(
+                        std::memory_order_acquire)
+                    && synthesisResult.candidate
+                    && maximumResult.candidate)
+                {
+                    const PatternPatchResult temporalPreEmphasisResult =
+                        PatchUniqueExecutablePattern(module, path,
+                            kNgxTemporalPreEmphasisPatch);
+                    record.ngxTemporalPreEmphasisCandidate =
+                        temporalPreEmphasisResult.candidate;
+                    record.ngxTemporalPreEmphasisPatched =
+                        temporalPreEmphasisResult.patched;
+                }
+
+            }
+            if (record.ngxCachedDlssgImplementation
+                && gExperimentalTemporalPreEmphasis.load(
+                    std::memory_order_acquire))
+            {
+                const PatternPatchResult temporalPreEmphasisResult =
+                    PatchUniqueExecutablePattern(module, path,
+                        kNgxCachedTemporalPreEmphasisPatch);
+                record.ngxTemporalPreEmphasisCandidate =
+                    temporalPreEmphasisResult.candidate;
+                record.ngxTemporalPreEmphasisPatched =
+                    temporalPreEmphasisResult.patched;
             }
             record.inventoryLogged = gLogReady.load(std::memory_order_acquire);
             logInventory = record.inventoryLogged;
@@ -1645,6 +3398,15 @@ void RemoveLoadedModule(HMODULE module)
             [&](const ModuleRecord& record) { return record.module == module; }),
             gModuleRecords.end());
         RecomputeModuleStateLocked();
+    }
+    {
+        std::lock_guard lock(gNgxEvaluateRouteMutex);
+        gNgxEvaluateRoutes.erase(std::remove_if(
+            gNgxEvaluateRoutes.begin(), gNgxEvaluateRoutes.end(),
+            [&](const NgxEvaluateRoute& route) { return route.wrapper == module; }),
+            gNgxEvaluateRoutes.end());
+        gNgxEvaluateLookupHookInstalled.store(!gNgxEvaluateRoutes.empty(),
+            std::memory_order_release);
     }
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
     if (gActiveWrapperBase.load(std::memory_order_acquire) == base)
@@ -1762,6 +3524,36 @@ bool RegisterDllNotification()
 DWORD WINAPI PatchWorker(void* context)
 {
     const DWORD pid = GetCurrentProcessId();
+    gForceFullNgxState.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_FORCE_FULL_NGX_STATE"),
+        std::memory_order_release);
+    gDisableAutomaticFullNgxState.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_DISABLE_FULL_NGX_STATE"),
+        std::memory_order_release);
+    gExperimentalSm120Target.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_EXPERIMENTAL_SM120_TARGET"),
+        std::memory_order_release);
+    gExperimentalDl4rtSm120Path.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_EXPERIMENTAL_DL4RT_SM120_PATH"),
+        std::memory_order_release);
+    gExperimentalTemporalPreEmphasis.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_EXPERIMENTAL_TEMPORAL_PREEMPHASIS"),
+        std::memory_order_release);
+    gPresentProbeEnvironmentEnabled.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_PRESENT_PROBE"),
+        std::memory_order_release);
+    gNgxOutputProbeEnvironmentEnabled.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_NGX_OUTPUT_PROBE"),
+        std::memory_order_release);
+    gImmutableOutputEnvironmentEnabled.store(
+        ReadEnvironmentFlag(L"RTX40_MFG_IMMUTABLE_OUTPUTS"),
+        std::memory_order_release);
+    present_probe::SetEnabled(
+        gPresentProbeEnvironmentEnabled.load(std::memory_order_acquire));
+    ngx_output_probe::Configure(
+        gNgxOutputProbeEnvironmentEnabled.load(std::memory_order_acquire),
+        gImmutableOutputEnvironmentEnabled.load(std::memory_order_acquire),
+        &ProbeLog);
     wchar_t tempDirectory[MAX_PATH]{};
     DWORD tempLength = GetTempPathW(_countof(tempDirectory), tempDirectory);
     std::wstring logPath;
@@ -1793,17 +3585,35 @@ DWORD WINAPI PatchWorker(void* context)
     FILETIME configWriteTime{};
     ReadLastWriteTime(gConfigPath, configWriteTime);
     Log(L"Initial control: mode=%s multiplier=%ux dynamicTarget=%u FPS "
-        L"dynamicExperimental56=%d; config: %s",
+        L"dynamicExperimental56=%d generatedOnlyDebug=%d; config: %s",
         initialControl.dynamic ? L"dynamic" : L"fixed", initialControl.multiplier,
         initialControl.dynamicTargetFrameRate, initialControl.dynamicExperimental56,
+        initialControl.generatedOnlyDebug,
         gConfigPath.c_str());
 
     Log(L"Patch worker started for PID %lu", static_cast<unsigned long>(pid));
+    Log(L"Sample diagnostics: forceFullNgxState=%d disableAutomaticFullNgxState=%d "
+        L"experimentalSm120Target=%d experimentalDl4rtSm120Path=%d "
+        L"experimentalTemporalPreEmphasis=%d presentProbe=%d ngxOutputProbe=%d "
+        L"immutableOutputs=%d",
+        gForceFullNgxState.load(std::memory_order_relaxed),
+        gDisableAutomaticFullNgxState.load(std::memory_order_relaxed),
+        gExperimentalSm120Target.load(std::memory_order_relaxed),
+        gExperimentalDl4rtSm120Path.load(std::memory_order_relaxed),
+        gExperimentalTemporalPreEmphasis.load(std::memory_order_relaxed),
+        gPresentProbeEnvironmentEnabled.load(std::memory_order_relaxed),
+        gNgxOutputProbeEnvironmentEnabled.load(std::memory_order_relaxed),
+        gImmutableOutputEnvironmentEnabled.load(std::memory_order_relaxed));
     Log(L"Early DLL notification registered: %d",
         gDllNotificationRegistered.load(std::memory_order_acquire));
     const bool liveHookInstalled = InstallFeatureFunctionHook();
     gLiveHookInstalled.store(liveHookInstalled, std::memory_order_release);
     Log(L"Streamline feature-function interception installed: %d", liveHookInstalled);
+    Log(L"Early D3D12 creation interception installed: create=%d upgrade=%d",
+        gD3D12CreateDeviceHookInstalled.load(std::memory_order_acquire),
+        gSlUpgradeInterfaceHookInstalled.load(std::memory_order_acquire));
+    Log(L"Streamline D3D12 device interception installed: %d",
+        gD3DDeviceHookInstalled.load(std::memory_order_acquire));
     const bool uiTagHookInstalled = InstallUiTagHooks();
     Log(L"Streamline UI tag interception installed: %d", uiTagHookInstalled);
     InspectAlreadyLoadedModules();
@@ -1868,10 +3678,11 @@ DWORD WINAPI PatchWorker(void* context)
                 PublishLiveBridge(activeControl);
                 WriteBridgeStatus(activeControl, pid);
                 Log(L"Live control requested: mode=%s multiplier=%ux dynamicTarget=%u FPS "
-                    L"dynamicExperimental56=%d",
+                    L"dynamicExperimental56=%d generatedOnlyDebug=%d",
                     activeControl.dynamic ? L"dynamic" : L"fixed", activeControl.multiplier,
                     activeControl.dynamicTargetFrameRate,
-                    activeControl.dynamicExperimental56);
+                    activeControl.dynamicExperimental56,
+                    activeControl.generatedOnlyDebug);
             }
         }
 
@@ -1900,16 +3711,62 @@ DWORD WINAPI PatchWorker(void* context)
 }
 }
 
+extern "C" __declspec(dllexport) BOOL WINAPI
+MfgUnlockRegisterD3D12Queue(ID3D12CommandQueue* queue)
+{
+    return ngx_output_probe::RegisterQueue(queue) ? TRUE : FALSE;
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI
+MfgUnlockRegisterD3D12Device(ID3D12Device* device)
+{
+    return ngx_output_probe::RegisterDevice(device) ? TRUE : FALSE;
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI
+MfgUnlockRegisterD3D12Swapchain(
+    IDXGISwapChain* swapchain, IUnknown* presentationQueue)
+{
+    return present_probe::RegisterSwapchain(swapchain, presentationQueue)
+        ? TRUE : FALSE;
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI
+MfgUnlockUnregisterD3D12Swapchain(IDXGISwapChain* swapchain)
+{
+    return present_probe::UnregisterSwapchain(swapchain) ? TRUE : FALSE;
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(instance);
+        // This must be available before DLL-load notifications inspect NGX.
+        gExperimentalSm120Target.store(
+            ReadEnvironmentFlag(L"RTX40_MFG_EXPERIMENTAL_SM120_TARGET"),
+            std::memory_order_release);
+        gExperimentalDl4rtSm120Path.store(
+            ReadEnvironmentFlag(L"RTX40_MFG_EXPERIMENTAL_DL4RT_SM120_PATH"),
+            std::memory_order_release);
+        gExperimentalTemporalPreEmphasis.store(
+            ReadEnvironmentFlag(L"RTX40_MFG_EXPERIMENTAL_TEMPORAL_PREEMPHASIS"),
+            std::memory_order_release);
         wchar_t executablePath[32768]{};
         GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
         gExecutableDirectory = ParentPath(executablePath);
+        InstallEarlyD3D12Hooks();
+        InstallD3DDeviceHook();
         gLiveHookInstalled.store(InstallFeatureFunctionHook(), std::memory_order_release);
         InstallUiTagHooks();
+        // The official Streamline sample recreates its swapchain through the
+        // interposer.  Do not alter that path for parameter-only control runs;
+        // opt the sample into presentation probing explicitly.
+        if (!ReadEnvironmentFlag(L"RTX40_MFG_SAMPLE_PROBE")
+            && ReadEnvironmentFlag(L"RTX40_MFG_PRESENT_PROBE"))
+        {
+            present_probe::Install(GetModuleHandleW(nullptr), &ProbeLog);
+        }
         RegisterDllNotification();
         HANDLE thread = CreateThread(nullptr, 0, PatchWorker, instance, 0, nullptr);
         if (thread)

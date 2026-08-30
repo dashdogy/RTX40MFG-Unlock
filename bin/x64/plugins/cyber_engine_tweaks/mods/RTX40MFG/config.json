@@ -1,7 +1,8 @@
 {
-  "mode": "fixed",
-  "multiplier": 2,
+  "mode": "dynamic",
+  "multiplier": 6,
   "dynamicTargetFrameRate": 0,
-  "dynamicExperimental56": false,
-  "version": 6
+  "dynamicExperimental56": true,
+  "generatedOnlyDebug": false,
+  "version": 7
 }

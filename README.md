@@ -17,7 +17,10 @@ Requires Cyberpunk 2077, Cyber Engine Tweaks, an RTX 40 series GPU, and DLSS
 Frame Generation enabled. CET 1.37.1 was used during development.
 
 Extract `bin` into the Cyberpunk game directory, merge folders, then select a
-mode from the CET overlay. Changes apply live.
+mode from the CET overlay. Select the multiplier before launch when possible.
+If Frame Generation is already active, change it Off and back On in the game
+settings (or restart the game) so Streamline rebuilds its presentation swapchain
+and generated-frame pool with the new shape.
 
 ## How it works
 
@@ -29,6 +32,13 @@ not assume NVIDIA cache paths.
 The bridge becomes ready only after the active DLSS G wrapper and loaded NGX
 module are verified and patched. It then adjusts `slDLSSGSetOptions` and reads
 actual presentation counts through `slDLSSGGetState`.
+Multiplier-shape changes are submitted only on a clean DLSS-G enable. A live
+change is reported as pending rather than recycling only the NGX feature inside
+an already-created Streamline presentation swapchain.
+For higher modes, it keeps the Ada backend in its supported single generated
+frame configuration while the wrapper evaluates each requested temporal index.
+An unknown backend safely falls back to 2x instead of presenting duplicate frames.
+The generated frames only toggle isolates interpolated output for capture tests.
 
 The approach targets Streamline DLSS G rather than Cyberpunk's renderer. In
 another Streamline game, only the early DLL loading integration, UI, paths, and

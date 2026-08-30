@@ -3,3 +3,4 @@
 /outputs/
 /test_runs/
 **/bridge_status.json
+*.rdp

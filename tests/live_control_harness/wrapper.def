@@ -3,4 +3,10 @@ EXPORTS
     FakeSetOptions
     FakeGetState
     FakeUiRecompositionEnabled
+    FakeOptionsFlags
+    FakeActualMultiplier
+    FakeOffSetCalls
+    FakeRecycleOrderViolations
+    FakeRunTemporalSequence
+    FakeRunInterleavedTemporalSequences
     WrapperSignature

@@ -1,5 +1,8 @@
 LIBRARY "sl.interposer.dll"
 EXPORTS
     slGetFeatureFunction
+    slFreeResources
     slSetTag
     slSetTagForFrame
+    FakeFreeResourcesCalls
+    FakeFreeResourcesOrderViolations
