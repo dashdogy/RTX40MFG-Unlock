@@ -10,19 +10,23 @@ local selectedMode = "fixed"
 local selectedMultiplier = 2
 local dynamicTargetFrameRate = 0
 local dynamicExperimental56 = false
+local generatedOnlyDebug = false
 local lastCustomTarget = 120
 local nativeStatusDetected = false
 local nativeStatusVersion = nil
 local liveBridgeDetected = false
+local synthesisFallbackActive = false
 local activeMode = nil
 local activeMultiplier = nil
 local activeDynamicTarget = nil
 local activeDynamicExperimental56 = nil
+local activeGeneratedOnlyDebug = nil
 local activePatchRoute = nil
 local appliedMode = nil
 local appliedMultiplier = nil
 local appliedDynamicTarget = nil
 local requestPending = false
+local streamlineRebuildRequired = false
 local gameFrameGenerationOn = false
 local setOptionsSeen = false
 local setOptionsAccepted = false
@@ -76,16 +80,19 @@ local function readBridgeState()
         end
         local statusVersion = tonumber(data.version) or 1
         return {
-            bridgeReady = statusVersion >= 6 and data.bridgeReady == true,
+            bridgeReady = statusVersion >= 7 and data.bridgeReady == true,
+            synthesisFallbackActive = data.synthesisFallbackActive == true,
             multiplier = multiplier,
             mode = mode,
             dynamicTargetFrameRate = target or 0,
             dynamicExperimental56 = data.dynamicExperimental56 == true,
+            generatedOnlyDebug = data.generatedOnlyDebug == true,
             patchRoute = route,
             appliedMode = data.appliedMode or mode,
             appliedMultiplier = tonumber(data.appliedMultiplier) or multiplier,
             appliedDynamicTargetFrameRate = tonumber(data.appliedDynamicTargetFrameRate) or (target or 0),
             pending = data.pending == true,
+            streamlineRebuildRequired = data.streamlineRebuildRequired == true,
             gameFrameGenerationOn = data.gameFrameGenerationOn == true,
             setOptionsSeen = data.setOptionsSeen == true,
             setOptionsAccepted = data.setOptionsAccepted == true
@@ -135,6 +142,7 @@ local function loadConfig()
             selectedMode = mode
             dynamicTargetFrameRate = math.floor(target)
             dynamicExperimental56 = data.dynamicExperimental56 == true
+            generatedOnlyDebug = data.generatedOnlyDebug == true
             if dynamicTargetFrameRate > 0 then
                 lastCustomTarget = dynamicTargetFrameRate
             end
@@ -166,7 +174,8 @@ local function saveConfig()
         multiplier = selectedMultiplier,
         dynamicTargetFrameRate = dynamicTargetFrameRate,
         dynamicExperimental56 = dynamicExperimental56,
-        version = 6
+        generatedOnlyDebug = generatedOnlyDebug,
+        version = 7
     })
     if not ok then
         file:close()
@@ -194,15 +203,18 @@ local function refreshBridgeStatus()
         nativeStatusDetected = false
         nativeStatusVersion = nil
         liveBridgeDetected = false
+        synthesisFallbackActive = false
         activeMode = nil
         activeMultiplier = nil
         activeDynamicTarget = nil
         activeDynamicExperimental56 = nil
+        activeGeneratedOnlyDebug = nil
         activePatchRoute = nil
         appliedMode = nil
         appliedMultiplier = nil
         appliedDynamicTarget = nil
         requestPending = false
+        streamlineRebuildRequired = false
         gameFrameGenerationOn = false
         setOptionsSeen = false
         setOptionsAccepted = false
@@ -229,15 +241,18 @@ local function refreshBridgeStatus()
     nativeStatusDetected = true
     nativeStatusVersion = state.statusVersion
     liveBridgeDetected = state.bridgeReady
+    synthesisFallbackActive = state.synthesisFallbackActive
     activeMode = state.mode
     activeMultiplier = state.multiplier
     activeDynamicTarget = state.dynamicTargetFrameRate
     activeDynamicExperimental56 = state.dynamicExperimental56
+    activeGeneratedOnlyDebug = state.generatedOnlyDebug
     activePatchRoute = state.patchRoute
     appliedMode = state.appliedMode
     appliedMultiplier = state.appliedMultiplier
     appliedDynamicTarget = state.appliedDynamicTargetFrameRate
     requestPending = state.pending
+    streamlineRebuildRequired = state.streamlineRebuildRequired
     gameFrameGenerationOn = state.gameFrameGenerationOn
     setOptionsSeen = state.setOptionsSeen
     setOptionsAccepted = state.setOptionsAccepted
@@ -260,14 +275,14 @@ local function refreshBridgeStatus()
     fpsSampleAgeMs = state.fpsSampleAgeMs
     if liveBridgeDetected and not wasLive then
         if activePatchRoute == "ota" then
-            statusMessage = "Native bridge connected through the NVIDIA App OTA override. Changes apply without restarting."
+            statusMessage = "Native bridge connected through the NVIDIA App OTA override. Multiplier changes apply on the next clean Frame Generation enable."
         elseif activePatchRoute == "external" or activePatchRoute == "mixed" then
-            statusMessage = "Native bridge connected through loaded external modules. Changes apply without restarting."
+            statusMessage = "Native bridge connected through loaded external modules. Multiplier changes apply on the next clean Frame Generation enable."
         else
-            statusMessage = "Automatic native bridge connected. Changes apply without restarting."
+            statusMessage = "Automatic native bridge connected. Multiplier changes apply on the next clean Frame Generation enable."
         end
         print(MOD_NAME .. ": " .. statusMessage)
-    elseif nativeStatusVersion < 6 then
+    elseif nativeStatusVersion < 7 then
         statusMessage = "Update RTX40MFG.asi; bridge protocol is outdated."
     elseif not liveBridgeDetected then
         statusMessage = "Waiting for the active DLSS-G wrapper and NGX module."
@@ -342,8 +357,10 @@ registerForEvent("onDraw", function()
             statusValue = "Invalid state (38)"
         elseif setOptionsResult and not setOptionsAccepted then
             statusValue = "Error " .. tostring(setOptionsResult)
+        elseif streamlineRebuildRequired then
+            statusValue = "Re-enable Frame Generation"
         elseif requestPending then
-            statusValue = "Applying..."
+            statusValue = "Waiting for clean enable"
         elseif getStateSeen and getStateResult == 0 and stateSampleAgeMs
             and stateSampleAgeMs <= 2500 and actualFramesPresented then
             statusLabel = "Actual"
@@ -355,6 +372,9 @@ registerForEvent("onDraw", function()
             statusValue = statusValue .. " | VRAM low"
         end
         ImGui.Text(statusLabel .. ": " .. statusValue)
+        if synthesisFallbackActive then
+            ImGui.Text("3x-6x unavailable (DLL mismatch)")
+        end
         if realFps and dlssFps and fpsSampleAgeMs and fpsSampleAgeMs <= 2000 then
             ImGui.Text("FPS: " .. tostring(math.floor(realFps + 0.5))
                 .. " real | " .. tostring(math.floor(dlssFps + 0.5)) .. " DLSS")
@@ -379,7 +399,7 @@ registerForEvent("onDraw", function()
         end
         ImGui.Text("UI: " .. uiStatus)
     elseif nativeStatusDetected then
-        if nativeStatusVersion and nativeStatusVersion < 6 then
+        if nativeStatusVersion and nativeStatusVersion < 7 then
             ImGui.Text("Bridge: Update RTX40MFG.asi")
         else
             ImGui.Text("Bridge: Waiting for active DLSS-G modules")
@@ -447,8 +467,17 @@ registerForEvent("onDraw", function()
         ImGui.Text("VSync: Off")
     end
 
+    local generatedOnly = generatedOnlyDebug
+    local generatedOnlyChanged = false
+    generatedOnly, generatedOnlyChanged = ImGui.Checkbox("Generated frames only (debug)", generatedOnly)
+    if generatedOnlyChanged then
+        generatedOnlyDebug = generatedOnly
+        saveConfig()
+    end
+
     ImGui.Separator()
     ImGui.Text("In-game Frame Generation: On")
+    ImGui.TextWrapped("Multiplier or mode changes need a clean Frame Generation Off -> On, or a game restart.")
     if string.find(statusMessage, "Could not", 1, true)
         or string.find(statusMessage, "Invalid", 1, true) then
         ImGui.TextWrapped(statusMessage)

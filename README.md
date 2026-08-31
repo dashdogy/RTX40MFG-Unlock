@@ -8,6 +8,9 @@ Dynamic defaults to a 4x ceiling. Its UI toggle allows experimental 5x and 6x.
 UI recomposition is requested only when matching HUDless and UI buffers are tagged.
 The panel reports rendered FPS and total DLSS output FPS.
 
+Version 1.0 packages the preserved D157 runtime and fixes CET FPS telemetry
+when Streamline returns its accepted low-VRAM warning.
+
 This is an unsupported research mod. Modes above 2x may cause artifacts,
 latency, frozen presentation, black screens, or crashes.
 
@@ -17,7 +20,9 @@ Requires Cyberpunk 2077, Cyber Engine Tweaks, an RTX 40 series GPU, and DLSS
 Frame Generation enabled. CET 1.37.1 was used during development.
 
 Extract `bin` into the Cyberpunk game directory, merge folders, then select a
-mode from the CET overlay. Changes apply live.
+mode from the CET overlay. After changing mode or multiplier, toggle in-game
+Frame Generation Off and On (or restart the game). The release ZIP does not
+include `config.json`, so installing it preserves the selected mode.
 
 ## How it works
 
