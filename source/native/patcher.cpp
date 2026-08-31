@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "midpoint_fix.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -33,6 +34,7 @@ std::atomic<uint64_t> gAttemptedRevision{0};
 std::atomic<uint64_t> gLastAttemptTick{0};
 std::atomic<bool> gControlReady{false};
 std::atomic<PFun_slGetFeatureFunction*> gOriginalGetFeatureFunction{nullptr};
+std::atomic<PFun_slSetD3DDevice*> gOriginalSetD3DDevice{nullptr};
 std::atomic<PFun_slSetTag*> gOriginalSetTag{nullptr};
 std::atomic<PFun_slSetTagForFrame*> gOriginalSetTagForFrame{nullptr};
 std::atomic<PFun_slDLSSGSetOptions*> gOriginalSetOptions{nullptr};
@@ -58,6 +60,7 @@ std::atomic<uint64_t> gGetStateCalls{0};
 std::atomic<uint64_t> gLiveReapplyCount{0};
 std::atomic<uint64_t> gNotInitializedRetryCount{0};
 std::atomic<bool> gDllNotificationRegistered{false};
+std::atomic<bool> gModuleInventoryDirty{true};
 std::atomic<bool> gLiveHookInstalled{false};
 std::atomic<bool> gUiTagHookInstalled{false};
 std::atomic<uint32_t> gLoadedWrapperCandidates{0};
@@ -135,6 +138,7 @@ struct ModuleRecord
     bool ngxExport = false;
     bool ngxCandidate = false;
     bool ngxPatched = false;
+    bool ngxTemporalPatched = false;
     bool inventoryLogged = false;
 };
 
@@ -202,11 +206,15 @@ void Log(const wchar_t* format, ...)
     }
 }
 
-uint8_t RequestedMaximumGeneratedFrames(const ControlConfig& control)
+void MidpointLog(const wchar_t* message)
 {
-    return control.dynamic && !control.dynamicExperimental56
-        ? kStandardMaximumGeneratedFrames
-        : kExperimentalMaximumGeneratedFrames;
+    Log(L"%s", message ? message : L"");
+}
+
+uint8_t RequestedMaximumGeneratedFrames(const ControlConfig&)
+{
+    // Create one fixed-capacity wrapper and vary only numFramesToGenerate.
+    return kExperimentalMaximumGeneratedFrames;
 }
 
 bool SetWrapperMaximum(ModuleRecord& record, uint8_t maximum)
@@ -490,7 +498,8 @@ bool BridgeReady()
         && gSetOptionsHookExposed.load(std::memory_order_acquire)
         && gActiveWrapperObserved.load(std::memory_order_acquire)
         && gActiveWrapperPatched.load(std::memory_order_acquire)
-        && gPatchedNgxCandidates.load(std::memory_order_acquire) > 0;
+        && gPatchedNgxCandidates.load(std::memory_order_acquire) > 0
+        && midpoint_fix::Ready();
 }
 
 const char* PatchRouteName()
@@ -762,7 +771,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
 
     char json[4096]{};
     const int length = sprintf_s(json,
-        "{\"version\":6,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
+        "{\"version\":7,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
         "\"bridgeReady\":%s,\"liveHookInstalled\":%s,"
         "\"uiTagHookInstalled\":%s,"
         "\"activeWrapperObserved\":%s,\"activeWrapperPatched\":%s,"
@@ -1223,6 +1232,16 @@ sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
     return result;
 }
 
+sl::Result HookSlSetD3DDevice(void* device)
+{
+    auto* original = gOriginalSetD3DDevice.load(std::memory_order_acquire);
+    if (!original)
+        return sl::Result::eErrorNotInitialized;
+    if (midpoint_fix::ObserveD3D12Device(device))
+        gModuleInventoryDirty.store(true, std::memory_order_release);
+    return original(device);
+}
+
 bool HookMainExecutableImport(const char* importedModule, const char* importedFunction,
     void* replacement, void*& original)
 {
@@ -1291,6 +1310,20 @@ bool InstallFeatureFunctionHook()
     {
         gOriginalGetFeatureFunction.store(
             reinterpret_cast<PFun_slGetFeatureFunction*>(original),
+            std::memory_order_release);
+    }
+    return installed;
+}
+
+bool InstallD3DDeviceHook()
+{
+    void* original = nullptr;
+    const bool installed = HookMainExecutableImport("sl.interposer.dll",
+        "slSetD3DDevice", reinterpret_cast<void*>(&HookSlSetD3DDevice), original);
+    if (original)
+    {
+        gOriginalSetD3DDevice.store(
+            reinterpret_cast<PFun_slSetD3DDevice*>(original),
             std::memory_order_release);
     }
     return installed;
@@ -1527,7 +1560,7 @@ void RecomputeModuleStateLocked()
         }
         if (record.ngxCandidate)
             ++ngxCandidates;
-        if (record.ngxPatched)
+        if (record.ngxPatched && record.ngxTemporalPatched)
         {
             ++patchedNgx;
             ngxRouteBits |= ClassifyLoadedRoute(record.path);
@@ -1546,9 +1579,10 @@ void LogModuleInventory(const ModuleRecord& record)
     if (!record.wrapperExport && !record.ngxExport)
         return;
     Log(L"Loaded module: wrapperExport=%d wrapperCandidate=%d wrapperPatched=%d "
-        L"ngxExport=%d ngxCandidate=%d ngxPatched=%d path=%s",
+        L"ngxExport=%d ngxCandidate=%d ngxPatched=%d midpointPatched=%d path=%s",
         record.wrapperExport, record.wrapperCandidate, record.wrapperPatched,
         record.ngxExport, record.ngxCandidate, record.ngxPatched,
+        record.ngxTemporalPatched,
         record.path.c_str());
 }
 
@@ -1568,6 +1602,13 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             });
         if (existing != gModuleRecords.end())
         {
+            if (existing->ngxPatched && !existing->ngxTemporalPatched
+                && midpoint_fix::AdapterVerified())
+            {
+                existing->ngxTemporalPatched = midpoint_fix::PatchProvider(
+                    module, path.c_str());
+                RecomputeModuleStateLocked();
+            }
             if (gLogReady.load(std::memory_order_acquire) && !existing->inventoryLogged)
             {
                 existing->inventoryLogged = true;
@@ -1604,6 +1645,11 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
                     PatchUniqueExecutablePattern(module, path, kNgxPatch);
                 record.ngxCandidate = result.candidate;
                 record.ngxPatched = result.patched;
+                if (record.ngxPatched && midpoint_fix::AdapterVerified())
+                {
+                    record.ngxTemporalPatched = midpoint_fix::PatchProvider(
+                        module, path.c_str());
+                }
             }
             record.inventoryLogged = gLogReady.load(std::memory_order_acquire);
             logInventory = record.inventoryLogged;
@@ -1665,17 +1711,33 @@ void InspectAlreadyLoadedModules()
         return;
     }
 
+    std::vector<HMODULE> loadedModules;
     MODULEENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     if (Module32FirstW(snapshot, &entry))
     {
         do
         {
-            InspectLoadedModule(reinterpret_cast<HMODULE>(entry.modBaseAddr), entry.szExePath);
+            HMODULE module = reinterpret_cast<HMODULE>(entry.modBaseAddr);
+            loadedModules.push_back(module);
+            InspectLoadedModule(module, entry.szExePath);
             entry.dwSize = sizeof(entry);
         } while (Module32NextW(snapshot, &entry));
     }
     CloseHandle(snapshot);
+
+    std::vector<HMODULE> removedModules;
+    {
+        std::lock_guard lock(gModuleMutex);
+        for (const ModuleRecord& record : gModuleRecords)
+        {
+            if (std::find(loadedModules.begin(), loadedModules.end(),
+                    record.module) == loadedModules.end())
+                removedModules.push_back(record.module);
+        }
+    }
+    for (HMODULE module : removedModules)
+        RemoveLoadedModule(module);
 }
 
 void ObserveActiveWrapperProvider(void* function)
@@ -1726,22 +1788,8 @@ void CALLBACK OnDllNotification(
 {
     static constexpr ULONG kDllLoaded = 1;
     static constexpr ULONG kDllUnloaded = 2;
-    if (!data)
-        return;
-
-    if (reason == kDllUnloaded)
-    {
-        RemoveLoadedModule(static_cast<HMODULE>(data->unloaded.dllBase));
-        return;
-    }
-    if (reason != kDllLoaded || !data->loaded.dllBase)
-        return;
-
-    std::wstring path;
-    if (data->loaded.fullDllName && data->loaded.fullDllName->Buffer)
-        path.assign(data->loaded.fullDllName->Buffer,
-            data->loaded.fullDllName->Length / sizeof(wchar_t));
-    InspectLoadedModule(static_cast<HMODULE>(data->loaded.dllBase), path);
+    if (data && (reason == kDllLoaded || reason == kDllUnloaded))
+        gModuleInventoryDirty.store(true, std::memory_order_release);
 }
 
 bool RegisterDllNotification()
@@ -1804,6 +1852,8 @@ DWORD WINAPI PatchWorker(void* context)
     const bool liveHookInstalled = InstallFeatureFunctionHook();
     gLiveHookInstalled.store(liveHookInstalled, std::memory_order_release);
     Log(L"Streamline feature-function interception installed: %d", liveHookInstalled);
+    Log(L"Streamline D3D device interception installed: %d",
+        InstallD3DDeviceHook());
     const bool uiTagHookInstalled = InstallUiTagHooks();
     Log(L"Streamline UI tag interception installed: %d", uiTagHookInstalled);
     InspectAlreadyLoadedModules();
@@ -1846,11 +1896,20 @@ DWORD WINAPI PatchWorker(void* context)
     // CET writes config.json when the user changes the mode. Watch it off
     // the presenting thread and atomically publish changes for the SetOptions hook.
     uint32_t heartbeatTicks = 0;
+    uint32_t inventoryTicks = 0;
     bool previousReady = BridgeReady();
     std::string previousRoute = PatchRouteName();
     for (;;)
     {
         Sleep(100);
+        const bool retryMidpoint = ++inventoryTicks >= 10
+            && midpoint_fix::AdapterVerified() && !midpoint_fix::Ready();
+        if (gModuleInventoryDirty.exchange(false, std::memory_order_acq_rel)
+            || retryMidpoint)
+        {
+            inventoryTicks = 0;
+            InspectAlreadyLoadedModules();
+        }
         FILETIME latestWriteTime{};
         if (ReadLastWriteTime(gConfigPath, latestWriteTime)
             && CompareFileTime(&latestWriteTime, &configWriteTime) != 0)
@@ -1905,10 +1964,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(instance);
+        midpoint_fix::SetLogCallback(&MidpointLog);
         wchar_t executablePath[32768]{};
         GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
         gExecutableDirectory = ParentPath(executablePath);
         gLiveHookInstalled.store(InstallFeatureFunctionHook(), std::memory_order_release);
+        InstallD3DDeviceHook();
         InstallUiTagHooks();
         RegisterDllNotification();
         HANDLE thread = CreateThread(nullptr, 0, PatchWorker, instance, 0, nullptr);
