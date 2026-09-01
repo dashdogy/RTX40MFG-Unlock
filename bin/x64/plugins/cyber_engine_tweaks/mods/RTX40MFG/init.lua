@@ -275,11 +275,11 @@ local function refreshBridgeStatus()
     fpsSampleAgeMs = state.fpsSampleAgeMs
     if liveBridgeDetected and not wasLive then
         if activePatchRoute == "ota" then
-            statusMessage = "Native bridge connected through the NVIDIA App OTA override. Multiplier changes apply live after the first clean Frame Generation enable."
+            statusMessage = "Native bridge connected through the NVIDIA App OTA override. Multiplier changes apply on the next clean Frame Generation enable."
         elseif activePatchRoute == "external" or activePatchRoute == "mixed" then
-            statusMessage = "Native bridge connected through loaded external modules. Multiplier changes apply live after the first clean Frame Generation enable."
+            statusMessage = "Native bridge connected through loaded external modules. Multiplier changes apply on the next clean Frame Generation enable."
         else
-            statusMessage = "Automatic native bridge connected. Multiplier changes apply live after the first clean Frame Generation enable."
+            statusMessage = "Automatic native bridge connected. Multiplier changes apply on the next clean Frame Generation enable."
         end
         print(MOD_NAME .. ": " .. statusMessage)
     elseif nativeStatusVersion < 7 then
@@ -477,7 +477,7 @@ registerForEvent("onDraw", function()
 
     ImGui.Separator()
     ImGui.Text("In-game Frame Generation: On")
-    ImGui.TextWrapped("Multiplier changes apply live after the first clean Frame Generation enable. If Status says Re-enable Frame Generation, toggle it Off -> On or restart.")
+    ImGui.TextWrapped("Multiplier or mode changes need a clean Frame Generation Off -> On, or a game restart.")
     if string.find(statusMessage, "Could not", 1, true)
         or string.find(statusMessage, "Invalid", 1, true) then
         ImGui.TextWrapped(statusMessage)

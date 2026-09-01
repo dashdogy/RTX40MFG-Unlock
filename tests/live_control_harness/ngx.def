@@ -1,4 +1,5 @@
 EXPORTS
     NVSDK_NGX_D3D12_CreateFeature
+    NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl
     NVSDK_NGX_GetGPUArchitecture
     NgxSignature

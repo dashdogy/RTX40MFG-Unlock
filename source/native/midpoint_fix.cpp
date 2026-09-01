@@ -1,8 +1,8 @@
 #include "midpoint_fix.h"
+#include "dlssg_provider_policy.h"
 
 #include <bcrypt.h>
 #include <d3d12.h>
-#include <winver.h>
 
 #include <algorithm>
 #include <array>
@@ -42,20 +42,6 @@ constexpr char kTemporalInput[] =
     "sub.ftz.f32 %f136, %f135, %f134;\r\n";
 constexpr size_t kTemporalMultiplyCount = 104;
 constexpr size_t kTemporalDirectionCount = kTemporalMultiplyCount / 2;
-
-struct ProviderVersion
-{
-    WORD major;
-    WORD minor;
-    WORD build;
-};
-
-constexpr std::array<ProviderVersion, 4> kSupportedVersions{{
-    {310, 7, 0},
-    {310, 7, 128},
-    {310, 7, 129},
-    {310, 8, 0},
-}};
 
 enum class Failure : uint32_t
 {
@@ -180,37 +166,6 @@ bool Sha256Equals(const uint8_t* bytes, size_t count,
             return false;
     }
     return true;
-}
-
-bool SupportedVersion(const wchar_t* path) noexcept
-{
-    if (!path || !*path)
-        return false;
-    DWORD ignored = 0;
-    const DWORD bytes = GetFileVersionInfoSizeW(path, &ignored);
-    if (!bytes)
-        return false;
-    void* data = VirtualAlloc(nullptr, bytes,
-        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!data)
-        return false;
-
-    VS_FIXEDFILEINFO* info = nullptr;
-    UINT infoBytes = 0;
-    const bool read = GetFileVersionInfoW(path, 0, bytes, data)
-        && VerQueryValueW(data, L"\\", reinterpret_cast<void**>(&info),
-            &infoBytes)
-        && info && infoBytes >= sizeof(*info)
-        && info->dwSignature == VS_FFI_SIGNATURE;
-    const bool matched = read
-        && std::any_of(kSupportedVersions.begin(), kSupportedVersions.end(),
-            [&](const ProviderVersion& version) {
-                return HIWORD(info->dwFileVersionMS) == version.major
-                    && LOWORD(info->dwFileVersionMS) == version.minor
-                    && HIWORD(info->dwFileVersionLS) == version.build;
-            });
-    VirtualFree(data, 0, MEM_RELEASE);
-    return matched;
 }
 
 bool ImageSize(HMODULE module, uint32_t& imageSize) noexcept
@@ -856,7 +811,7 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
             static_cast<unsigned>(failure), path && *path ? path : L"(unknown)");
         return false;
     };
-    if (!SupportedVersion(path))
+    if (!dlssg_provider_policy::IsSupportedProvider(pinned, path))
         return fail(Failure::eProviderVersion);
     uint32_t imageSize = 0;
     if (!ImageSize(module, imageSize))

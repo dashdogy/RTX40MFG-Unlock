@@ -1,5 +1,6 @@
 #include "shared.h"
 #include "midpoint_fix.h"
+#include "dlssg_provider_policy.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -1622,7 +1623,9 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             record.module = module;
             record.path = path;
             record.wrapperExport = ModuleExportsFunction(module, "slGetPluginFunction");
-            record.ngxExport = ModuleExportsFunction(module, "NVSDK_NGX_D3D12_CreateFeature")
+            record.ngxExport =
+                dlssg_provider_policy::IsDlssgImplementationModule(module)
+                && ModuleExportsFunction(module, "NVSDK_NGX_D3D12_CreateFeature")
                 && ModuleExportsFunction(module, "NVSDK_NGX_GetGPUArchitecture");
             if (!record.wrapperExport && !record.ngxExport)
                 return record;
