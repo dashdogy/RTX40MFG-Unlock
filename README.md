@@ -76,3 +76,10 @@ FPS/status client are tracked at
 deep-kernel research diagnostics are disabled in the normal build.
 
 Logs are written to the temporary directory and include the process ID.
+
+## License
+
+Original code in this repository is licensed under the [MIT License](LICENSE).
+Reuse and redistribution are permitted provided the copyright and license notice
+are retained. NVIDIA Streamline, NGX, Cyberpunk 2077, and other third-party
+components remain subject to their respective terms.
