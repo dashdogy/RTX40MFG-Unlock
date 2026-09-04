@@ -1,4 +1,4 @@
-# Universal RTX 40 MFG Unlock
+# Universal RTX 40 MFG Unlocker
 
 Universal DLSS Multi Frame Generation enabler for supported Windows x64 games
 on NVIDIA GeForce RTX 40 Series GPUs. V1.2 adds Follow game, fixed 2X through
