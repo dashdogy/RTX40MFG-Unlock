@@ -64,6 +64,38 @@ The ASI must load before the first Frame Generation pipeline is created. If the
 menu asks for recreation, toggle Frame Generation Off and On or restart with an
 earlier loader proxy.
 
+### Frozen image or black screen above 2x
+
+If selecting a multiplier above 2x freezes the image while the game keeps
+running, try the following before deleting settings or reinstalling:
+
+1. Close the game.
+2. Open the game's profile in the NVIDIA App. Under **DLSS Override - Model
+   Presets**, set **Frame Generation** to **Preset B** and apply the change.
+3. Restart the game and test the desired multiplier.
+
+Users in [issue #6](https://github.com/dashdogy/RTX40MFG-Unlock/issues/6)
+reported that forcing Preset B restored presentation in Crimson Desert and
+Star Wars: Zero Company. Cyberpunk was also in the original report, but its
+recovery was not separately confirmed. This is a reported workaround; the
+underlying cause and correct output at every multiplier remain unverified.
+File removal and rebooting had mixed results, so preserve your configuration
+when trying the preset change.
+
+### ReShade status flicker
+
+Flickering status in the ReShade panel can persist after Preset B resolves the
+frozen image. Treat it as a separate symptom. A user
+[suggested using Ultimate ASI Loader's `dinput8.dll` proxy](https://github.com/dashdogy/RTX40MFG-Unlock/issues/6#issuecomment-5545273216)
+for the flicker, but the affected recipient has not confirmed that fix.
+If testing a different UAL proxy, fully close the game and back up the current
+loader setup first; preserve proxy files belonging to other mods.
+
+If either problem persists, include the game and mod version, GPU and driver,
+Frame Generation preset, selected multiplier, UAL proxy filename (if used),
+and relevant logs in the bug report. State whether the game image freezes,
+the ReShade status flickers, or both.
+
 ## Usage
 
 Open ReShade and select the **DLSS MFG** tab. Choose Follow game, a fixed
