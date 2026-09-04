@@ -1,0 +1,126 @@
+name: Game compatibility report
+description: Report a game that does not work correctly with Universal RTX 40 MFG Unlock
+title: "[Compatibility] "
+labels:
+  - compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use one report per game. Confirm that the game has native DLSS Frame Generation before testing the mod. Do not upload NVIDIA or game DLL files.
+
+  - type: input
+    id: game
+    attributes:
+      label: Game and build
+      description: Include the exact game title, store, and game version or build number.
+      placeholder: Cyberpunk 2077, Steam, build 2.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: graphics_api
+    attributes:
+      label: Graphics API
+      options:
+        - DirectX 12
+        - Vulkan
+        - Unsure
+    validations:
+      required: true
+
+  - type: input
+    id: mod_version
+    attributes:
+      label: Mod version
+      description: State the release version or commit used.
+      placeholder: v1.2
+    validations:
+      required: true
+
+  - type: textarea
+    id: system
+    attributes:
+      label: System and loader
+      description: Include GPU model, NVIDIA driver, Windows version, ReShade version, Ultimate ASI Loader proxy filename, and any other DLSS or Frame Generation mods.
+      placeholder: RTX 4070, driver 000.00, Windows 11, ReShade 6.8.0, version.dll
+    validations:
+      required: true
+
+  - type: dropdown
+    id: native_fg
+    attributes:
+      label: Native Frame Generation without this mod
+      description: Remove the mod, fully restart the game, and test native 2X Frame Generation.
+      options:
+        - Works
+        - Does not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: Observed result
+      options:
+        - Game crashes during launch
+        - Frame Generation is unavailable
+        - Mod remains waiting or not ready
+        - Native 2X works but a higher multiplier fails
+        - Selected and applied multipliers do not match
+        - Dynamic mode does not behave correctly
+        - Visual output or frame pacing is incorrect
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: selected_mode
+    attributes:
+      label: Selected mode
+      placeholder: Follow game, Dynamic, 2X, 4X, or 6X
+    validations:
+      required: true
+
+  - type: textarea
+    id: active_stack
+    attributes:
+      label: Active Streamline and DLSS G stack
+      description: Copy the Wrapper, Wrapper version, Provider, Provider version, route, and fail closed lines from the Debug panel.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Describe the shortest reliable sequence from a full game restart.
+      placeholder: |
+        1. Start the game.
+        2. Enable native Frame Generation.
+        3. Select 4X in the DLSS MFG tab.
+        4. Observe the result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and supporting evidence
+      description: Attach the matching MfgUnlock log and interval CSV from the temporary directory. Redact personal path information if needed. Add a short video for visual or pacing problems.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I reproduced the issue after a full game restart.
+          required: true
+        - label: I removed older RTX40MFG Universal and Bridge ASI files before testing.
+          required: true
+        - label: I listed any NVIDIA OTA override, OptiScaler, DLL swapper, or other Frame Generation mod above.
+          required: true
