@@ -1,312 +1,448 @@
-local MOD_NAME = "RTX 40 MFG Unlock"
-local CONFIG_PATH = "config.json"
-local STATUS_PATH = "bridge_status.json"
-local VALID_MULTIPLIERS = {
-    [2] = true, [3] = true, [4] = true, [5] = true, [6] = true
-}
+local MOD_NAME = "DLSS MFG"
+local MOD_VERSION = "1.2.0.22"
+local CONTROL_VERSION = 11
+local STATUS_PROTOCOL = 18
 
+-- CET intentionally sandboxes each mod's file I/O to its own directory. The
+-- native core detects this dedicated frontend and uses the same local files;
+-- no path escape or process-working-directory assumption is required.
+local PATH_PAIRS = {{
+    config = "RTX40MFG-Universal.json",
+    status = "RTX40MFG-Universal.status.json"
+}}
+
+local activePaths = PATH_PAIRS[1]
 local overlayOpen = false
-local selectedMode = "fixed"
-local selectedMultiplier = 2
-local dynamicTargetFrameRate = 0
-local dynamicExperimental56 = false
-local generatedOnlyDebug = false
-local lastCustomTarget = 120
-local nativeStatusDetected = false
-local nativeStatusVersion = nil
-local liveBridgeDetected = false
-local synthesisFallbackActive = false
-local activeMode = nil
-local activeMultiplier = nil
-local activeDynamicTarget = nil
-local activeDynamicExperimental56 = nil
-local activeGeneratedOnlyDebug = nil
-local activePatchRoute = nil
-local appliedMode = nil
-local appliedMultiplier = nil
-local appliedDynamicTarget = nil
-local requestPending = false
-local streamlineRebuildRequired = false
-local gameFrameGenerationOn = false
-local setOptionsSeen = false
-local setOptionsAccepted = false
-local setOptionsResult = nil
-local getStateSeen = false
-local getStateResult = nil
-local actualFramesPresented = nil
-local stateSampleAgeMs = nil
-local uiTagHookInstalled = false
-local hudlessTagActive = false
-local uiAlphaTagActive = false
-local uiColorAlphaTagActive = false
-local uiDimensionsKnown = false
-local uiDimensionsMatch = false
-local uiRecompositionEnabled = false
-local uiRecompositionForced = false
-local gameUiRecompositionEnabled = false
-local realFps = nil
-local dlssFps = nil
-local fpsSampleAgeMs = nil
+local pollElapsed = 0
+local lastDrawStatusPoll = -1
+local state = nil
+local controlsLoaded = false
+local lastSaveOk = true
 local statusMessage = ""
-local bridgePollElapsed = 0
+local unsupportedDynamicRetired = false
 
-local function readBridgeState()
-    local ok, state = pcall(function()
-        local file = io.open(STATUS_PATH, "r")
-        if not file then
-            return nil
-        end
-        local content = file:read("*all")
-        file:close()
-        local decoded, data = pcall(json.decode, content)
-        if not decoded or type(data) ~= "table" then
-            return nil
-        end
-        local heartbeat = tonumber(data.heartbeat)
-        if not heartbeat or math.abs(os.time() - heartbeat) > 4 then
-            return nil
-        end
+local control = {
+    followGame = true,
+    mode = "follow",
+    multiplier = 2,
+    dynamicTargetFrameRate = 0,
+    dynamicExperimental56 = false,
+    generatedOnlyDebug = false
+}
+local lastCustomTarget = 60
 
-        local multiplier = tonumber(data.multiplier)
-        local mode = data.mode
-        local target = tonumber(data.dynamicTargetFrameRate)
-        local route = data.route
-
-        if not VALID_MULTIPLIERS[multiplier] then
-            return nil
-        end
-        if mode ~= "fixed" and mode ~= "dynamic" then
-            mode = "fixed"
-        end
-        local statusVersion = tonumber(data.version) or 1
-        return {
-            bridgeReady = statusVersion >= 7 and data.bridgeReady == true,
-            synthesisFallbackActive = data.synthesisFallbackActive == true,
-            multiplier = multiplier,
-            mode = mode,
-            dynamicTargetFrameRate = target or 0,
-            dynamicExperimental56 = data.dynamicExperimental56 == true,
-            generatedOnlyDebug = data.generatedOnlyDebug == true,
-            patchRoute = route,
-            appliedMode = data.appliedMode or mode,
-            appliedMultiplier = tonumber(data.appliedMultiplier) or multiplier,
-            appliedDynamicTargetFrameRate = tonumber(data.appliedDynamicTargetFrameRate) or (target or 0),
-            pending = data.pending == true,
-            streamlineRebuildRequired = data.streamlineRebuildRequired == true,
-            gameFrameGenerationOn = data.gameFrameGenerationOn == true,
-            setOptionsSeen = data.setOptionsSeen == true,
-            setOptionsAccepted = data.setOptionsAccepted == true
-                or tonumber(data.setOptionsResult) == 0
-                or tonumber(data.setOptionsResult) == 39,
-            setOptionsResult = tonumber(data.setOptionsResult),
-            getStateSeen = data.getStateSeen == true,
-            getStateResult = tonumber(data.getStateResult),
-            actualFramesPresented = tonumber(data.actualFramesPresented),
-            stateSampleAgeMs = tonumber(data.stateSampleAgeMs),
-            uiTagHookInstalled = data.uiTagHookInstalled == true,
-            hudlessTagActive = data.hudlessTagActive == true,
-            uiAlphaTagActive = data.uiAlphaTagActive == true,
-            uiColorAlphaTagActive = data.uiColorAlphaTagActive == true,
-            uiDimensionsKnown = data.uiDimensionsKnown == true,
-            uiDimensionsMatch = data.uiDimensionsMatch == true,
-            uiRecompositionEnabled = data.uiRecompositionEnabled == true,
-            uiRecompositionForced = data.uiRecompositionForced == true,
-            gameUiRecompositionEnabled = data.gameUiRecompositionEnabled == true,
-            realFps = tonumber(data.realFpsMilli) and tonumber(data.realFpsMilli) / 1000 or nil,
-            dlssFps = tonumber(data.dlssFpsMilli) and tonumber(data.dlssFpsMilli) / 1000 or nil,
-            fpsSampleAgeMs = tonumber(data.fpsSampleAgeMs),
-            statusVersion = statusVersion
-        }
-    end)
-    return ok and state or nil
+local function clamp(value, minimum, maximum)
+    value = tonumber(value) or minimum
+    if value < minimum then return minimum end
+    if value > maximum then return maximum end
+    return math.floor(value)
 end
 
-local function loadConfig()
-    local file = io.open(CONFIG_PATH, "r")
-    if not file then
-        statusMessage = "Config missing; using fixed 2x until it can be saved."
-        return
-    end
+local function numberValue(source, name, fallback)
+    if type(source) ~= "table" then return fallback end
+    local value = tonumber(source[name])
+    if value == nil then return fallback end
+    return value
+end
 
+local function boolValue(source, name)
+    return type(source) == "table" and source[name] == true
+end
+
+local function stringValue(source, name, fallback)
+    if type(source) == "table" and type(source[name]) == "string"
+        and source[name] ~= "" then
+        return source[name]
+    end
+    return fallback
+end
+
+local function yesNo(value)
+    return value and "yes" or "no"
+end
+
+local function readJson(path)
+    local file = io.open(path, "r")
+    if not file then return nil end
     local content = file:read("*all")
     file:close()
-    local ok, data = pcall(json.decode, content)
-    if ok and type(data) == "table" then
-        local multiplier = tonumber(data.multiplier)
-        local mode = data.mode or "fixed"
-        local target = tonumber(data.dynamicTargetFrameRate) or 0
-        if VALID_MULTIPLIERS[multiplier]
-            and (mode == "fixed" or mode == "dynamic")
-            and target >= 0 and target <= 1000 then
-            selectedMultiplier = multiplier
-            selectedMode = mode
-            dynamicTargetFrameRate = math.floor(target)
-            dynamicExperimental56 = data.dynamicExperimental56 == true
-            generatedOnlyDebug = data.generatedOnlyDebug == true
-            if dynamicTargetFrameRate > 0 then
-                lastCustomTarget = dynamicTargetFrameRate
-            end
-            return
-        end
-    end
-    statusMessage = "Invalid config; choose a fixed multiplier or Dynamic to repair it."
+    if not content or content == "" then return nil end
+    local ok, decoded = pcall(json.decode, content)
+    if not ok or type(decoded) ~= "table" then return nil end
+    return decoded
 end
 
-local function describeRequest()
-    if selectedMode == "dynamic" then
-        if dynamicTargetFrameRate == 0 then
-            return "Dynamic targeting the current display refresh rate"
-        end
-        return "Dynamic targeting " .. tostring(dynamicTargetFrameRate) .. " FPS"
+local function writeJson(path, value)
+    local ok, encoded = pcall(json.encode, value)
+    if not ok or type(encoded) ~= "string" then
+        return false, "Could not encode the control request."
     end
-    return "Fixed " .. tostring(selectedMultiplier) .. "x"
-end
-
-local function saveConfig()
-    local file = io.open(CONFIG_PATH, "w")
+    local file = io.open(path, "w")
     if not file then
-        statusMessage = "Could not write config.json. Check folder permissions."
-        return false
+        return false, "Could not write RTX40MFG-Universal.json."
     end
-
-    local ok, encoded = pcall(json.encode, {
-        mode = selectedMode,
-        multiplier = selectedMultiplier,
-        dynamicTargetFrameRate = dynamicTargetFrameRate,
-        dynamicExperimental56 = dynamicExperimental56,
-        generatedOnlyDebug = generatedOnlyDebug,
-        version = 7
-    })
-    if not ok then
-        file:close()
-        statusMessage = "Could not encode config.json."
-        return false
-    end
-
     file:write(encoded)
     file:write("\n")
     file:close()
-    if liveBridgeDetected then
-        statusMessage = describeRequest() .. " requested."
-    elseif nativeStatusDetected then
-        statusMessage = describeRequest() .. " saved. Waiting for active DLSS-G modules."
-    else
-        statusMessage = describeRequest() .. " saved. Auto-loader not detected; verify bin/x64/plugins/RTX40MFG.asi."
+    return true, ""
+end
+
+local function freshStatus(candidate)
+    local decoded = readJson(candidate.status)
+    if not decoded then return nil end
+    local heartbeat = tonumber(decoded.heartbeat)
+    if heartbeat and math.abs(os.time() - heartbeat) > 5 then
+        return nil
     end
-    print(MOD_NAME .. ": " .. statusMessage)
+    return decoded
+end
+
+local function findStatus()
+    for _, candidate in ipairs(PATH_PAIRS) do
+        local decoded = freshStatus(candidate)
+        if decoded then
+            activePaths = candidate
+            return decoded
+        end
+    end
+    return nil
+end
+
+local function loadControlValues(source)
+    if type(source) ~= "table" then return false end
+    local multiplier = clamp(source.multiplier, 2, 6)
+    local target = clamp(source.dynamicTargetFrameRate, 0, 1000)
+    local mode = type(source.mode) == "string" and source.mode or "fixed"
+    local followGame = source.followGame == true or mode == "follow"
+    if not followGame and mode ~= "fixed" and mode ~= "dynamic" then
+        return false
+    end
+    control.followGame = followGame
+    control.mode = followGame and "follow" or mode
+    control.multiplier = multiplier
+    control.dynamicTargetFrameRate = target
+    control.dynamicExperimental56 = source.dynamicExperimental56 == true
+    control.generatedOnlyDebug = source.generatedOnlyDebug == true
+    if target > 0 then lastCustomTarget = target end
+    controlsLoaded = true
     return true
 end
 
-local function refreshBridgeStatus()
-    local state = readBridgeState()
-    if not state then
-        nativeStatusDetected = false
-        nativeStatusVersion = nil
-        liveBridgeDetected = false
-        synthesisFallbackActive = false
-        activeMode = nil
-        activeMultiplier = nil
-        activeDynamicTarget = nil
-        activeDynamicExperimental56 = nil
-        activeGeneratedOnlyDebug = nil
-        activePatchRoute = nil
-        appliedMode = nil
-        appliedMultiplier = nil
-        appliedDynamicTarget = nil
-        requestPending = false
-        streamlineRebuildRequired = false
-        gameFrameGenerationOn = false
-        setOptionsSeen = false
-        setOptionsAccepted = false
-        setOptionsResult = nil
-        getStateSeen = false
-        getStateResult = nil
-        actualFramesPresented = nil
-        stateSampleAgeMs = nil
-        uiTagHookInstalled = false
-        hudlessTagActive = false
-        uiAlphaTagActive = false
-        uiColorAlphaTagActive = false
-        uiDimensionsKnown = false
-        uiDimensionsMatch = false
-        uiRecompositionEnabled = false
-        uiRecompositionForced = false
-        gameUiRecompositionEnabled = false
-        realFps = nil
-        dlssFps = nil
-        fpsSampleAgeMs = nil
-        return
-    end
-    local wasLive = liveBridgeDetected
-    nativeStatusDetected = true
-    nativeStatusVersion = state.statusVersion
-    liveBridgeDetected = state.bridgeReady
-    synthesisFallbackActive = state.synthesisFallbackActive
-    activeMode = state.mode
-    activeMultiplier = state.multiplier
-    activeDynamicTarget = state.dynamicTargetFrameRate
-    activeDynamicExperimental56 = state.dynamicExperimental56
-    activeGeneratedOnlyDebug = state.generatedOnlyDebug
-    activePatchRoute = state.patchRoute
-    appliedMode = state.appliedMode
-    appliedMultiplier = state.appliedMultiplier
-    appliedDynamicTarget = state.appliedDynamicTargetFrameRate
-    requestPending = state.pending
-    streamlineRebuildRequired = state.streamlineRebuildRequired
-    gameFrameGenerationOn = state.gameFrameGenerationOn
-    setOptionsSeen = state.setOptionsSeen
-    setOptionsAccepted = state.setOptionsAccepted
-    setOptionsResult = state.setOptionsResult
-    getStateSeen = state.getStateSeen
-    getStateResult = state.getStateResult
-    actualFramesPresented = state.actualFramesPresented
-    stateSampleAgeMs = state.stateSampleAgeMs
-    uiTagHookInstalled = state.uiTagHookInstalled
-    hudlessTagActive = state.hudlessTagActive
-    uiAlphaTagActive = state.uiAlphaTagActive
-    uiColorAlphaTagActive = state.uiColorAlphaTagActive
-    uiDimensionsKnown = state.uiDimensionsKnown
-    uiDimensionsMatch = state.uiDimensionsMatch
-    uiRecompositionEnabled = state.uiRecompositionEnabled
-    uiRecompositionForced = state.uiRecompositionForced
-    gameUiRecompositionEnabled = state.gameUiRecompositionEnabled
-    realFps = state.realFps
-    dlssFps = state.dlssFps
-    fpsSampleAgeMs = state.fpsSampleAgeMs
-    if liveBridgeDetected and not wasLive then
-        if activePatchRoute == "ota" then
-            statusMessage = "Native bridge connected through the NVIDIA App OTA override. Multiplier changes apply on the next clean Frame Generation enable."
-        elseif activePatchRoute == "external" or activePatchRoute == "mixed" then
-            statusMessage = "Native bridge connected through loaded external modules. Multiplier changes apply on the next clean Frame Generation enable."
-        else
-            statusMessage = "Automatic native bridge connected. Multiplier changes apply on the next clean Frame Generation enable."
+local function loadControl()
+    for _, candidate in ipairs(PATH_PAIRS) do
+        local decoded = readJson(candidate.config)
+        if decoded and loadControlValues(decoded) then
+            activePaths = candidate
+            return true
         end
-        print(MOD_NAME .. ": " .. statusMessage)
-    elseif nativeStatusVersion < 7 then
-        statusMessage = "Update RTX40MFG.asi; bridge protocol is outdated."
-    elseif not liveBridgeDetected then
-        statusMessage = "Waiting for the active DLSS-G wrapper and NGX module."
+    end
+    return false
+end
+
+local function safeMaximum()
+    return clamp(numberValue(state, "safeMaximumMultiplier", 2), 2, 6)
+end
+
+local function dynamicCapabilityKnown()
+    return boolValue(state, "dynamicMfgSupportKnown")
+end
+
+local function dynamicSupported()
+    return dynamicCapabilityKnown()
+        and boolValue(state, "dynamicMfgSupported")
+end
+
+local function describeControl()
+    if control.followGame then return "Follow game" end
+    if control.mode == "dynamic" then
+        if control.dynamicTargetFrameRate == 0 then
+            return "Dynamic at refresh rate"
+        end
+        return "Dynamic at " .. tostring(control.dynamicTargetFrameRate)
+            .. " FPS"
+    end
+    return tostring(control.multiplier) .. "X"
+end
+
+local function saveControl()
+    local maximum = safeMaximum()
+    control.multiplier = clamp(control.multiplier, 2, maximum)
+    control.dynamicTargetFrameRate = clamp(
+        control.dynamicTargetFrameRate, 0, 1000)
+    if control.followGame then
+        control.mode = "follow"
+        control.dynamicExperimental56 = false
+    elseif control.mode ~= "dynamic" then
+        control.mode = "fixed"
+    end
+    if maximum < 6 then control.dynamicExperimental56 = false end
+
+    local saved, message = writeJson(activePaths.config, {
+        followGame = control.followGame,
+        mode = control.mode,
+        multiplier = control.multiplier,
+        dynamicTargetFrameRate = control.dynamicTargetFrameRate,
+        dynamicExperimental56 = control.dynamicExperimental56,
+        generatedOnlyDebug = control.generatedOnlyDebug,
+        intervalLogging = true,
+        version = CONTROL_VERSION
+    })
+    lastSaveOk = saved
+    statusMessage = saved and (describeControl() .. " requested.") or message
+    print(MOD_NAME .. ": " .. statusMessage)
+    return saved
+end
+
+local function refreshStatus()
+    state = findStatus()
+    if not state then return end
+    if not controlsLoaded then loadControlValues(state) end
+
+    if control.mode == "dynamic" and dynamicCapabilityKnown()
+        and not dynamicSupported() and not unsupportedDynamicRetired then
+        control.followGame = true
+        control.mode = "follow"
+        control.dynamicExperimental56 = false
+        unsupportedDynamicRetired = true
+        saveControl()
+    elseif dynamicSupported() then
+        unsupportedDynamicRetired = false
     end
 end
 
-local function chooseFixed(multiplier)
-    selectedMode = "fixed"
-    selectedMultiplier = multiplier
-    saveConfig()
+local function nvidiaMaximumText()
+    if not state or not boolValue(state, "nvidiaCompatibilityResolved") then
+        return "unavailable"
+    end
+    local tier = numberValue(state, "nvidiaCompatibilityTier", 0)
+    if tier == 4 or tier == 6 then return tostring(tier) .. "X" end
+    return "not listed"
 end
 
-local function chooseDynamic()
-    selectedMode = "dynamic"
-    saveConfig()
+local function availableMaximumText()
+    if not state or not boolValue(state, "activeWrapperObserved") then
+        return "detecting"
+    end
+    return tostring(safeMaximum()) .. "X"
+end
+
+local function versionText(prefix)
+    return string.format("%d.%d.%d.%d",
+        numberValue(state, prefix .. "VersionMajor", 0),
+        numberValue(state, prefix .. "VersionMinor", 0),
+        numberValue(state, prefix .. "VersionBuild", 0),
+        numberValue(state, prefix .. "VersionPrivate", 0))
+end
+
+local function selectMode(action)
+    if not action or action.enabled == false then return end
+    if action.kind == "follow" then
+        control.followGame = true
+        control.mode = "follow"
+        control.dynamicExperimental56 = false
+    elseif action.kind == "fixed" then
+        control.followGame = false
+        control.mode = "fixed"
+        control.multiplier = action.multiplier
+    elseif action.kind == "dynamic" then
+        control.followGame = false
+        control.mode = "dynamic"
+    end
+    saveControl()
+end
+
+local function drawModeSelector()
+    local labels = {"Follow game"}
+    local actions = {{kind = "follow"}}
+    local currentIndex = control.followGame and 0 or nil
+    local maximum = safeMaximum()
+    for multiplier = 2, maximum do
+        table.insert(labels, tostring(multiplier) .. "X")
+        table.insert(actions, {kind = "fixed", multiplier = multiplier})
+        if not control.followGame and control.mode == "fixed"
+            and control.multiplier == multiplier then
+            currentIndex = #labels - 1
+        end
+    end
+
+    local dynamicLabel = dynamicSupported() and "Dynamic"
+        or (dynamicCapabilityKnown()
+            and "Dynamic (unavailable)" or "Dynamic (checking...)")
+    table.insert(labels, dynamicLabel)
+    table.insert(actions, {
+        kind = "dynamic",
+        enabled = dynamicSupported()
+    })
+    if not control.followGame and control.mode == "dynamic" then
+        currentIndex = #labels - 1
+    end
+    if currentIndex == nil then
+        currentIndex = math.max(1, math.min(maximum - 1, #labels - 2))
+    end
+
+    local selected, changed = ImGui.Combo(
+        "MFG mode", currentIndex, labels, #labels)
+    if changed then selectMode(actions[selected + 1]) end
+
+    if dynamicCapabilityKnown() and not dynamicSupported() then
+        ImGui.Text("Dynamic mode is not supported by this game.")
+    end
+    if not control.followGame and control.mode == "dynamic"
+        and dynamicSupported() then
+        local locked = control.dynamicTargetFrameRate == 0
+        local newLocked, lockChanged = ImGui.Checkbox(
+            "Lock target to refresh rate", locked)
+        if lockChanged then
+            control.dynamicTargetFrameRate = newLocked and 0 or lastCustomTarget
+            saveControl()
+        end
+        if control.dynamicTargetFrameRate > 0 then
+            local target, targetChanged = ImGui.SliderInt(
+                "Custom target FPS", control.dynamicTargetFrameRate, 1, 1000)
+            if targetChanged then
+                control.dynamicTargetFrameRate = target
+                lastCustomTarget = target
+                saveControl()
+            end
+        end
+        if maximum >= 6 then
+            local experimental, experimentalChanged = ImGui.Checkbox(
+                "Enable Dynamic 5X/6X (experimental)",
+                control.dynamicExperimental56)
+            if experimentalChanged then
+                control.dynamicExperimental56 = experimental
+                saveControl()
+            end
+        end
+    end
+end
+
+local function drawMainStatus()
+    ImGui.Text("NVIDIA-listed maximum: " .. nvidiaMaximumText())
+    local available = "Available maximum: " .. availableMaximumText()
+    if state and boolValue(state, "compatibilityFallback")
+        and boolValue(state, "activeWrapperObserved") then
+        available = available .. " (safe fallback)"
+    end
+    ImGui.Text(available)
+    ImGui.Text("Frame Generation: "
+        .. (boolValue(state, "gameFrameGenerationOn") and "On" or "Off"))
+
+    if boolValue(state, "gameFrameGenerationOn") then
+        local realFps = numberValue(state, "realFpsMilli", 0)
+        local dlssFps = numberValue(state, "dlssFpsMilli", 0)
+        local age = numberValue(state, "fpsSampleAgeMs", 999999)
+        if realFps > 0 and dlssFps > 0 and age <= 2000 then
+            ImGui.Text(string.format("FPS: %.1f real | %.1f DLSS",
+                realFps / 1000, dlssFps / 1000))
+        else
+            ImGui.Text("FPS: measuring...")
+        end
+    end
+
+    if numberValue(state, "version", 0) < STATUS_PROTOCOL then
+        ImGui.TextWrapped("Update RTX40MFG.asi and RTX40MFGCore.dll "
+            .. "together; the loaded core uses an older protocol.")
+    elseif not boolValue(state, "bridgeReady") then
+        ImGui.Text("Waiting for an active DLSS-G pipeline.")
+    end
+    if boolValue(state, "streamlineRebuildRequired")
+        or boolValue(state, "pipelineMayPredateDetour") then
+        ImGui.TextWrapped("Toggle Frame Generation Off then On, or restart "
+            .. "the game, to recreate the pipeline with this selection.")
+    end
+end
+
+local function drawDebug()
+    local generatedOnly, generatedChanged = ImGui.Checkbox(
+        "Generated frames only", control.generatedOnlyDebug)
+    if generatedChanged then
+        control.generatedOnlyDebug = generatedOnly
+        saveControl()
+    end
+
+    ImGui.Separator()
+    ImGui.Text("Active route")
+    ImGui.Text(string.format("Core protocol: %d | Bridge: %s",
+        numberValue(state, "version", 0),
+        boolValue(state, "bridgeReady") and "ready" or "not ready"))
+    ImGui.Text(string.format("Fail-closed reason: %s (%d)",
+        stringValue(state, "universalRouteFailureReason", "none"),
+        numberValue(state, "universalRouteFailure", 0)))
+    ImGui.TextWrapped("Wrapper: "
+        .. stringValue(state, "activeWrapperPath", "waiting for a real call"))
+    ImGui.Text(string.format("Wrapper version: %s | generation: %d",
+        versionText("activeWrapper"),
+        numberValue(state, "activeWrapperGeneration", 0)))
+    ImGui.Text(string.format("Control: %s (%s) | State: %s (%s)",
+        stringValue(state, "activeControlPath", "none"),
+        stringValue(state, "activeControlDetour", "none"),
+        stringValue(state, "activeStatePath", "none"),
+        stringValue(state, "activeStateDetour", "none")))
+
+    ImGui.Separator()
+    ImGui.Text("Active provider")
+    ImGui.TextWrapped("Provider: "
+        .. stringValue(state, "activeProviderPath", "waiting for FG Create"))
+    ImGui.Text(string.format("Provider version: %s | generation: %d",
+        versionText("activeProvider"),
+        numberValue(state, "activeProviderGeneration", 0)))
+    ImGui.Text(string.format("Selected by: %s | Create: %s | Evaluate: %s",
+        stringValue(state, "providerSelectionSource", "none"),
+        stringValue(state, "providerCreateDetour", "none"),
+        stringValue(state, "providerEvaluateDetour", "none")))
+    ImGui.Text("Midpoint ready at first Create: "
+        .. yesNo(boolValue(state, "midpointReadyAtFirstCreate")))
+
+    ImGui.Separator()
+    ImGui.Text("Control and lifecycle")
+    ImGui.Text(string.format("Requested/applied revision: %d/%d",
+        numberValue(state, "requestRevision", 0),
+        numberValue(state, "appliedRevision", 0)))
+    ImGui.Text(string.format("Route last call/accepted revision: %d/%d",
+        numberValue(state, "activeLastCallRevision", 0),
+        numberValue(state, "activeLastAcceptedRevision", 0)))
+    ImGui.Text(string.format("FG: %s | Off accepted: %s | Release observed: %s",
+        boolValue(state, "gameFrameGenerationOn") and "on" or "off",
+        yesNo(boolValue(state, "frameGenerationOffAccepted")),
+        yesNo(boolValue(state, "releaseObserved"))))
+    ImGui.Text(string.format("Release entry: %s | Recreate required: %s",
+        boolValue(state, "releaseEntryCurrent") and "covered" or "unavailable",
+        yesNo(boolValue(state, "streamlineRebuildRequired"))))
+    ImGui.Text("NVIDIA max: " .. nvidiaMaximumText()
+        .. " | Available max: " .. availableMaximumText())
+    if boolValue(state, "getStateSeen")
+        and numberValue(state, "getStateResult", -1) == 0 then
+        ImGui.Text(string.format("Runtime: %d presented | max %d generated",
+            numberValue(state, "actualFramesPresented", 0),
+            numberValue(state, "numFramesToGenerateMax", 0)))
+    end
+
+    ImGui.Separator()
+    ImGui.Text("Temporal interval trace (always on)")
+    ImGui.Text(string.format(
+        "Log: %s | Samples: %d valid, %d invalid, %d dropped",
+        boolValue(state, "intervalLogReady") and "ready" or "opening",
+        numberValue(state, "intervalValidSamples", 0),
+        numberValue(state, "intervalInvalidSamples", 0),
+        numberValue(state, "intervalDroppedSamples", 0)))
+    if numberValue(state, "intervalValidSamples", 0) > 0 then
+        ImGui.Text(string.format(
+            "Last interval: count %d | index %d | position %d/%d",
+            numberValue(state, "intervalLastCount", 0),
+            numberValue(state, "intervalLastIndex", 0),
+            numberValue(state, "intervalLastPositionNumerator", 0),
+            numberValue(state, "intervalLastPositionDenominator", 0)))
+    end
+    local trace = stringValue(state, "intervalLogFile", "")
+    if trace ~= "" then ImGui.Text("Trace: %TEMP%\\" .. trace) end
 end
 
 registerForEvent("onInit", function()
-    loadConfig()
-    refreshBridgeStatus()
-    if not nativeStatusDetected then
-        statusMessage = "Waiting for the automatic native bridge."
-    end
-    print(MOD_NAME .. ": loaded; request is " .. describeRequest())
+    loadControl()
+    refreshStatus()
+    statusMessage = "Loaded V" .. MOD_VERSION .. "."
+    print(MOD_NAME .. ": " .. statusMessage)
 end)
 
 registerForEvent("onOverlayOpen", function()
@@ -318,170 +454,43 @@ registerForEvent("onOverlayClose", function()
 end)
 
 registerForEvent("onUpdate", function(deltaTime)
-    bridgePollElapsed = bridgePollElapsed + deltaTime
-    if bridgePollElapsed >= 0.5 then
-        bridgePollElapsed = 0
-        refreshBridgeStatus()
+    pollElapsed = pollElapsed + (tonumber(deltaTime) or 0)
+    if pollElapsed >= 0.5 then
+        pollElapsed = 0
+        refreshStatus()
     end
 end)
 
 registerForEvent("onDraw", function()
-    if not overlayOpen then
+    if not overlayOpen then return end
+
+    -- onDraw can run while CET is still waiting to fire onInit/onUpdate. Poll
+    -- here as well so opening the overlay early never produces a false backend
+    -- failure while native telemetry is already available.
+    if not state then
+        local now = os.clock()
+        if now - lastDrawStatusPoll >= 0.5 then
+            lastDrawStatusPoll = now
+            refreshStatus()
+        end
+    end
+
+    ImGui.SetNextWindowSize(660, 640, ImGuiCond.FirstUseEver)
+    ImGui.Begin(MOD_NAME)
+    if not state then
+        ImGui.Text("Waiting for RTX40MFG telemetry...")
+        ImGui.TextWrapped("If this remains after the main menu has loaded, "
+            .. "fully restart the game and verify the native files.")
+        ImGui.End()
         return
     end
 
-    ImGui.SetNextWindowSize(410, 320, ImGuiCond.FirstUseEver)
-    ImGui.Begin(MOD_NAME)
-
-    if liveBridgeDetected then
-        local route = activePatchRoute == "ota" and "OTA"
-            or (activePatchRoute == "both" and "Local + External"
-            or (activePatchRoute == "external" and "External"
-            or (activePatchRoute == "mixed" and "Mixed" or "Local")))
-        ImGui.Text("Bridge: Connected (" .. route .. ")")
-        local requested = activeMode == "dynamic"
-            and ("Dynamic @ " .. (activeDynamicTarget == 0 and "refresh" or (tostring(activeDynamicTarget) .. " FPS"))
-                .. (activeDynamicExperimental56 and " | max 6x*" or " | max 4x"))
-            or (tostring(activeMultiplier) .. "x")
-        ImGui.Text("Requested: " .. requested)
-
-        local statusLabel = "Status"
-        local statusValue = "Waiting"
-        if not setOptionsSeen then
-            statusValue = "Waiting for game"
-        elseif not gameFrameGenerationOn then
-            statusValue = "Off"
-        elseif setOptionsResult == 21 then
-            statusValue = "DLSS-G not initialized (21)"
-        elseif setOptionsResult == 38 then
-            statusValue = "Invalid state (38)"
-        elseif setOptionsResult and not setOptionsAccepted then
-            statusValue = "Error " .. tostring(setOptionsResult)
-        elseif streamlineRebuildRequired then
-            statusValue = "Re-enable Frame Generation"
-        elseif requestPending then
-            statusValue = "Waiting for clean enable"
-        elseif getStateSeen and getStateResult == 0 and stateSampleAgeMs
-            and stateSampleAgeMs <= 2500 and actualFramesPresented then
-            statusLabel = "Actual"
-            statusValue = actualFramesPresented > 0 and (tostring(actualFramesPresented) .. "x") or "Idle"
-        elseif setOptionsAccepted then
-            statusValue = "Applied"
-        end
-        if setOptionsResult == 39 then
-            statusValue = statusValue .. " | VRAM low"
-        end
-        ImGui.Text(statusLabel .. ": " .. statusValue)
-        if synthesisFallbackActive then
-            ImGui.Text("3x-6x unavailable (DLL mismatch)")
-        end
-        if realFps and dlssFps and fpsSampleAgeMs and fpsSampleAgeMs <= 2000 then
-            ImGui.Text("FPS: " .. tostring(math.floor(realFps + 0.5))
-                .. " real | " .. tostring(math.floor(dlssFps + 0.5)) .. " DLSS")
-        else
-            ImGui.Text("FPS: Waiting")
-        end
-        local uiStatus = "Waiting for HUDless"
-        if not uiTagHookInstalled then
-            uiStatus = "Unavailable"
-        elseif uiRecompositionEnabled and uiRecompositionForced then
-            uiStatus = "Recomposition requested"
-        elseif gameUiRecompositionEnabled and uiRecompositionEnabled then
-            uiStatus = "Game managed"
-        elseif hudlessTagActive and (uiAlphaTagActive or uiColorAlphaTagActive)
-            and not uiDimensionsKnown then
-            uiStatus = "Buffer size unknown"
-        elseif hudlessTagActive and (uiAlphaTagActive or uiColorAlphaTagActive)
-            and not uiDimensionsMatch then
-            uiStatus = "Buffer size mismatch"
-        elseif hudlessTagActive then
-            uiStatus = "HUDless only"
-        end
-        ImGui.Text("UI: " .. uiStatus)
-    elseif nativeStatusDetected then
-        if nativeStatusVersion and nativeStatusVersion < 7 then
-            ImGui.Text("Bridge: Update RTX40MFG.asi")
-        else
-            ImGui.Text("Bridge: Waiting for active DLSS-G modules")
-        end
-    else
-        ImGui.Text("Bridge: Offline - check RTX40MFG.asi")
-    end
+    drawMainStatus()
     ImGui.Separator()
-
-    ImGui.Text("Mode")
-    if ImGui.RadioButton("Dynamic", selectedMode == "dynamic") then
-        chooseDynamic()
-    end
-    ImGui.SameLine()
-    if ImGui.RadioButton("2x", selectedMode == "fixed" and selectedMultiplier == 2) then
-        chooseFixed(2)
-    end
-    ImGui.SameLine()
-    if ImGui.RadioButton("3x", selectedMode == "fixed" and selectedMultiplier == 3) then
-        chooseFixed(3)
-    end
-    ImGui.SameLine()
-    if ImGui.RadioButton("4x", selectedMode == "fixed" and selectedMultiplier == 4) then
-        chooseFixed(4)
-    end
-    ImGui.SameLine()
-    if ImGui.RadioButton("5x*", selectedMode == "fixed" and selectedMultiplier == 5) then
-        chooseFixed(5)
-    end
-    ImGui.SameLine()
-    if ImGui.RadioButton("6x*", selectedMode == "fixed" and selectedMultiplier == 6) then
-        chooseFixed(6)
-    end
-
-    if selectedMode == "fixed" and selectedMultiplier >= 5 then
-        ImGui.Text("* Experimental")
-    end
-
-    if selectedMode == "dynamic" then
-        local autoTarget = dynamicTargetFrameRate == 0
-        local changed = false
-        local experimental = dynamicExperimental56
-        experimental, changed = ImGui.Checkbox("Allow Dynamic 5x / 6x*", experimental)
-        if changed then
-            dynamicExperimental56 = experimental
-            saveConfig()
-        end
-        if dynamicExperimental56 then
-            ImGui.Text("* Experimental")
-        end
-        autoTarget, changed = ImGui.Checkbox("Use display refresh", autoTarget)
-        if changed then
-            dynamicTargetFrameRate = autoTarget and 0 or lastCustomTarget
-            saveConfig()
-        end
-        if dynamicTargetFrameRate > 0 then
-            local target = dynamicTargetFrameRate
-            target, changed = ImGui.SliderInt("Target FPS", target, 30, 360)
-            if changed then
-                dynamicTargetFrameRate = target
-                lastCustomTarget = target
-                saveConfig()
-            end
-        end
-        ImGui.Text("VSync: Off")
-    end
-
-    local generatedOnly = generatedOnlyDebug
-    local generatedOnlyChanged = false
-    generatedOnly, generatedOnlyChanged = ImGui.Checkbox("Generated frames only (debug)", generatedOnly)
-    if generatedOnlyChanged then
-        generatedOnlyDebug = generatedOnly
-        saveConfig()
-    end
+    drawModeSelector()
+    if not lastSaveOk then ImGui.TextWrapped(statusMessage) end
 
     ImGui.Separator()
-    ImGui.Text("In-game Frame Generation: On")
-    ImGui.TextWrapped("Multiplier or mode changes need a clean Frame Generation Off -> On, or a game restart.")
-    if string.find(statusMessage, "Could not", 1, true)
-        or string.find(statusMessage, "Invalid", 1, true) then
-        ImGui.TextWrapped(statusMessage)
-    end
-
+    if ImGui.CollapsingHeader("Debug") then drawDebug() end
     ImGui.End()
 end)

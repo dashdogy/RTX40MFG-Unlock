@@ -1,85 +1,115 @@
-# RTX 40 MFG Unlock for Cyberpunk 2077
+# Universal RTX 40 MFG Unlock
 
-Experimental Cyber Engine Tweaks mod providing fixed 2x through 6x and Dynamic
-DLSS Frame Generation controls on RTX 40 series GPUs. The 5x and 6x modes are
-especially experimental.
+Universal DLSS Multi Frame Generation enabler for supported Windows x64 games
+on NVIDIA GeForce RTX 40 Series GPUs. V1.2 adds Follow game, fixed 2X through
+the verified maximum, and Dynamic controls to games that already provide
+Streamline DLSS Frame Generation.
 
-Dynamic defaults to a 4x ceiling. Its UI toggle allows experimental 5x and 6x.
-UI recomposition is requested only when matching HUDless and UI buffers are tagged.
-The panel reports rendered FPS and total DLSS output FPS.
+The same build supports DirectX 12 and Vulkan. It combines NVIDIA's listed
+maximum for each game with the active Streamline wrapper capacity, exposing up to 6X
+when both allow it and falling back to a supported lower maximum. It does not
+add DLSS Frame Generation to games that do not already support it.
 
-Version 1.1 restores the preserved D157 runtime and separates DLSS-G feature
-identity from version eligibility. A loaded module must expose the DLSS-G-specific
-`NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl` export before its version is
-considered. The tested provider versions are `310.7.0.*`, `310.7.128.*`,
-`310.7.129.*`, and `310.8.0.*`; other `310.7.x` builds are not accepted
-implicitly.
+This is unsupported research software. Higher multipliers and Vulkan support
+remain experimental and may cause artifacts, frozen presentation, black
+screens, or crashes.
 
-Streamline 2.12 and 2.13 module layouts are recognized independently of the
-DLSS-G provider version. Updating `nvngx_dlssg.dll` does not require matching
-versions of `nvngx_dlss.dll`, `nvngx_dlssd.dll`, `nvngx_dlssnr.dll`,
-`nvngx_deepdvc.dll`, or the other Streamline DLLs.
+## V1.2 changes
 
-This is an unsupported research mod. Modes above 2x may cause artifacts,
-latency, frozen presentation, black screens, or crashes.
+1. Added one Universal build for DirectX 12 and Vulkan games.
+2. Added live fixed and Dynamic controls through the ReShade menu.
+3. Added automatic game capability limits, Ada temporal correction, and telemetry.
+
+If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
 
 ## Install
 
-Requires Cyberpunk 2077, Cyber Engine Tweaks, an RTX 40 series GPU, and DLSS
-Frame Generation enabled. CET 1.37.1 was used during development.
+Requires Windows x64, an RTX 40 Series GPU, a game with working Streamline DLSS
+Frame Generation, [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader),
+and [ReShade](https://reshade.me/) with extension support for the menu.
 
-Extract `bin` into the Cyberpunk game directory, merge folders, then select a
-mode from the CET overlay. Select the multiplier before launch when possible.
-If Frame Generation is already active, toggle it Off and On (or restart the
-game) so Streamline rebuilds the feature with the requested shape. The release
-ZIP does not include `config.json`, so installing it preserves the selected
-mode.
+Close the game and copy these files beside its real executable:
 
-The v1.1 provider matrix covered 17 DLSS-G binaries: the five binaries in the
-four supported version triplets passed and all twelve others failed closed.
-Each passing provider was also checked beside renamed DLSS, DLSSD, DLSSNR, and
-DeepDVC siblings; only DLSS-G was admitted. These compatibility checks and FPS
-counters do not by themselves prove final-present image quality.
+```text
+RTX40MFGCore.dll
+RTX40MFG.asi
+RTX40MFG-UI.addon64
+```
+
+Install Ultimate ASI Loader under a supported proxy name that the game loads
+early. Merge the supplied `global.ini` values into the matching UAL proxy file,
+such as `dinput8.ini` or `version.ini`; do not overwrite unrelated loader
+settings. Remove legacy
+`RTX40MFG-Universal.asi` and `RTX40MFG-Bridge.asi` files before upgrading, but
+keep `RTX40MFG-Universal.json` to preserve the selected mode.
+
+Do not replace or bundle a game's Streamline or NVIDIA DLLs. An NVIDIA App OTA
+override may supply the active Frame Generation wrapper and provider separately.
+
+### DirectX 12
+
+Install ReShade for DirectX 10/11/12. ReShade normally owns `dxgi.dll`, so give
+Ultimate ASI Loader a different supported proxy name that the game imports at
+startup, commonly `dinput8.dll` or `version.dll`. Never install both loaders
+under the same proxy filename.
+
+### Vulkan
+
+Select Vulkan in the ReShade installer. Use Ultimate ASI Loader under an early
+proxy unrelated to DirectX that the game imports, such as `dinput8.dll`,
+`version.dll`, or `winmm.dll`; a Vulkan game may never load `dxgi.dll` or
+`d3d12.dll`. The mod files are otherwise identical to the DirectX 12 install.
+
+The ASI must load before the first Frame Generation pipeline is created. If the
+menu asks for recreation, toggle Frame Generation Off and On or restart with an
+earlier loader proxy.
+
+## Usage
+
+Open ReShade and select the **DLSS MFG** tab. Choose Follow game, a fixed
+multiplier, or Dynamic when the active stack supports it. Changes are sent
+immediately; no Apply button is required. The normal panel shows real and DLSS
+output FPS, while detailed route and interval telemetry stays under Debug.
 
 ## How it works
 
-The ASI intercepts `slGetFeatureFunction`, watches modules actually loaded by
-the game, and identifies Streamline and NGX candidates by exports and exact code
-signatures. DLSS-G feature identity is established before the supported-version
-gate, preventing same-version DLSS-family siblings from being scanned as the
-Frame Generation provider. It patches only mapped process memory, never DLLs on
-disk, and does not assume NVIDIA cache paths.
+`RTX40MFG.asi` imports `RTX40MFGCore.dll`, loading the core before the ASI entry
+point. The core intercepts the active Streamline and NGX function paths before
+feature creation, validates the adapter, wrapper, provider, and requested
+capacity, then publishes the Ada temporal correction and forwards the call.
 
-The D157 (v1.0) fix targets Ada’s midpoint compaction bug: at higher multipliers, generated samples collapse toward the middle of the frame interval instead of occupying their requested temporal positions, producing near duplicate frames. It backports the corrected slot-9 temporal program used by Blackwell in process memory so each generated sample is evaluated at its own evenly spaced position between rendered frames. If the active adapter, provider version, or layout cannot be verified, the patch fails closed to native 2x.
+Only verified code and data inside the process are changed; NVIDIA files on disk are
+left untouched. Unknown ownership, layout, timing, or capacity fails closed.
+FPS counters and telemetry are diagnostic and do not by themselves prove
+correct final presentation frame spacing.
 
-The bridge becomes ready only after the active DLSS G wrapper and loaded NGX
-module are verified and patched. It then adjusts `slDLSSGSetOptions` and reads
-actual presentation counts through `slDLSSGGetState`.
+Logs are written to `%TEMP%\MfgUnlock-<PID>.log` and temporal samples to
+`%TEMP%\MfgUnlock-intervals-<PID>.csv`.
 
-The approach targets Streamline DLSS G rather than Cyberpunk's renderer. In
-another Streamline game, adapt the early DLL loading integration, UI and config
-paths, and game/provider specific signatures.
+## Cyberpunk 2077
+
+The dedicated Cyberpunk 2077 mod is still available on [Nexus Mods](https://www.nexusmods.com/cyberpunk2077/mods/33286).
 
 ## Build
 
-Requires Visual Studio 2022, CMake 3.24+, and Streamline SDK 2.12.0.
+Requires Visual Studio 2022, CMake 3.24+, Streamline SDK 2.12.0, and compatible
+ReShade and ImGui source trees.
 
 ```powershell
 cmake -S .\source\native -B .\build -G "Visual Studio 17 2022" -A x64 `
-  -DSTREAMLINE_ROOT="C:\path\to\streamline-sdk-v2.12.0"
-cmake --build .\build --config Release --parallel
+  -DSTREAMLINE_ROOT="C:\path\to\streamline" `
+  -DMFG_UNLOCK_BUILD_UNIVERSAL_UI=ON `
+  -DRESHADE_ROOT="C:\path\to\reshade" `
+  -DIMGUI_ROOT="C:\path\to\reshade\deps\imgui"
+cmake --build .\build --config Release --parallel --target `
+  RTX40MFGCore RTX40MFGAuto RTX40MFGReShadeUI
 ```
-
-The native build writes `build\Release\RTX40MFG.asi`. The CET UI and its
-FPS/status client are tracked at
-`bin\x64\plugins\cyber_engine_tweaks\mods\RTX40MFG\init.lua`. Breakpoint and
-deep-kernel research diagnostics are disabled in the normal build.
-
-Logs are written to the temporary directory and include the process ID.
 
 ## License
 
 Original code in this repository is licensed under the [MIT License](LICENSE).
-Reuse and redistribution are permitted provided the copyright and license notice
-are retained. NVIDIA Streamline, NGX, Cyberpunk 2077, and other third-party
-components remain subject to their respective terms.
+Reuse and redistribution are permitted provided the copyright and license
+notice are retained. NVIDIA Streamline, NGX, ReShade, Ultimate ASI Loader, and
+other external components remain subject to their respective terms. The
+bundled MinHook source retains its own license in
+the [MinHook license](source/native/third_party/minhook/LICENSE.txt).

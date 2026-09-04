@@ -48,7 +48,9 @@ bool SupportedProviderVersionMatches(const wchar_t* path) noexcept
 
 bool IsDlssgImplementationModule(HMODULE module) noexcept
 {
-    return module && GetProcAddress(module, kD3d12ImplementationExport);
+    return module && HasDlssgExportIdentity(
+        GetProcAddress(module, kD3d12ImplementationExport) != nullptr,
+        GetProcAddress(module, kDirectSrImplementationExport) != nullptr);
 }
 
 bool IsSupportedProvider(HMODULE module, const wchar_t* path) noexcept

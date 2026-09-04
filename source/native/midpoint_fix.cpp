@@ -13,35 +13,195 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 namespace midpoint_fix
 {
 namespace
 {
 constexpr size_t kKernelCount = 25;
-constexpr size_t kTemporalSlot = 9;
 constexpr size_t kDescriptorBytes = 48;
 constexpr size_t kNameBytes = 96;
 constexpr uint64_t kMaximumFatbinBytes = 64ull * 1024ull * 1024ull;
-constexpr uint64_t kSourceFatbinBytes = 98408;
-constexpr size_t kOutputCapacity = 256 * 1024;
+constexpr size_t kOutputCapacity = 384 * 1024;
 constexpr size_t kScratchCapacity = 256 * 1024;
-constexpr char kDescriptorName[] = "dlfg_kernel";
-constexpr char kEntryName[] = "main_kernel";
-constexpr char kSourceFatbinSha256[] =
-    "5A8E0284AAB8AC14FC82B0504BBEEF25D2FCE1D13A1C11D8BDB3F91FEE8145FC";
-constexpr char kSourcePtxSha256[] =
-    "46C05996A2EF199BBE39378681734ED5EE757655DE70410D9900D85BA91222F1";
-constexpr char kOutputFatbinSha256[] =
-    "19FB3CD5500BFD1FC88F96C36B381E096D6AB1DFC7B1DB02A04D40A00849104B";
 constexpr char kJoinLabel[] = "$L__BB0_3:";
 constexpr char kMidpointBits[] = "0f3F000000";
-constexpr char kTemporalInput[] =
+constexpr char kEarlyRegisterDeclaration[] = ".reg .f32 %f<4010>;";
+constexpr char kEarlyPatchedRegisterDeclaration[] = ".reg .f32 %f<4013>;";
+constexpr char kEarlyTemporalInput[] =
+    "ld.param.f32 %f4010, [main_kernel_param_5];\r\n"
+    "mov.f32 %f4011, 0f3F800000;\r\n"
+    "sub.ftz.f32 %f4012, %f4011, %f4010;\r\n";
+constexpr char kLegacyTemporalInput[] =
     "ld.param.f32 %f134, [main_kernel_param_0+32];\r\n"
+    "mov.f32 %f135, 0f3F800000;\r\n"
+    "sub.ftz.f32 %f136, %f135, %f134;\r\n";
+constexpr char k3109TemporalInput[] =
+    "ld.param.f32 %f134, [Kernel_EstimateIntermMvecsScatter_param_0+32];\r\n"
     "mov.f32 %f135, 0f3F800000;\r\n"
     "sub.ftz.f32 %f136, %f135, %f134;\r\n";
 constexpr size_t kTemporalMultiplyCount = 104;
 constexpr size_t kTemporalDirectionCount = kTemporalMultiplyCount / 2;
+
+struct TemporalProviderProfile
+{
+    size_t temporalSlot = 0;
+    bool namedKernelDescriptors = false;
+    uint64_t sourceFatbinBytes = 0;
+    const char* sourceFatbinSha256 = nullptr;
+    const char* sourcePtxSha256 = nullptr;
+    const char* outputFatbinSha256 = nullptr;
+    const char* registerDeclaration = nullptr;
+    const char* patchedRegisterDeclaration = nullptr;
+    const char* temporalInput = nullptr;
+    const char* curr2PrevScale = nullptr;
+    const char* prev2CurrScale = nullptr;
+    size_t sm120EntryBytes = 0;
+    uint64_t sm120PayloadBytes = 0;
+    uint32_t sm120CompressedBytes = 0;
+    uint64_t sm120RawBytes = 0;
+    uint64_t sm89PayloadBytes = 0;
+    uint32_t sm89CompressedBytes = 0;
+    uint64_t sm89RawBytes = 0;
+};
+
+constexpr TemporalProviderProfile kEarlyTemporalProfile{
+    12,
+    false,
+    197560,
+    "25E24B204A58BB5E2757199B1C856B5FDE7D26B9967FFEF82FD794BDE4BCBC67",
+    "946A4CCE7B2E43BD0F6228EBCC99F85B9EF03F64D4A5F6D19097FA502BF912CB",
+    "9E72F801D8B73F47AA2904BC6A7EFAE203AF7139D168AEBD94724BFB102DC5D9",
+    kEarlyRegisterDeclaration,
+    kEarlyPatchedRegisterDeclaration,
+    kEarlyTemporalInput,
+    "%f4012",
+    "%f4010",
+    54200,
+    54096,
+    54094,
+    188378,
+    60456,
+    60450,
+    210951,
+};
+
+constexpr TemporalProviderProfile LegacyTemporalProfile(size_t temporalSlot)
+{
+    return {
+        temporalSlot,
+        false,
+        98408,
+        "5A8E0284AAB8AC14FC82B0504BBEEF25D2FCE1D13A1C11D8BDB3F91FEE8145FC",
+        "46C05996A2EF199BBE39378681734ED5EE757655DE70410D9900D85BA91222F1",
+        "19FB3CD5500BFD1FC88F96C36B381E096D6AB1DFC7B1DB02A04D40A00849104B",
+        nullptr,
+        nullptr,
+        kLegacyTemporalInput,
+        "%f136",
+        "%f134",
+        28128,
+        28024,
+        28017,
+        90490,
+        30384,
+        30379,
+        99362,
+    };
+}
+
+constexpr TemporalProviderProfile kLegacySlot11TemporalProfile =
+    LegacyTemporalProfile(11);
+constexpr TemporalProviderProfile kLegacySlot10TemporalProfile =
+    LegacyTemporalProfile(10);
+constexpr TemporalProviderProfile kLegacySlot9TemporalProfile =
+    LegacyTemporalProfile(9);
+
+constexpr TemporalProviderProfile k3109TemporalProfile{
+    9,
+    true,
+    98704,
+    "FBA7599CC9CDC1EED947AD5ADB94436052E8C17AD7FD268C2590AB36A0C731E9",
+    "D1EB7A60C57915238AA228511DA16386F95AAAA5A0D1C1B7903F1DA8FB9519B4",
+    "579ACF3317ED39B45AC0ABBC70F4DC812A53AE0F8B11E528B7B5542681E8BEF4",
+    nullptr,
+    nullptr,
+    k3109TemporalInput,
+    "%f136",
+    "%f134",
+    28144,
+    28040,
+    28040,
+    90732,
+    30408,
+    30402,
+    99626,
+};
+
+constexpr std::array<const char*, kKernelCount> k3109KernelNames{{
+    "BlendCandidatesFused",
+    "Copy4Channel",
+    "DL1Net_Input",
+    "DL1Net_Output",
+    "DetectMenus",
+    "DetectMenusHudless",
+    "Distortion",
+    "DownsampleDistortion",
+    "DownsampleRGBAndEstimateUIFused",
+    "EstimateIntermMvecsScatter",
+    "EstimatePrev2CurrScatter",
+    "InitMvecQualityMask",
+    "InputMvecProcessing",
+    "MenuDetectionOutput",
+    "OutputPull",
+    "OutputPullMiddle",
+    "OutputPush",
+    "OutputPushFine",
+    "Prev2CurrUnpackPull",
+    "Prev2CurrPullMiddle",
+    "Prev2CurrPush",
+    "Prev2CurrPushFine",
+    "Scatter3d",
+    "WarpBlendingWeights",
+    "ZeroBuffer",
+}};
+
+const TemporalProviderProfile* ProfileForVersion(
+    dlssg_provider_policy::VersionTriplet version) noexcept
+{
+    if (version.major == 310
+        && ((version.minor == 1 && version.build == 0)
+            || (version.minor == 2
+                && (version.build == 0 || version.build == 1))
+            || (version.minor == 3 && version.build == 0)))
+        return &kEarlyTemporalProfile;
+    if (version.major == 310
+        && ((version.minor == 4 && version.build == 0)
+            || (version.minor == 5
+                && (version.build == 0 || version.build == 2
+                    || version.build == 3))))
+        return &kLegacySlot11TemporalProfile;
+    if (version.major == 310 && version.minor == 6 && version.build == 0)
+        return &kLegacySlot10TemporalProfile;
+    if (version.major == 310 && version.minor == 9 && version.build == 0)
+        return &k3109TemporalProfile;
+    if (version.major == 310
+        && ((version.minor == 7
+                && (version.build == 0 || version.build == 128
+                    || version.build == 129))
+            || (version.minor == 8 && version.build == 0)))
+        return &kLegacySlot9TemporalProfile;
+    return nullptr;
+}
+
+static_assert(kEarlyTemporalProfile.temporalSlot == 12);
+static_assert(kLegacySlot11TemporalProfile.temporalSlot == 11);
+static_assert(kLegacySlot10TemporalProfile.temporalSlot == 10);
+static_assert(kLegacySlot9TemporalProfile.temporalSlot == 9);
+static_assert(k3109TemporalProfile.temporalSlot == 9);
+static_assert(kEarlyTemporalProfile.sourceFatbinBytes <= kOutputCapacity);
+static_assert(264968 <= kOutputCapacity);
 
 enum class Failure : uint32_t
 {
@@ -200,8 +360,28 @@ bool IsReadOnlyImageAddress(HMODULE module, uintptr_t address) noexcept
     return protection == PAGE_READONLY || protection == PAGE_EXECUTE_READ;
 }
 
+bool KernelIdentityMatches(const TemporalProviderProfile& profile, size_t slot,
+    const char* descriptorName, const char* entryName) noexcept
+{
+    if (!descriptorName || !entryName || slot >= kKernelCount)
+        return false;
+    if (!profile.namedKernelDescriptors)
+    {
+        return std::strcmp(descriptorName, "dlfg_kernel") == 0
+            && std::strcmp(entryName, "main_kernel") == 0;
+    }
+
+    constexpr char kEntryPrefix[] = "Kernel_";
+    const char* const expected = k3109KernelNames[slot];
+    return expected && std::strcmp(descriptorName, expected) == 0
+        && std::strncmp(entryName, kEntryPrefix,
+            sizeof(kEntryPrefix) - 1) == 0
+        && std::strcmp(entryName + sizeof(kEntryPrefix) - 1, expected) == 0;
+}
+
 bool DescriptorMatches(uintptr_t moduleBase, uintptr_t moduleEnd,
-    uintptr_t descriptor, bool temporalSource) noexcept
+    uintptr_t descriptor, size_t slot,
+    const TemporalProviderProfile& profile) noexcept
 {
     if (!moduleBase || moduleEnd <= moduleBase
         || descriptor < moduleBase || moduleEnd - moduleBase < kDescriptorBytes
@@ -231,8 +411,7 @@ bool DescriptorMatches(uintptr_t moduleBase, uintptr_t moduleEnd,
             sizeof(descriptorName) - 1)
         || !SafeCopy(entryName, reinterpret_cast<const void*>(entry),
             sizeof(entryName) - 1)
-        || std::strcmp(descriptorName, kDescriptorName) != 0
-        || std::strcmp(entryName, kEntryName) != 0)
+        || !KernelIdentityMatches(profile, slot, descriptorName, entryName))
         return false;
 
     std::array<uint8_t, 16> header{};
@@ -248,14 +427,14 @@ bool DescriptorMatches(uintptr_t moduleBase, uintptr_t moduleEnd,
         || totalSize > static_cast<uint64_t>(moduleEnd - fatbin)
         || (suppliedSize != 0 && suppliedSize != totalSize))
         return false;
-    return !temporalSource
-        || (totalSize == kSourceFatbinBytes
+    return slot != profile.temporalSlot
+        || (totalSize == profile.sourceFatbinBytes
             && Sha256Equals(reinterpret_cast<const uint8_t*>(fatbin),
-                static_cast<size_t>(totalSize), kSourceFatbinSha256));
+                static_cast<size_t>(totalSize), profile.sourceFatbinSha256));
 }
 
 bool DescriptorTableMatches(uintptr_t moduleBase, uintptr_t moduleEnd,
-    uintptr_t table) noexcept
+    uintptr_t table, const TemporalProviderProfile& profile) noexcept
 {
     constexpr size_t kTableBytes = kKernelCount * sizeof(uintptr_t);
     if (!table || moduleEnd <= moduleBase || table < moduleBase
@@ -265,14 +444,15 @@ bool DescriptorTableMatches(uintptr_t moduleBase, uintptr_t moduleEnd,
     {
         uintptr_t descriptor = 0;
         if (!SafeRead(table + slot * sizeof(uintptr_t), descriptor)
-            || !DescriptorMatches(moduleBase, moduleEnd, descriptor,
-                slot == kTemporalSlot))
+            || !DescriptorMatches(moduleBase, moduleEnd, descriptor, slot,
+                profile))
             return false;
     }
     return true;
 }
 
-uintptr_t FindDescriptorEntry(HMODULE module, uint32_t imageSize) noexcept
+uintptr_t FindDescriptorEntry(HMODULE module, uint32_t imageSize,
+    const TemporalProviderProfile& profile) noexcept
 {
     constexpr size_t kTableBytes = kKernelCount * sizeof(uintptr_t);
     if (!module || imageSize < kTableBytes)
@@ -323,13 +503,16 @@ uintptr_t FindDescriptorEntry(HMODULE module, uint32_t imageSize) noexcept
         {
             const uintptr_t table = begin + offset;
             uintptr_t descriptor = 0;
-            if (!SafeRead(table + kTemporalSlot * sizeof(uintptr_t), descriptor)
-                || !DescriptorMatches(base, end, descriptor, true)
-                || !DescriptorTableMatches(base, end, table))
+            if (!SafeRead(table + profile.temporalSlot * sizeof(uintptr_t),
+                    descriptor)
+                || !DescriptorMatches(base, end, descriptor,
+                    profile.temporalSlot,
+                    profile)
+                || !DescriptorTableMatches(base, end, table, profile))
                 continue;
             if (match)
                 return 0;
-            match = table + kTemporalSlot * sizeof(uintptr_t);
+            match = table + profile.temporalSlot * sizeof(uintptr_t);
         }
     }
     return match;
@@ -414,67 +597,85 @@ size_t FindUniqueBytes(const uint8_t* bytes, size_t count,
 }
 
 bool BuildTemporalFatbin(uint8_t* fatbin, uint8_t* scratch,
-    uint32_t& outputBytes, Failure& failure) noexcept
+    const TemporalProviderProfile& profile, uint32_t& outputBytes,
+    Failure& failure) noexcept
 {
     constexpr size_t kOuterHeaderBytes = 16;
     constexpr size_t kSm120EntryOffset = kOuterHeaderBytes;
-    constexpr size_t kSm120EntryBytes = 28128;
-    constexpr size_t kSm89EntryOffset = kSm120EntryOffset + kSm120EntryBytes;
     constexpr size_t kSm89HeaderBytes = 104;
-    constexpr size_t kSm89PayloadBytes = 30384;
-    constexpr size_t kSm89CompressedBytes = 30379;
-    constexpr size_t kSm89RawBytes = 99362;
     constexpr uint64_t kCompressedFlags = 0x2041;
     constexpr uint64_t kUncompressedFlags = 0x41;
     constexpr char kMulPrefix[] = "mul.ftz.f32 ";
-    constexpr char kCurr2PrevScale[] = "%f136";
-    constexpr char kPrev2CurrScale[] = "%f134";
-
     failure = Failure::eTemporalLayout;
     if (!fatbin || !scratch || ReadU32(fatbin) != 0xBA55ED50u
+        || !profile.temporalInput || !profile.curr2PrevScale
+        || !profile.prev2CurrScale
         || ReadU16(fatbin + 6) != kOuterHeaderBytes
-        || ReadU64(fatbin + 8) + kOuterHeaderBytes != kSourceFatbinBytes)
+        || ReadU64(fatbin + 8) + kOuterHeaderBytes
+            != profile.sourceFatbinBytes)
         return false;
+    const size_t kSm89EntryOffset =
+        kSm120EntryOffset + profile.sm120EntryBytes;
     uint8_t* sm120 = fatbin + kSm120EntryOffset;
     uint8_t* sm89 = fatbin + kSm89EntryOffset;
     if (ReadU16(sm120) != 1 || ReadU32(sm120 + 4) != 104
-        || ReadU64(sm120 + 8) != 28024 || ReadU32(sm120 + 16) != 28017
+        || ReadU64(sm120 + 8) != profile.sm120PayloadBytes
+        || ReadU32(sm120 + 16) != profile.sm120CompressedBytes
         || ReadU32(sm120 + 28) != 120 || ReadU64(sm120 + 40) != 0x2041
-        || ReadU64(sm120 + 56) != 90490
+        || ReadU64(sm120 + 56) != profile.sm120RawBytes
         || ReadU16(sm89) != 1 || ReadU32(sm89 + 4) != kSm89HeaderBytes
-        || ReadU64(sm89 + 8) != kSm89PayloadBytes
-        || ReadU32(sm89 + 16) != kSm89CompressedBytes
+        || ReadU64(sm89 + 8) != profile.sm89PayloadBytes
+        || ReadU32(sm89 + 16) != profile.sm89CompressedBytes
         || ReadU32(sm89 + 28) != 89
         || ReadU64(sm89 + 40) != kCompressedFlags
-        || ReadU64(sm89 + 56) != kSm89RawBytes)
+        || ReadU64(sm89 + 56) != profile.sm89RawBytes)
         return false;
     if (!DecompressNvidiaLz(sm89 + kSm89HeaderBytes,
-            kSm89CompressedBytes, scratch, kSm89RawBytes))
+            profile.sm89CompressedBytes, scratch, profile.sm89RawBytes))
     {
         failure = Failure::eDecompression;
         return false;
     }
-    if (!Sha256Equals(scratch, kSm89RawBytes, kSourcePtxSha256))
+    if (!Sha256Equals(scratch, profile.sm89RawBytes,
+            profile.sourcePtxSha256))
     {
         failure = Failure::eSourceIdentity;
         return false;
     }
 
-    const size_t label = FindUniqueBytes(scratch, kSm89RawBytes,
+    if ((profile.registerDeclaration == nullptr)
+        != (profile.patchedRegisterDeclaration == nullptr))
+        return false;
+    if (profile.registerDeclaration)
+    {
+        const size_t sourceBytes = std::strlen(profile.registerDeclaration);
+        const size_t replacementBytes =
+            std::strlen(profile.patchedRegisterDeclaration);
+        if (sourceBytes == 0 || sourceBytes != replacementBytes)
+            return false;
+        const size_t declaration = FindUniqueBytes(scratch,
+            profile.sm89RawBytes, profile.registerDeclaration, sourceBytes);
+        if (declaration == SIZE_MAX)
+            return false;
+        std::memcpy(scratch + declaration,
+            profile.patchedRegisterDeclaration, replacementBytes);
+    }
+
+    const size_t label = FindUniqueBytes(scratch, profile.sm89RawBytes,
         kJoinLabel, sizeof(kJoinLabel) - 1);
     if (label == SIZE_MAX)
         return false;
     size_t insertion = label + sizeof(kJoinLabel) - 1;
-    while (insertion < kSm89RawBytes && scratch[insertion] != '\n')
+    while (insertion < profile.sm89RawBytes && scratch[insertion] != '\n')
         ++insertion;
-    if (insertion >= kSm89RawBytes)
+    if (insertion >= profile.sm89RawBytes)
         return false;
     ++insertion;
 
     std::array<size_t, kTemporalMultiplyCount> midpointOffsets{};
     size_t midpointCount = 0;
     for (size_t offset = 0;
-         offset + sizeof(kMidpointBits) - 1 < kSm89RawBytes; ++offset)
+         offset + sizeof(kMidpointBits) - 1 < profile.sm89RawBytes; ++offset)
     {
         if (std::memcmp(scratch + offset, kMidpointBits,
                 sizeof(kMidpointBits) - 1) != 0
@@ -510,8 +711,8 @@ bool BuildTemporalFatbin(uint8_t* fatbin, uint8_t* scratch,
         return true;
     };
     if (!append(scratch, insertion)
-        || !append(reinterpret_cast<const uint8_t*>(kTemporalInput),
-            sizeof(kTemporalInput) - 1))
+        || !append(reinterpret_cast<const uint8_t*>(profile.temporalInput),
+            std::strlen(profile.temporalInput)))
         return false;
     sourceOffset = insertion;
     for (size_t index = 0; index < midpointOffsets.size(); ++index)
@@ -521,12 +722,14 @@ bool BuildTemporalFatbin(uint8_t* fatbin, uint8_t* scratch,
             || !append(scratch + sourceOffset, marker - sourceOffset))
             return false;
         const char* scale = index < kTemporalDirectionCount
-            ? kCurr2PrevScale : kPrev2CurrScale;
-        if (!append(reinterpret_cast<const uint8_t*>(scale), 5))
+            ? profile.curr2PrevScale : profile.prev2CurrScale;
+        if (!append(reinterpret_cast<const uint8_t*>(scale),
+                std::strlen(scale)))
             return false;
         sourceOffset = marker + sizeof(kMidpointBits) - 1;
     }
-    if (!append(scratch + sourceOffset, kSm89RawBytes - sourceOffset))
+    if (!append(scratch + sourceOffset,
+            profile.sm89RawBytes - sourceOffset))
         return false;
 
     const size_t padded = (destinationOffset + 7) & ~size_t{7};
@@ -656,6 +859,78 @@ uint64_t PackLuid(const LUID& luid) noexcept
         | (static_cast<uint64_t>(static_cast<uint32_t>(luid.HighPart)) << 32);
 }
 
+bool VerifyAdaAdapter(const LUID& activeLuid, int& major,
+    int& minor) noexcept;
+void SetFailure(Failure failure) noexcept;
+
+// Only the prefix consumed by vkGetPhysicalDeviceProperties2 is represented
+// here. Keeping the Vulkan loader dynamic avoids adding a Vulkan SDK/runtime
+// import to the universal core, while the fixed Vulkan ABI offsets are checked
+// below. The opaque properties storage is larger than VkPhysicalDeviceProperties.
+struct VulkanPhysicalDeviceIdProperties
+{
+    uint32_t sType = 1000071004u;
+    uint32_t padding = 0;
+    void* pNext = nullptr;
+    std::array<uint8_t, 16> deviceUuid{};
+    std::array<uint8_t, 16> driverUuid{};
+    std::array<uint8_t, 8> deviceLuid{};
+    uint32_t deviceNodeMask = 0;
+    uint32_t deviceLuidValid = 0;
+};
+
+struct VulkanPhysicalDeviceProperties2
+{
+    uint32_t sType = 1000059001u;
+    uint32_t padding = 0;
+    void* pNext = nullptr;
+    alignas(8) std::array<uint8_t, 1024> properties{};
+};
+
+static_assert(offsetof(VulkanPhysicalDeviceIdProperties, pNext) == 8);
+static_assert(offsetof(VulkanPhysicalDeviceIdProperties, deviceLuid) == 48);
+static_assert(offsetof(VulkanPhysicalDeviceProperties2, pNext) == 8);
+static_assert(offsetof(VulkanPhysicalDeviceProperties2, properties) == 16);
+
+void RejectAdapterUnavailable() noexcept
+{
+    std::lock_guard lock(gMutex);
+    gAdapterVerified.store(false, std::memory_order_release);
+    gReady.store(false, std::memory_order_release);
+    SetFailure(Failure::eAdapterUnavailable);
+}
+
+bool ObserveAdapterLuid(const LUID& luid, const wchar_t* api) noexcept
+{
+    int major = 0;
+    int minor = 0;
+    const bool verified = VerifyAdaAdapter(luid, major, minor);
+    const uint64_t packedLuid = PackLuid(luid);
+    {
+        std::lock_guard lock(gMutex);
+        if (gProvider && gPublishedAdapterLuid != packedLuid)
+        {
+            gAdapterVerified.store(false, std::memory_order_release);
+            gReady.store(false, std::memory_order_release);
+            SetFailure(Failure::eRestartRequired);
+            Log(L"D157 midpoint fix requires restart after an adapter change");
+            return false;
+        }
+        gAdapterLuid.store(packedLuid, std::memory_order_release);
+        gAdapterVerified.store(verified, std::memory_order_release);
+        if (!verified)
+        {
+            gReady.store(false, std::memory_order_release);
+            SetFailure(major == 0 && minor == 0
+                    ? Failure::eAdapterUnavailable : Failure::eAdapterNotAda);
+        }
+    }
+    Log(L"D157 %s adapter verification: luid=0x%016llX "
+        L"capability=%d.%d verified=%d", api ? api : L"unknown",
+        static_cast<unsigned long long>(packedLuid), major, minor, verified);
+    return verified;
+}
+
 bool VerifyAdaAdapter(const LUID& activeLuid, int& major, int& minor) noexcept
 {
     using CuInit = int (WINAPI*)(unsigned int);
@@ -724,50 +999,72 @@ bool ObserveD3D12Device(void* device) noexcept
 {
     if (!device)
     {
-        std::lock_guard lock(gMutex);
-        gAdapterVerified.store(false, std::memory_order_release);
-        gReady.store(false, std::memory_order_release);
-        SetFailure(Failure::eAdapterUnavailable);
+        RejectAdapterUnavailable();
         return false;
     }
     ID3D12Device* d3d12 = nullptr;
     if (FAILED(reinterpret_cast<IUnknown*>(device)->QueryInterface(
             __uuidof(ID3D12Device), reinterpret_cast<void**>(&d3d12))))
     {
-        std::lock_guard lock(gMutex);
-        gAdapterVerified.store(false, std::memory_order_release);
-        gReady.store(false, std::memory_order_release);
-        SetFailure(Failure::eAdapterUnavailable);
+        RejectAdapterUnavailable();
         return false;
     }
     const LUID luid = d3d12->GetAdapterLuid();
     d3d12->Release();
-    int major = 0;
-    int minor = 0;
-    const bool verified = VerifyAdaAdapter(luid, major, minor);
-    const uint64_t packedLuid = PackLuid(luid);
+    return ObserveAdapterLuid(luid, L"D3D12");
+}
+
+bool ObserveVulkanPhysicalDevice(void* physicalDevice) noexcept
+{
+    if (!physicalDevice)
     {
-        std::lock_guard lock(gMutex);
-        if (gProvider && gPublishedAdapterLuid != packedLuid)
-        {
-            gAdapterVerified.store(false, std::memory_order_release);
-            gReady.store(false, std::memory_order_release);
-            SetFailure(Failure::eRestartRequired);
-            Log(L"D157 midpoint fix requires restart after an adapter change");
-            return false;
-        }
-        gAdapterLuid.store(packedLuid, std::memory_order_release);
-        gAdapterVerified.store(verified, std::memory_order_release);
-        if (!verified)
-        {
-            gReady.store(false, std::memory_order_release);
-            SetFailure(major == 0 && minor == 0
-                    ? Failure::eAdapterUnavailable : Failure::eAdapterNotAda);
-        }
+        RejectAdapterUnavailable();
+        return false;
     }
-    Log(L"D157 adapter verification: luid=0x%016llX capability=%d.%d verified=%d",
-        static_cast<unsigned long long>(packedLuid), major, minor, verified);
-    return verified;
+    using GetPhysicalDeviceProperties2 = void (WINAPI*)(
+        void*, VulkanPhysicalDeviceProperties2*);
+    HMODULE vulkan = LoadLibraryExW(L"vulkan-1.dll", nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto* getProperties = vulkan
+        ? reinterpret_cast<GetPhysicalDeviceProperties2>(
+            GetProcAddress(vulkan, "vkGetPhysicalDeviceProperties2"))
+        : nullptr;
+    if (!getProperties && vulkan)
+    {
+        getProperties = reinterpret_cast<GetPhysicalDeviceProperties2>(
+            GetProcAddress(vulkan, "vkGetPhysicalDeviceProperties2KHR"));
+    }
+    if (!getProperties)
+    {
+        if (vulkan)
+            FreeLibrary(vulkan);
+        RejectAdapterUnavailable();
+        return false;
+    }
+
+    VulkanPhysicalDeviceIdProperties identity{};
+    VulkanPhysicalDeviceProperties2 properties{};
+    properties.pNext = &identity;
+    bool queried = false;
+    __try
+    {
+        getProperties(physicalDevice, &properties);
+        queried = identity.deviceLuidValid != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        queried = false;
+    }
+    FreeLibrary(vulkan);
+    if (!queried)
+    {
+        RejectAdapterUnavailable();
+        return false;
+    }
+
+    LUID luid{};
+    std::memcpy(&luid, identity.deviceLuid.data(), sizeof(luid));
+    return ObserveAdapterLuid(luid, L"Vulkan");
 }
 
 bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
@@ -799,11 +1096,15 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
         SetFailure(Failure::eProviderLayout);
         return false;
     }
-    wchar_t loadedPath[32768]{};
+    std::wstring loadedPath(32768, L'\0');
     const DWORD pathLength = GetModuleFileNameW(
-        pinned, loadedPath, _countof(loadedPath));
-    const wchar_t* path = pathLength > 0 && pathLength < _countof(loadedPath)
-        ? loadedPath : suppliedPath;
+        pinned, loadedPath.data(), static_cast<DWORD>(loadedPath.size()));
+    if (pathLength > 0 && pathLength < loadedPath.size())
+        loadedPath.resize(pathLength);
+    else
+        loadedPath.clear();
+    const wchar_t* path = !loadedPath.empty()
+        ? loadedPath.c_str() : suppliedPath;
     auto fail = [&](Failure failure) noexcept {
         SetFailure(failure);
         FreeLibrary(pinned);
@@ -813,6 +1114,13 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
     };
     if (!dlssg_provider_policy::IsSupportedProvider(pinned, path))
         return fail(Failure::eProviderVersion);
+    dlssg_provider_policy::VersionTriplet providerVersion{};
+    if (!dlssg_provider_policy::ReadProviderVersion(path, providerVersion))
+        return fail(Failure::eProviderVersion);
+    const TemporalProviderProfile* const profile =
+        ProfileForVersion(providerVersion);
+    if (!profile)
+        return fail(Failure::eProviderVersion);
     uint32_t imageSize = 0;
     if (!ImageSize(module, imageSize))
         return fail(Failure::eProviderLayout);
@@ -820,7 +1128,8 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
     if (base > UINTPTR_MAX - imageSize)
         return fail(Failure::eProviderLayout);
     const uintptr_t end = base + imageSize;
-    const uintptr_t descriptorEntry = FindDescriptorEntry(module, imageSize);
+    const uintptr_t descriptorEntry = FindDescriptorEntry(
+        module, imageSize, *profile);
     if (!descriptorEntry || !IsReadOnlyImageAddress(module, descriptorEntry))
         return fail(Failure::eProviderLayout);
 
@@ -839,9 +1148,13 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
         sizeof(suppliedSize));
     if (suppliedSize == 0)
         return fail(Failure::eProviderNotReady);
-    if (suppliedSize != kSourceFatbinBytes || originalFatbin < base
-        || originalFatbin > end - kSourceFatbinBytes)
+    if (profile->sourceFatbinBytes > imageSize
+        || suppliedSize != profile->sourceFatbinBytes
+        || originalFatbin < base
+        || originalFatbin > end - profile->sourceFatbinBytes)
         return fail(Failure::eSourceIdentity);
+    const size_t sourceFatbinBytes =
+        static_cast<size_t>(profile->sourceFatbinBytes);
 
     const size_t allocationSize = kDescriptorBytes
         + kOutputCapacity + kScratchCapacity;
@@ -854,22 +1167,23 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
     uint8_t* scratch = clonedFatbin + kOutputCapacity;
     std::memcpy(clonedDescriptor, descriptor.data(), descriptor.size());
     if (!SafeCopy(clonedFatbin, reinterpret_cast<const void*>(originalFatbin),
-            kSourceFatbinBytes)
-        || !Sha256Equals(clonedFatbin, kSourceFatbinBytes,
-            kSourceFatbinSha256))
+            sourceFatbinBytes)
+        || !Sha256Equals(clonedFatbin, sourceFatbinBytes,
+            profile->sourceFatbinSha256))
     {
         VirtualFree(allocation, 0, MEM_RELEASE);
         return fail(Failure::eSourceIdentity);
     }
     uint32_t outputBytes = 0;
     Failure transformFailure = Failure::eNone;
-    if (!BuildTemporalFatbin(clonedFatbin, scratch, outputBytes,
-            transformFailure))
+    if (!BuildTemporalFatbin(clonedFatbin, scratch, *profile,
+            outputBytes, transformFailure))
     {
         VirtualFree(allocation, 0, MEM_RELEASE);
         return fail(transformFailure);
     }
-    if (!Sha256Equals(clonedFatbin, outputBytes, kOutputFatbinSha256))
+    if (!Sha256Equals(clonedFatbin, outputBytes,
+            profile->outputFatbinSha256))
     {
         VirtualFree(allocation, 0, MEM_RELEASE);
         return fail(Failure::eOutputIdentity);
