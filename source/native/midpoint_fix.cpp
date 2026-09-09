@@ -167,7 +167,7 @@ constexpr std::array<const char*, kKernelCount> k3109KernelNames{{
     "ZeroBuffer",
 }};
 
-const TemporalProviderProfile* ProfileForVersion(
+constexpr const TemporalProviderProfile* ProfileForVersion(
     dlssg_provider_policy::VersionTriplet version) noexcept
 {
     if (version.major == 310
@@ -184,7 +184,10 @@ const TemporalProviderProfile* ProfileForVersion(
         return &kLegacySlot11TemporalProfile;
     if (version.major == 310 && version.minor == 6 && version.build == 0)
         return &kLegacySlot10TemporalProfile;
-    if (version.major == 310 && version.minor == 9 && version.build == 0)
+    // 310.9.1 retains the exact named table and temporal payload contract.
+    // Structural discovery follows the relocated table; no RVA is reused.
+    if (version.major == 310 && version.minor == 9
+        && (version.build == 0 || version.build == 1))
         return &k3109TemporalProfile;
     if (version.major == 310
         && ((version.minor == 7
@@ -195,6 +198,15 @@ const TemporalProviderProfile* ProfileForVersion(
     return nullptr;
 }
 
+constexpr bool SupportedVersionsHaveProfiles() noexcept
+{
+    for (const auto version : dlssg_provider_policy::kSupportedVersions)
+        if (!ProfileForVersion(version)) return false;
+    return ProfileForVersion({310, 9, 2}) == nullptr
+        && ProfileForVersion({311, 9, 1}) == nullptr;
+}
+
+static_assert(SupportedVersionsHaveProfiles());
 static_assert(kEarlyTemporalProfile.temporalSlot == 12);
 static_assert(kLegacySlot11TemporalProfile.temporalSlot == 11);
 static_assert(kLegacySlot10TemporalProfile.temporalSlot == 10);

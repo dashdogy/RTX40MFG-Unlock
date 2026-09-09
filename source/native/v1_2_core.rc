@@ -1,8 +1,8 @@
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,2,0,22
- PRODUCTVERSION 1,2,0,22
+ FILEVERSION 1,2,0,23
+ PRODUCTVERSION 1,2,0,23
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -19,11 +19,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "dashdogy"
             VALUE "FileDescription", "Universal DLSS Multi Frame Generation enabler for supported games on NVIDIA GeForce RTX 40 Series GPUs."
-            VALUE "FileVersion", "1.2.0.22"
+            VALUE "FileVersion", "1.2.0.23"
             VALUE "InternalName", "RTX40MFGCore.dll"
             VALUE "OriginalFilename", "RTX40MFGCore.dll"
             VALUE "ProductName", "Universal RTX 40 MFG Unlock V1.2"
-            VALUE "ProductVersion", "1.2.0.22"
+            VALUE "ProductVersion", "1.2.0.23"
         END
     END
     BLOCK "VarFileInfo"

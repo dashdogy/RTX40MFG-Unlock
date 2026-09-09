@@ -20,6 +20,22 @@ screens, or crashes.
 2. Added live fixed and Dynamic controls through the ReShade menu.
 3. Added automatic game capability limits, Ada temporal correction, and telemetry.
 
+### 310.9.1 source hotfix candidate (core 1.2.0.23)
+
+Adds exactly DLSS-G 310.9.1 to provider eligibility and the existing verified
+310.9 temporal profile. The original feature identity, payload hashes,
+structural discovery, adapter, timing and publication checks remain in force.
+Unknown 310.9.2 stays rejected.
+
+For an existing V1.2 installation, close the game, back up `RTX40MFGCore.dll`,
+and replace only that core with the hotfix candidate. Keep the V1.2 ASI,
+ReShade add-on, loader configuration and user settings. Do not mix this core
+with the V1.3 single-DLL package.
+
+Local source/harness validation does not establish provider execution or
+correct final-present content in a game. This hotfix does not add the newer
+Streamline V-Sync or Reflex controls.
+
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
 
 ## Install

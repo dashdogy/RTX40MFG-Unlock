@@ -17,7 +17,7 @@ struct VersionTriplet
 // Only provider builds which passed the complete immutable layout and payload
 // contract belong here. The fourth file-version component is intentionally not
 // part of eligibility because it did not change the validated provider layout.
-inline constexpr std::array<VersionTriplet, 14> kSupportedVersions{{
+inline constexpr std::array<VersionTriplet, 15> kSupportedVersions{{
     {310, 1, 0},
     {310, 2, 0},
     {310, 2, 1},
@@ -32,6 +32,7 @@ inline constexpr std::array<VersionTriplet, 14> kSupportedVersions{{
     {310, 7, 129},
     {310, 8, 0},
     {310, 9, 0},
+    {310, 9, 1},
 }};
 
 inline constexpr char kD3d12ImplementationExport[] =
@@ -81,11 +82,12 @@ static_assert(IsSupportedVersion({310, 7, 128}));
 static_assert(IsSupportedVersion({310, 7, 129}));
 static_assert(IsSupportedVersion({310, 8, 0}));
 static_assert(IsSupportedVersion({310, 9, 0}));
+static_assert(IsSupportedVersion({310, 9, 1}));
 static_assert(!IsSupportedVersion({310, 7, 1}));
 static_assert(!IsSupportedVersion({310, 5, 1}));
 static_assert(!IsSupportedVersion({310, 6, 1}));
 static_assert(!IsSupportedVersion({310, 8, 1}));
-static_assert(!IsSupportedVersion({310, 9, 1}));
+static_assert(!IsSupportedVersion({310, 9, 2}));
 
 bool ReadProviderVersion(
     const wchar_t* path, VersionTriplet& version) noexcept;
