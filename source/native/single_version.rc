@@ -1,0 +1,38 @@
+#include <windows.h>
+#ifndef MFG_SINGLE_FILENAME
+#define MFG_SINGLE_FILENAME "RTXMFG.dll"
+#endif
+101 RCDATA "third_party/imgui_backends/LICENSE-ImGui.txt"
+102 RCDATA "third_party/minhook/LICENSE.txt"
+103 RCDATA "proxy_generated/LICENSE-UAL.txt"
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,3,2,0
+ PRODUCTVERSION 1,3,2,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904B0"
+  BEGIN
+   VALUE "CompanyName", "dashdogy"
+   VALUE "FileDescription", "RTXMFG integrated Ada and experimental Ampere backend and UI"
+   VALUE "FileVersion", "1.3.2"
+   VALUE "InternalName", MFG_SINGLE_FILENAME
+   VALUE "OriginalFilename", MFG_SINGLE_FILENAME
+   VALUE "ProductName", "Universal RTXMFG Single Module"
+   VALUE "ProductVersion", "1.3.2"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0409, 1200
+ END
+END

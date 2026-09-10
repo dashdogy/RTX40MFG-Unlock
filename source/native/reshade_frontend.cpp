@@ -1,3 +1,7 @@
+#include "build_variant.h"
+#include "unified_control_paths.h"
+#include "ampere_policy.h"
+#include "universal_route_policy.h"
 #include "reshade_frontend.h"
 
 #if defined(MFG_UNLOCK_RESHADE_UI_CLIENT)
@@ -5,15 +9,26 @@
 #else
 #include "reshade_bridge.h"
 #endif
+#include "ampere_diagnostics.h"
+#include "reflex_control.h"
 
 #include <imgui.h>
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+#include "ui_host.h"
+#include "standalone_ui.h"
+#include "single_module.h"
+#else
 #include <reshade.hpp>
+#endif
 
 #include <Psapi.h>
 #include <d3d12.h>
 #include <dxgi.h>
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include "ui_status_json.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
@@ -24,9 +39,12 @@
 
 namespace
 {
-constexpr const char* kConfigSection = "RTX40MFG";
-constexpr const char* kOverlayTitle = "DLSS MFG";
+constexpr const char* kConfigSection = MFG_PRODUCT;
+constexpr const char* kOverlayTitle = MFG_OVERLAY_TITLE;
 constexpr const char* kReShadeHomeWindow = "###home";
+
+std::atomic<uint32_t> gGpuFamily{0};
+bool UiAmpere() noexcept { return gGpuFamily.load(std::memory_order_acquire) == 2u; }
 
 std::atomic<bool> gRegistered{false};
 std::atomic<bool> gInitialized{false};
@@ -52,6 +70,10 @@ std::atomic<bool> gIntegratedUniversalBackend{false};
 SRWLOCK gBackendConnectionLock = SRWLOCK_INIT;
 std::wstring gNativeConfigPath;
 std::wstring gNativeStatusPath;
+// Display-only state. Control writes always obtain their own current snapshot.
+MfgUnlockReShadeSnapshot gLastNativeDisplay{};
+std::wstring gLastNativeDisplayPath;
+bool gHaveNativeDisplay = false;
 std::wstring gCompanionConfigPath;
 using MfgUnlockSampleFrameTelemetryFn = BOOL (WINAPI*)();
 MfgUnlockSampleFrameTelemetryFn gSampleFrameTelemetry = nullptr;
@@ -88,6 +110,12 @@ bool gDynamicMode = false;
 int gDynamicTargetFrameRate = 0;
 bool gDynamicLockToRefreshRate = true;
 int gDynamicCustomTargetFrameRate = 60;
+int gDlssgPreset = 2;
+int gVsyncMode = 0;
+int gReflexFrameLimitFps = 0;
+int gReflexCustomLimitFps = 120;
+bool gPresentationSaveFailed = false;
+bool gPresetSaveFailed = false;
 bool gDynamicExperimental56 = false;
 bool gGeneratedOnlyDebug = false;
 bool gLastApplyAttempted = false;
@@ -207,12 +235,14 @@ bool ParseJsonBool(const std::string& content, const char* name,
     size_t offset = 0;
     if (!FindJsonValue(content, name, offset))
         return false;
-    if (content.compare(offset, 4, "true") == 0)
+    if (content.compare(offset, 4, "true") == 0
+        && ui_status_json::ValueEnd(content, offset+4))
     {
         value = TRUE;
         return true;
     }
-    if (content.compare(offset, 5, "false") == 0)
+    if (content.compare(offset, 5, "false") == 0
+        && ui_status_json::ValueEnd(content, offset+5))
     {
         value = FALSE;
         return true;
@@ -227,11 +257,27 @@ bool ParseJsonInteger(const std::string& content, const char* name,
     size_t offset = 0;
     if (!FindJsonValue(content, name, offset))
         return false;
-    char* end = nullptr;
-    const long long parsed = std::strtoll(content.c_str() + offset, &end, 10);
-    if (!end || end == content.c_str() + offset)
+    T parsed{};
+    const auto result = std::from_chars(content.data()+offset,
+        content.data()+content.size(), parsed);
+    if (result.ec != std::errc{} || !ui_status_json::ValueEnd(content,
+            static_cast<size_t>(result.ptr-content.data())))
         return false;
-    value = static_cast<T>(parsed);
+    value = parsed;
+    return true;
+}
+
+bool ParseJsonFloat(const std::string& content, const char* name, float& value) noexcept
+{
+    size_t offset = 0;
+    if (!FindJsonValue(content, name, offset)) return false;
+    float parsed = 0.0f;
+    const auto result = std::from_chars(content.data()+offset,
+        content.data()+content.size(), parsed);
+    if (result.ec != std::errc{} || !std::isfinite(parsed)
+        || !ui_status_json::ValueEnd(content,
+            static_cast<size_t>(result.ptr-content.data()))) return false;
+    value = parsed;
     return true;
 }
 
@@ -293,9 +339,11 @@ bool ReadTextFile(const std::wstring& path, std::string& content) noexcept
     const BOOL read = ReadFile(file, content.data(),
         static_cast<DWORD>(content.size()), &bytesRead, nullptr);
     CloseHandle(file);
-    if (!read)
+    if (!read || bytesRead != content.size())
+    {
+        content.clear();
         return false;
-    content.resize(bytesRead);
+    }
     return true;
 }
 
@@ -309,26 +357,29 @@ bool ResolveNativeFilePaths() noexcept
     executablePath.resize(length);
     const std::filesystem::path directory =
         std::filesystem::path(executablePath).parent_path();
-#if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
+#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
+    gNativeConfigPath = unified_control_paths::Config(directory.wstring());
+    gNativeStatusPath = unified_control_paths::Status(gNativeConfigPath, directory.wstring());
+#elif defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
     gNativeConfigPath = (directory
-        / L"RTX40MFG-Universal.json").wstring();
+        / MFG_CONFIG_W).wstring();
     gNativeStatusPath = (directory
-        / L"RTX40MFG-Universal.status.json").wstring();
+        / MFG_STATUS_W).wstring();
 #else
     if (GetModuleHandleW(L"RTX40MFG-Universal.asi"))
     {
         gNativeConfigPath = (directory
-            / L"RTX40MFG-Universal.json").wstring();
+            / MFG_CONFIG_W).wstring();
         gNativeStatusPath = (directory
-            / L"RTX40MFG-Universal.status.json").wstring();
+            / MFG_STATUS_W).wstring();
     }
     else
     {
         gNativeConfigPath = (directory / L"plugins"
-            / L"cyber_engine_tweaks" / L"mods" / L"RTX40MFG"
+            / L"cyber_engine_tweaks" / L"mods" / MFG_PRODUCT_W
             / L"config.json").wstring();
         gNativeStatusPath = (directory / L"plugins"
-            / L"cyber_engine_tweaks" / L"mods" / L"RTX40MFG"
+            / L"cyber_engine_tweaks" / L"mods" / MFG_PRODUCT_W
             / L"bridge_status.json").wstring();
     }
 #endif
@@ -363,7 +414,7 @@ BOOL PersistCompanionControl() noexcept
         "\"dynamicExperimental56\":%s,\"generatedOnlyDebug\":%s}\n",
         gFollowGameMode ? "true" : "false",
         gDynamicMode ? "dynamic" : "fixed",
-        static_cast<uint32_t>(std::clamp(gMultiplier, 2, 6)),
+        static_cast<uint32_t>(std::clamp(gMultiplier, UiAmpere() ? 1 : 2, 6)),
         static_cast<uint32_t>(
             std::clamp(gDynamicTargetFrameRate, 0, 1000)),
         gDynamicExperimental56 ? "true" : "false",
@@ -392,47 +443,145 @@ BOOL PersistCompanionControl() noexcept
     return TRUE;
 }
 
-BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
+BOOL ParseNativeControlSnapshot(const std::string& control,
+    MfgUnlockReShadeSnapshot* snapshot)
 {
     if (!snapshot || snapshot->structSize < sizeof(*snapshot))
         return FALSE;
     MfgUnlockReShadeSnapshot output{};
-    output.followGameMode = TRUE;
-    output.desiredMultiplier = static_cast<uint32_t>(
-        std::clamp(gMultiplier, 2, 6));
-    output.dynamicMode = gDynamicMode ? TRUE : FALSE;
-    output.dynamicTargetFrameRate = static_cast<uint32_t>(
-        std::clamp(gDynamicTargetFrameRate, 0, 1000));
-    output.dynamicExperimental56 = gDynamicExperimental56 ? TRUE : FALSE;
-    output.generatedOnlyDebug = gGeneratedOnlyDebug ? TRUE : FALSE;
+    output.followGameMode = FALSE;
     output.intervalLoggingEnabled = TRUE;
     output.frontendClients = 1;
     strcpy_s(output.patchRoute, "pending");
 
-    std::string control;
-    if (ReadTextFile(gNativeConfigPath, control))
+    if (!ui_status_json::CompleteObject(control)
+        || !ParseJsonInteger(control, "multiplier", output.desiredMultiplier)
+        || output.desiredMultiplier < 1 || output.desiredMultiplier > 6) return FALSE;
     {
-        BOOL followGame = FALSE;
-        output.followGameMode = ParseJsonBool(
-            control, "followGame", followGame) ? followGame : FALSE;
-        ParseJsonInteger(control, "multiplier", output.desiredMultiplier);
-        ParseJsonInteger(control, "dynamicTargetFrameRate",
-            output.dynamicTargetFrameRate);
-        ParseJsonBool(control, "dynamicExperimental56",
-            output.dynamicExperimental56);
-        ParseJsonBool(control, "generatedOnlyDebug",
-            output.generatedOnlyDebug);
+        size_t offset = 0;
+        if (FindJsonValue(control, "followGame", offset)
+            && !ParseJsonBool(control, "followGame", output.followGameMode)) return FALSE;
+        if (FindJsonValue(control, "dynamicTargetFrameRate", offset)
+            && (!ParseJsonInteger(control, "dynamicTargetFrameRate", output.dynamicTargetFrameRate)
+                || output.dynamicTargetFrameRate > 1000)) return FALSE;
+        if (FindJsonValue(control, "dlssgPreset", offset)
+            && (!ParseJsonInteger(control, "dlssgPreset", output.dlssgPresetRequested)
+                || output.dlssgPresetRequested > 2)) return FALSE;
+        if (FindJsonValue(control, "vsyncMode", offset)
+            && (!ParseJsonInteger(control, "vsyncMode", output.vsyncMode)
+                || output.vsyncMode > 2)) return FALSE;
+        if (FindJsonValue(control, "reflexFrameLimitFps", offset)
+            && (!ParseJsonInteger(control, "reflexFrameLimitFps", output.reflexFrameLimitFps)
+                || output.reflexFrameLimitFps > 1000)) return FALSE;
+        // Legacy Dynamic 5X/6X preferences no longer control capacity.
+        output.dynamicExperimental56 = FALSE;
+        if (FindJsonValue(control, "generatedOnlyDebug", offset)
+            && !ParseJsonBool(control, "generatedOnlyDebug", output.generatedOnlyDebug)) return FALSE;
+        BOOL legacyValue = FALSE;
+        for (const char* name : {"dynamicExperimental56", "selectiveOtaDlssgWrapper"})
+            if (FindJsonValue(control, name, offset)
+                && !ParseJsonBool(control, name, legacyValue)) return FALSE;
+        if (FindJsonValue(control, "intervalLogging", offset)
+            && !ParseJsonBool(control, "intervalLogging", output.intervalLoggingEnabled)) return FALSE;
         std::string controlMode;
-        if (ParseJsonString(control, "mode", controlMode))
+        if (FindJsonValue(control, "mode", offset))
+        {
+            if (!ParseJsonString(control, "mode", controlMode)
+                || (controlMode != "fixed" && controlMode != "dynamic"
+                    && !(controlMode == "follow" && output.followGameMode))) return FALSE;
             output.dynamicMode = controlMode == "dynamic" ? TRUE : FALSE;
+        }
+        if (output.followGameMode) output.dynamicMode = FALSE;
     }
 
+    *snapshot = output;
+    return TRUE;
+}
+
+BOOL ReadNativeControlSnapshot(MfgUnlockReShadeSnapshot* snapshot)
+{
+    std::string control;
+    return ReadTextFile(gNativeConfigPath, control)
+        && ParseNativeControlSnapshot(control, snapshot);
+}
+
+uint64_t NativeStatusUnixSeconds() noexcept
+{
+    FILETIME time{};
+    GetSystemTimeAsFileTime(&time);
+    const uint64_t ticks = (uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    return ticks/10000000ull - 11644473600ull;
+}
+
+bool ValidNativeStatus(const std::string& status)
+{
+    if (!ui_status_json::CompleteObject(status)) return false;
+    uint32_t version = 0, pid = 0, maximum = 0;
+    uint64_t heartbeat = 0;
+    const uint64_t now = NativeStatusUnixSeconds();
+    if (!ParseJsonInteger(status, "version", version)
+        || version != MFG_STATUS_VERSION_NUMBER
+        || !ParseJsonInteger(status, "pid", pid) || pid != GetCurrentProcessId()
+        || !ParseJsonInteger(status, "heartbeat", heartbeat)
+        || heartbeat > now || now-heartbeat > 5
+        || !ParseJsonInteger(status, "safeMaximumMultiplier", maximum)
+        || maximum < 2 || maximum > 6u) return false;
+    // These fields define availability and the menu's shape. Never silently
+    // substitute defaults for a missing or ill-typed capability field.
+    BOOL value = FALSE;
+    for (const char* key : {"bridgeReady", "gameFrameGenerationOn",
+            "appliedFrameGenerationOn",
+            "activeWrapperObserved", "dynamicMfgSupportKnown", "dynamicMfgSupported"})
+        if (!ParseJsonBool(status, key, value)) return false;
+    return true;
+}
+
+BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
+{
+    if (!snapshot || snapshot->structSize < sizeof(*snapshot)) return FALSE;
+    MfgUnlockReShadeSnapshot output{};
+    const bool haveSavedControl = ReadNativeControlSnapshot(&output) != FALSE;
     std::string status;
-    if (ReadTextFile(gNativeStatusPath, status))
+    if (!ReadTextFile(gNativeStatusPath, status) || !ValidNativeStatus(status)) return FALSE;
     {
-        ParseJsonBool(status, "followGame", output.followGameMode);
+        // A status heartbeat can precede the latest atomic config save. Saved
+        // intent remains authoritative; applied state comes only from status.
+        if (!haveSavedControl) ParseJsonBool(status, "followGame", output.followGameMode);
         ParseJsonInteger(status, "version",
             output.statusProtocolVersion);
+        if (!ParseJsonInteger(status, "gpuFamily", output.gpuFamily) || output.gpuFamily > 3u)
+            return FALSE;
+        ParseJsonInteger(status, "gpuAdapterLuid", output.gpuAdapterLuid);
+        ParseJsonInteger(status, "gpuSelectionFailure", output.gpuSelectionFailure);
+        gGpuFamily.store(output.gpuFamily, std::memory_order_release);
+        if (UiAmpere())
+        {
+            if (output.statusProtocolVersion != MFG_STATUS_VERSION_NUMBER) return FALSE;
+            ParseJsonBool(status, "ampereProgramReadyMfg", output.ampereProgramReadyMfg);
+            ParseJsonInteger(status, "ampereKernelImage", output.ampereKernelImage);
+            ParseJsonInteger(status, "ampereNativeCacheStatus", output.ampereNativeCacheStatus);
+            ParseJsonInteger(status, "ampereCertifiedMaximum", output.ampereCertifiedMaximum);
+            ParseJsonInteger(status, "ampereFailure", output.ampereFailure);
+            ParseJsonInteger(status, "presetQueries", output.presetQueries);
+            ParseJsonInteger(status, "ampereFirstFailure", output.ampereFirstFailure);
+            ParseJsonInteger(status, "ampereFirstNgxResult", output.ampereFirstNgxResult);
+            ParseJsonInteger(status, "amperePrimaryFailure", output.amperePrimaryFailure);
+            ParseJsonInteger(status, "amperePrimaryNgxResult", output.amperePrimaryNgxResult);
+            ParseJsonInteger(status, "ampereLastFailure", output.ampereLastFailure);
+            ParseJsonInteger(status, "ampereLastNgxResult", output.ampereLastNgxResult);
+            ParseJsonInteger(status, "ampereCreateAttempts", output.ampereCreateAttempts);
+            ParseJsonInteger(status, "ampereCreateBlockedBeforeProvider", output.ampereCreateBlockedBeforeProvider);
+            ParseJsonInteger(status, "ampereEvaluateAttempts", output.ampereEvaluateAttempts);
+            ParseJsonInteger(status, "amperePreparationStage", output.amperePreparationStage);
+            ParseJsonInteger(status, "ampereStartupFailureMask", output.ampereStartupFailureMask);
+            ParseJsonInteger(status, "ampereCandidateVersionMajor", output.ampereCandidateVersionMajor);
+            ParseJsonInteger(status, "ampereCandidateVersionMinor", output.ampereCandidateVersionMinor);
+            ParseJsonInteger(status, "ampereCandidateVersionBuild", output.ampereCandidateVersionBuild);
+            ParseJsonInteger(status, "ampereCreatedFeatures", output.ampereCreatedFeatures);
+            ParseJsonInteger(status, "ampereEvaluations", output.ampereEvaluations);
+            if (!ParseJsonBool(status, "ampereLegacySinglePreset", output.ampereLegacySinglePreset))
+                return FALSE;
+        }
         ParseJsonBool(status, "bridgeReady", output.bridgeReady);
         ParseJsonBool(status, "loaderCoreImported",
             output.loaderCoreImported);
@@ -544,6 +693,8 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
             output.pipelineMayPredateDetour);
         ParseJsonBool(status, "gameFrameGenerationOn",
             output.gameFrameGenerationOn);
+        ParseJsonBool(status, "appliedFrameGenerationOn",
+            output.appliedFrameGenerationOn);
         ParseJsonBool(status, "streamlineRebuildRequired",
             output.streamlineRebuildRequired);
         ParseJsonBool(status, "perSampleSynthesisReady",
@@ -571,13 +722,34 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
             output.wrapperCompiledMaximumGeneratedFrames);
         ParseJsonInteger(status, "safeMaximumMultiplier",
             output.safeMaximumMultiplier);
+        if (!haveSavedControl)
+            ParseJsonInteger(status, "dlssgPresetRequested", output.dlssgPresetRequested);
+        ParseJsonInteger(status, "dlssgPresetLatched", output.dlssgPresetLatched);
+        ParseJsonBool(status, "dlssgPresetSelectionFrozen", output.dlssgPresetSelectionFrozen);
+        ParseJsonBool(status, "dlssgPresetRestartRequired", output.dlssgPresetRestartRequired);
+        ParseJsonInteger(status, "dlssgPresetObserved", output.dlssgPresetObserved);
+        ParseJsonBool(status, "dlssgPresetObservedValid", output.dlssgPresetObservedValid);
+        ParseJsonInteger(status, "dlssgPresetOverrideReadCount", output.dlssgPresetOverrideReadCount);
+        ParseJsonBool(status, "dlssgPresetOverrideInstalled", output.dlssgPresetOverrideInstalled);
+        ParseJsonInteger(status, "dlssgPresetOverrideFailure", output.dlssgPresetOverrideFailure);
+        ParseJsonInteger(status, "dlssgPresetReadCount", output.dlssgPresetReadCount);
         ParseJsonBool(status, "requestedMultiplierLimited",
             output.requestedMultiplierLimited);
-        ParseJsonInteger(status, "multiplier", output.desiredMultiplier);
+        if (!haveSavedControl) ParseJsonInteger(status, "multiplier", output.desiredMultiplier);
         ParseJsonInteger(status, "appliedMultiplier",
             output.appliedMultiplier);
-        ParseJsonInteger(status, "dynamicTargetFrameRate",
-            output.dynamicTargetFrameRate);
+        if (!haveSavedControl)
+            ParseJsonInteger(status, "dynamicTargetFrameRate", output.dynamicTargetFrameRate);
+        BOOL appliedTargetValid = FALSE;
+        float appliedTarget = 0.0f;
+        if (ParseJsonBool(status, "appliedDynamicTargetValid", appliedTargetValid)
+            && appliedTargetValid
+            && ParseJsonFloat(status, "appliedDynamicTargetFrameRate", appliedTarget)
+            && appliedTarget >= 0.0f)
+        {
+            output.appliedDynamicTargetFrameRate = appliedTarget;
+            output.appliedDynamicTargetValid = TRUE;
+        }
         ParseJsonInteger(status, "requestRevision",
             output.desiredRevision);
         ParseJsonInteger(status, "appliedRevision",
@@ -600,6 +772,32 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
             output.dynamicMfgSupportKnown);
         ParseJsonBool(status, "dynamicMfgSupported",
             output.dynamicMfgSupported);
+        ParseJsonBool(status, "fgVsyncSupportKnown", output.fgVsyncSupportKnown);
+        ParseJsonBool(status, "fgVsyncSupported", output.fgVsyncSupported);
+        if (!haveSavedControl)
+        {
+            ParseJsonInteger(status, "vsyncMode", output.vsyncMode);
+            ParseJsonInteger(status, "reflexFrameLimitFps", output.reflexFrameLimitFps);
+        }
+        ParseJsonBool(status, "dynamicVsyncAvailable", output.dynamicVsyncAvailable);
+        ParseJsonBool(status, "vsyncControlAvailable", output.vsyncControlAvailable);
+        ParseJsonBool(status, "vsyncOverrideApplied", output.vsyncOverrideApplied);
+        ParseJsonBool(status, "vsyncPresentationObserved", output.vsyncPresentationObserved);
+        ParseJsonInteger(status, "vsyncOriginalInterval", output.vsyncOriginalInterval);
+        ParseJsonInteger(status, "vsyncSubmittedInterval", output.vsyncSubmittedInterval);
+        ParseJsonInteger(status, "vsyncFailure", output.vsyncFailure);
+        ParseJsonBool(status, "reflexControlAvailable", output.reflexControlAvailable);
+        ParseJsonBool(status, "reflexAppliedKnown", output.reflexAppliedKnown);
+        ParseJsonInteger(status, "reflexAppliedFrameLimitUs", output.reflexAppliedFrameLimitUs);
+        ParseJsonBool(status, "reflexLimitPending", output.reflexLimitPending);
+        ParseJsonBool(status, "reflexRestorePending", output.reflexRestorePending);
+        ParseJsonInteger(status, "reflexStatus", output.reflexStatus);
+        ParseJsonInteger(status, "reflexLastResult", output.reflexLastResult);
+        ParseJsonInteger(status, "reflexHookMask", output.reflexHookMask);
+        ParseJsonInteger(status, "reflexModuleVersionMajor", output.reflexModuleVersionMajor);
+        ParseJsonInteger(status, "reflexModuleVersionMinor", output.reflexModuleVersionMinor);
+        ParseJsonInteger(status, "reflexModuleVersionPatch", output.reflexModuleVersionPatch);
+        ParseJsonInteger(status, "reflexModuleGeneration", output.reflexModuleGeneration);
         ParseJsonBool(status, "intervalLoggingEnabled",
             output.intervalLoggingEnabled);
         ParseJsonBool(status, "intervalLogReady",
@@ -626,8 +824,8 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
             output.uiRecompositionEnabled);
         ParseJsonBool(status, "uiRecompositionForced",
             output.uiRecompositionForced);
-        ParseJsonBool(status, "generatedOnlyDebug",
-            output.generatedOnlyDebug);
+        if (!haveSavedControl)
+            ParseJsonBool(status, "generatedOnlyDebug", output.generatedOnlyDebug);
         ParseJsonBool(status, "appliedGeneratedOnlyDebug",
             output.appliedGeneratedOnlyDebug);
         std::string intervalFile;
@@ -635,7 +833,7 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
             strncpy_s(output.intervalLogFile,
                 intervalFile.c_str(), _TRUNCATE);
         std::string mode;
-        if (ParseJsonString(status, "mode", mode))
+        if (!haveSavedControl && ParseJsonString(status, "mode", mode))
             output.dynamicMode = mode == "dynamic" ? TRUE : FALSE;
         std::string appliedMode;
         if (ParseJsonString(status, "appliedMode", appliedMode))
@@ -766,39 +964,32 @@ void MergeNativeMidpointStatus(
     (void)rebuildRequired;
 }
 
-BOOL WINAPI NativeFileApplyControl(uint32_t multiplier, BOOL dynamicMode,
-    uint32_t dynamicTargetFrameRate, BOOL dynamicExperimental56,
-    BOOL generatedOnlyDebug)
+std::string NativeControlJson(uint32_t multiplier, BOOL followGame, BOOL dynamicMode,
+    uint32_t dynamicTargetFrameRate, BOOL generatedOnlyDebug, BOOL intervalLogging,
+    uint32_t preset, uint32_t vsyncMode = 0, uint32_t reflexFrameLimitFps = 0)
 {
-    const BOOL followGame = multiplier == 0 && dynamicMode == FALSE;
-    uint32_t safeMaximumMultiplier = 2;
-    std::string status;
-    if (ReadTextFile(gNativeStatusPath, status))
-        ParseJsonInteger(status, "safeMaximumMultiplier",
-            safeMaximumMultiplier);
-    safeMaximumMultiplier = std::clamp(
-        safeMaximumMultiplier, 2u, 6u);
-    multiplier = followGame
-        ? 2u : std::clamp(multiplier, 2u, safeMaximumMultiplier);
-    if (followGame || safeMaximumMultiplier < 6)
-        dynamicExperimental56 = FALSE;
-    dynamicTargetFrameRate = std::min(dynamicTargetFrameRate, 1000u);
     char content[384]{};
     const int length = std::snprintf(content, sizeof(content),
         "{\"followGame\":%s,\"mode\":\"%s\",\"multiplier\":%u,"
-        "\"dynamicTargetFrameRate\":%u,"
-        "\"dynamicExperimental56\":%s,"
-        "\"generatedOnlyDebug\":%s,\"intervalLogging\":true,"
-        "\"version\":11}\n",
+        "\"dynamicTargetFrameRate\":%u,\"dlssgPreset\":%u,"
+        "\"vsyncMode\":%u,\"reflexFrameLimitFps\":%u,"
+        "\"generatedOnlyDebug\":%s,\"intervalLogging\":%s,"
+        "\"version\":13}\n",
         followGame ? "true" : "false",
         followGame ? "follow"
             : dynamicMode ? "dynamic" : "fixed",
         multiplier,
-        dynamicTargetFrameRate, dynamicExperimental56 ? "true" : "false",
-        generatedOnlyDebug ? "true" : "false");
+        dynamicTargetFrameRate,
+        preset, vsyncMode, reflexFrameLimitFps,
+        generatedOnlyDebug ? "true" : "false", intervalLogging ? "true" : "false");
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(content))
-        return FALSE;
+        return {};
+    return std::string(content, static_cast<size_t>(length));
+}
 
+BOOL WriteNativeControl(const std::string& content)
+{
+    if (content.empty() || content.size() > 4096) return FALSE;
     std::error_code error;
     std::filesystem::create_directories(
         std::filesystem::path(gNativeConfigPath).parent_path(), error);
@@ -810,9 +1001,9 @@ BOOL WINAPI NativeFileApplyControl(uint32_t multiplier, BOOL dynamicMode,
     if (file == INVALID_HANDLE_VALUE)
         return FALSE;
     DWORD written = 0;
-    const BOOL write = WriteFile(file, content, static_cast<DWORD>(length),
+    const BOOL write = WriteFile(file, content.data(), static_cast<DWORD>(content.size()),
         &written, nullptr);
-    const BOOL flushed = write && written == static_cast<DWORD>(length)
+    const BOOL flushed = write && written == content.size()
         && FlushFileBuffers(file);
     CloseHandle(file);
     if (!flushed || !MoveFileExW(temporary.c_str(), gNativeConfigPath.c_str(),
@@ -822,6 +1013,118 @@ BOOL WINAPI NativeFileApplyControl(uint32_t multiplier, BOOL dynamicMode,
         return FALSE;
     }
     return TRUE;
+}
+
+BOOL WINAPI NativeFileApplyControl(uint32_t multiplier, BOOL dynamicMode,
+    uint32_t dynamicTargetFrameRate, BOOL dynamicExperimental56,
+    BOOL generatedOnlyDebug)
+{
+    const BOOL followGame = multiplier == 0 && dynamicMode == FALSE;
+    MfgUnlockReShadeSnapshot current{};
+    if (!NativeFileGetSnapshot(&current)) return FALSE;
+    if (current.gpuFamily != 1u && current.gpuFamily != 2u) return FALSE;
+    if (UiAmpere())
+    {
+        if (!ampere_policy::ControlValid(multiplier, dynamicMode != FALSE,
+                dynamicExperimental56 != FALSE, generatedOnlyDebug != FALSE)) return FALSE;
+    }
+    const uint32_t safeMaximumMultiplier = current.safeMaximumMultiplier;
+    if ((!followGame && multiplier > safeMaximumMultiplier)
+        || (dynamicMode && (!current.dynamicMfgSupportKnown || !current.dynamicMfgSupported
+            || (UiAmpere() && safeMaximumMultiplier < 6)))
+        || current.dlssgPresetRequested > 2)
+        return FALSE;
+    multiplier = followGame
+        ? 2u : std::clamp(multiplier, UiAmpere() ? 1u : 2u, safeMaximumMultiplier);
+    dynamicTargetFrameRate = std::min(dynamicTargetFrameRate, 1000u);
+    BOOL intervalLogging = UiAmpere() ? FALSE : TRUE;
+    if (UiAmpere())
+    {
+        std::string existingControl;
+        if (ReadTextFile(gNativeConfigPath, existingControl))
+            ParseJsonBool(existingControl, "intervalLogging", intervalLogging);
+    }
+    return WriteNativeControl(NativeControlJson(multiplier, followGame, dynamicMode,
+        dynamicTargetFrameRate, generatedOnlyDebug, intervalLogging,
+        current.dlssgPresetRequested, current.vsyncMode, current.reflexFrameLimitFps));
+}
+
+bool SetUnsignedControlField(std::string& content, const char* name, uint32_t value)
+{
+    size_t offset = 0;
+    if (FindJsonValue(content, name, offset))
+    {
+        uint32_t previous = 0;
+        if (!ParseJsonInteger(content, name, previous)) return false;
+        size_t end = offset;
+        while (end < content.size() && content[end] >= '0' && content[end] <= '9') ++end;
+        content.replace(offset, end-offset, std::to_string(value));
+    }
+    else
+    {
+        const size_t end = content.find_last_not_of(" \t\r\n");
+        if (end == std::string::npos || content[end] != '}') return false;
+        content.insert(end, std::string(",\"") + name + "\":" + std::to_string(value));
+    }
+    return true;
+}
+
+BOOL NativeFilePersistPreset(uint32_t preset)
+{
+    if (preset > 2) return FALSE;
+    std::string content;
+    if (ReadTextFile(gNativeConfigPath, content))
+    {
+        MfgUnlockReShadeSnapshot saved{};
+        if (!ParseNativeControlSnapshot(content, &saved)
+            || !SetUnsignedControlField(content, "dlssgPreset", preset)
+            || !SetUnsignedControlField(content, "version", 13)) return FALSE;
+    }
+    else
+    {
+        // Never overwrite an unreadable existing file as though it were absent.
+        const DWORD attributes = GetFileAttributesW(gNativeConfigPath.c_str());
+        const DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+        if (attributes != INVALID_FILE_ATTRIBUTES
+            || (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)) return FALSE;
+        MfgUnlockReShadeSnapshot current{};
+        if (!NativeFileGetSnapshot(&current)) return FALSE;
+        content = NativeControlJson(current.desiredMultiplier, current.followGameMode,
+            current.dynamicMode, current.dynamicTargetFrameRate, current.generatedOnlyDebug,
+            current.intervalLoggingEnabled, preset, current.vsyncMode, current.reflexFrameLimitFps);
+    }
+    // Preset changes do not need Dynamic capability or an active FG feature.
+    // Preserve the saved request and let the backend's immutable preset state
+    // decide whether the choice belongs to this process or the next restart.
+    return WriteNativeControl(content);
+}
+
+BOOL NativeFilePersistPresentation(uint32_t vsyncMode, uint32_t reflexFrameLimitFps)
+{
+    if (vsyncMode > 2 || reflexFrameLimitFps > 1000) return FALSE;
+    std::string content;
+    if (ReadTextFile(gNativeConfigPath, content))
+    {
+        MfgUnlockReShadeSnapshot saved{};
+        if (!ParseNativeControlSnapshot(content, &saved)
+            || !SetUnsignedControlField(content, "vsyncMode", vsyncMode)
+            || !SetUnsignedControlField(content, "reflexFrameLimitFps", reflexFrameLimitFps)
+            || !SetUnsignedControlField(content, "version", 13)) return FALSE;
+    }
+    else
+    {
+        const DWORD attributes = GetFileAttributesW(gNativeConfigPath.c_str());
+        const DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+        if (attributes != INVALID_FILE_ATTRIBUTES
+            || (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)) return FALSE;
+        MfgUnlockReShadeSnapshot current{};
+        if (!NativeFileGetSnapshot(&current)) return FALSE;
+        content = NativeControlJson(current.desiredMultiplier, current.followGameMode,
+            current.dynamicMode, current.dynamicTargetFrameRate, current.generatedOnlyDebug,
+            current.intervalLoggingEnabled, current.dlssgPresetRequested,
+            vsyncMode, reflexFrameLimitFps);
+    }
+    return WriteNativeControl(content);
 }
 
 void WINAPI NativeFileSetFrontendAttached(BOOL)
@@ -861,8 +1164,13 @@ bool ConnectBackend() noexcept
         return true;
     }
 #if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
-    HMODULE core = GetModuleHandleW(L"RTX40MFGCore.dll");
-    HMODULE shim = GetModuleHandleW(L"RTX40MFG.asi");
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    HMODULE core = gSelf;
+    HMODULE shim = gSelf;
+#else
+    HMODULE core = GetModuleHandleW(MFG_CORE_W);
+    HMODULE shim = GetModuleHandleW(MFG_SHIM_W);
+#endif
     if (!core || !shim || !GetProcAddress(core, "MfgUnlockCoreLoaded")
         || !ResolveNativeFilePaths())
     {
@@ -988,7 +1296,7 @@ bool ConnectBackend() noexcept
             }
             path.resize(pathLength);
             if (_wcsicmp(std::filesystem::path(path).filename().c_str(),
-                    L"RTX40MFG.asi") != 0)
+                    MFG_SHIM_W) != 0)
             {
                 continue;
             }
@@ -1062,6 +1370,7 @@ void DisconnectBackend() noexcept
 }
 #endif
 
+#if !defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 bool IsD3D12(reshade::api::device* device) noexcept
 {
     return device && device->get_api() == reshade::api::device_api::d3d12;
@@ -1313,6 +1622,8 @@ bool ExistingMfgBackendPresent(HMODULE self) noexcept
     return false;
 }
 
+#endif // ReShade graphics/event host
+
 void PersistSettings(reshade::api::effect_runtime* runtime)
 {
     reshade::set_config_value(runtime, kConfigSection,
@@ -1328,8 +1639,6 @@ void PersistSettings(reshade::api::effect_runtime* runtime)
     reshade::set_config_value(runtime, kConfigSection,
         "DynamicCustomTargetFrameRate", gDynamicCustomTargetFrameRate);
     reshade::set_config_value(runtime, kConfigSection,
-        "DynamicExperimental56", gDynamicExperimental56);
-    reshade::set_config_value(runtime, kConfigSection,
         "GeneratedOnlyDebug", gGeneratedOnlyDebug);
 }
 
@@ -1338,15 +1647,28 @@ void ApplySettings(reshade::api::effect_runtime* runtime, bool persist)
     int safeMaximumMultiplier = 6;
 #if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
     MfgUnlockReShadeSnapshot capacity{};
-    if (BackendGetSnapshot(&capacity))
+    if (!BackendGetSnapshot(&capacity))
     {
-        safeMaximumMultiplier = std::clamp(
-            static_cast<int>(capacity.safeMaximumMultiplier), 2, 6);
+        if (persist)
+        {
+            gLastApplyAttempted = true;
+            gLastApplyAccepted = false;
+            gLastNativeConfigPersisted = false;
+        }
+        return;
     }
+    safeMaximumMultiplier = std::clamp(
+        static_cast<int>(capacity.safeMaximumMultiplier), 2, 6);
 #endif
-    gMultiplier = std::clamp(gMultiplier, 2, safeMaximumMultiplier);
-    if (gFollowGameMode || safeMaximumMultiplier < 6)
-        gDynamicExperimental56 = false;
+    if (UiAmpere())
+    {
+        gMultiplier = std::clamp(gMultiplier, 1, 6);
+    }
+    else
+    {
+        gMultiplier = std::clamp(gMultiplier, 2, safeMaximumMultiplier);
+    }
+    gDynamicExperimental56 = false;
     gDynamicCustomTargetFrameRate = std::clamp(
         gDynamicCustomTargetFrameRate, 1, 1000);
     gDynamicTargetFrameRate = gDynamicLockToRefreshRate
@@ -1383,25 +1705,39 @@ void ApplySettings(reshade::api::effect_runtime* runtime, bool persist)
 #endif
         gLastApplyAttempted = true;
         gLastApplyAccepted = accepted != FALSE;
-        PersistSettings(runtime);
+        if (accepted) PersistSettings(runtime);
     }
 }
 
 void LoadSettings()
 {
+    gPresetSaveFailed = false;
+    gPresentationSaveFailed = false;
     gDefaultDockInitialized = false;
     reshade::get_config_value(nullptr, kConfigSection,
         "DefaultDockInitialized", gDefaultDockInitialized);
 
     MfgUnlockReShadeSnapshot snapshot{};
-    const bool snapshotLoaded = BackendGetSnapshot(&snapshot) != FALSE;
+    bool snapshotLoaded = BackendGetSnapshot(&snapshot) != FALSE;
+#if defined(MFG_UNLOCK_RESHADE_UI_CLIENT)
+    // Saved intent is independent of a transient status-file read failure.
+    if (BackendUsesNativeFile())
+    {
+        MfgUnlockReShadeSnapshot saved{};
+        if (ReadNativeControlSnapshot(&saved)) { snapshot = saved; snapshotLoaded = true; }
+    }
+#endif
     if (snapshotLoaded)
     {
         gFollowGameMode = snapshot.followGameMode != FALSE;
         gMultiplier = static_cast<int>(snapshot.desiredMultiplier);
         gDynamicMode = snapshot.dynamicMode != FALSE;
+        gDlssgPreset = static_cast<int>(snapshot.dlssgPresetRequested);
+        gVsyncMode = static_cast<int>(snapshot.vsyncMode);
+        gReflexFrameLimitFps = static_cast<int>(snapshot.reflexFrameLimitFps);
         gDynamicTargetFrameRate = static_cast<int>(
             snapshot.dynamicTargetFrameRate);
+        if (gReflexFrameLimitFps > 0) gReflexCustomLimitFps = gReflexFrameLimitFps;
         gDynamicLockToRefreshRate = gDynamicTargetFrameRate == 0;
         if (!gDynamicLockToRefreshRate)
         {
@@ -1415,16 +1751,16 @@ void LoadSettings()
         }
         gDynamicCustomTargetFrameRate = std::clamp(
             gDynamicCustomTargetFrameRate, 1, 1000);
-        gDynamicExperimental56 = snapshot.dynamicExperimental56 != FALSE;
+        gDynamicExperimental56 = false;
         gGeneratedOnlyDebug = snapshot.generatedOnlyDebug != FALSE;
     }
 
 #if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
-    // The early-loaded core owns the V1.2 Release control file. ReShade may
+    // The early-loaded core owns the universal control file. ReShade may
     // initialize much later, so stale ReShade.ini values must not overwrite
     // the request which was already consumed during Streamline startup.
-    if (snapshotLoaded)
-        return;
+    // No startup/migration write is allowed merely because status is absent.
+    return;
 #endif
 
     reshade::get_config_value(nullptr, kConfigSection,
@@ -1446,8 +1782,6 @@ void LoadSettings()
         gDynamicCustomTargetFrameRate, 1, 1000);
     gDynamicTargetFrameRate = gDynamicLockToRefreshRate
         ? 0 : gDynamicCustomTargetFrameRate;
-    reshade::get_config_value(nullptr, kConfigSection,
-        "DynamicExperimental56", gDynamicExperimental56);
     reshade::get_config_value(nullptr, kConfigSection,
         "GeneratedOnlyDebug", gGeneratedOnlyDebug);
     ApplySettings(nullptr, false);
@@ -1481,6 +1815,191 @@ const char* YesNo(BOOL value) noexcept
     return value ? "yes" : "no";
 }
 
+const char* DlssgPresetName(uint32_t preset) noexcept
+{
+    switch (preset)
+    {
+    case 0: return "Game / driver";
+    case 1: return "A";
+    case 2: return "B";
+    default: return "Unknown";
+    }
+}
+
+void DrawPresetStatus(const MfgUnlockReShadeSnapshot& snapshot)
+{
+    if (UiAmpere() && snapshot.ampereLegacySinglePreset)
+    {
+        ImGui::TextUnformatted("This DLSS-G provider supports its original preset only.");
+        if (snapshot.dlssgPresetObservedValid && snapshot.dlssgPresetObserved == 1)
+            ImGui::TextUnformatted("DLSS-G preset: original (observed)");
+        else
+            ImGui::TextUnformatted("DLSS-G preset: original (waiting for provider)");
+        if (snapshot.dlssgPresetRequested == 2)
+            ImGui::TextUnformatted("Preset B remains saved for providers that support it.");
+        return;
+    }
+    if (snapshot.dlssgPresetSelectionFrozen
+        && snapshot.dlssgPresetRequested != snapshot.dlssgPresetLatched)
+    {
+        if (snapshot.dlssgPresetRequested == 0)
+            ImGui::TextWrapped("The game / driver preset is saved. Restart the game to use it.");
+        else
+            ImGui::TextWrapped("Preset %s is saved. Restart the game to use it.",
+                DlssgPresetName(snapshot.dlssgPresetRequested));
+    }
+    const uint32_t activePreset = snapshot.dlssgPresetSelectionFrozen
+        ? snapshot.dlssgPresetLatched : snapshot.dlssgPresetRequested;
+    if (activePreset == 0)
+        ImGui::TextUnformatted("DLSS-G preset: managed by the game / driver");
+    else if (snapshot.dlssgPresetObservedValid && snapshot.dlssgPresetObserved == activePreset
+        && snapshot.dlssgPresetOverrideReadCount > 0)
+        ImGui::Text("DLSS-G preset: %s (override supplied)", DlssgPresetName(activePreset));
+    else if (snapshot.dlssgPresetOverrideFailure != 0)
+        ImGui::Text("DLSS-G Preset %s override unavailable", DlssgPresetName(activePreset));
+    else
+        ImGui::Text("DLSS-G preset: %s (waiting for provider)", DlssgPresetName(activePreset));
+}
+
+void DrawPresetControls(MfgUnlockReShadeSnapshot snapshot, bool statusStale)
+{
+#if defined(MFG_UNLOCK_RESHADE_UI_CLIENT) && MFG_UNLOCK_RUNTIME_GPU_SELECTION
+    if (!statusStale && snapshot.dlssgPresetRequested <= 2)
+        gDlssgPreset = static_cast<int>(snapshot.dlssgPresetRequested);
+    const int previous = gDlssgPreset;
+    bool changed = false;
+    static const char* options[] = {"Game / driver default", "Preset A", "Preset B"};
+    const bool legacyPreset = UiAmpere() && snapshot.ampereLegacySinglePreset;
+    ImGui::BeginDisabled(statusStale || legacyPreset);
+    if (ImGui::BeginCombo("DLSS-G preset", legacyPreset ? "Original preset" : options[std::clamp(gDlssgPreset, 0, 2)]))
+    {
+        for (int preset = 0; preset <= 2; ++preset)
+        {
+            if (ImGui::Selectable(options[preset], gDlssgPreset == preset))
+            {
+                gDlssgPreset = preset;
+                changed = preset != previous;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (changed)
+    {
+        const BOOL saved = NativeFilePersistPreset(static_cast<uint32_t>(gDlssgPreset));
+        gLastApplyAttempted = true;
+        gLastApplyAccepted = saved != FALSE;
+        gLastNativeConfigPersisted = saved != FALSE;
+        gPresetSaveFailed = !saved;
+        if (!saved) gDlssgPreset = previous;
+    }
+    snapshot.dlssgPresetRequested = static_cast<uint32_t>(gDlssgPreset);
+#endif
+    DrawPresetStatus(snapshot);
+    if (gPresetSaveFailed)
+        ImGui::TextUnformatted("The preset selection could not be saved.");
+}
+
+const char* ReflexPendingMessage(uint32_t status)
+{
+    switch (static_cast<reflex_control::Status>(status))
+    {
+    case reflex_control::Status::eWaitingForModule: return "Waiting for the game's Reflex plugin.";
+    case reflex_control::Status::eUnsupportedModule: return "The loaded Reflex plugin version is unsupported.";
+    case reflex_control::Status::eHookUnavailable: return "Reflex controls are unavailable for this plugin.";
+    case reflex_control::Status::eIneligible: return "The Reflex limit is unavailable for the current FG runtime.";
+    case reflex_control::Status::eWaitingForGameOptions: return "Waiting for game Reflex settings. Change the game's Reflex setting once to retry.";
+    case reflex_control::Status::eWaitingForThread: return "Waiting for the game's Reflex settings thread.";
+    case reflex_control::Status::eWaitingForAvailability: return "Waiting for Reflex availability.";
+    case reflex_control::Status::eUnavailable: return "Reflex is unavailable.";
+    case reflex_control::Status::eRestorePending: return "Restoring the game's Reflex limit...";
+    case reflex_control::Status::eCallRejected: return "The game rejected the Reflex limit.";
+    case reflex_control::Status::eUnknownShape: return "The game's Reflex settings cannot be safely replayed.";
+    case reflex_control::Status::eStaleRoute: return "The Reflex plugin changed. Restart the game.";
+    case reflex_control::Status::eBusy: return "Waiting for the next safe Reflex update.";
+    default: return "Waiting for the game to accept the Reflex limit.";
+    }
+}
+
+void DrawPresentationControls(const MfgUnlockReShadeSnapshot& snapshot, bool statusStale)
+{
+#if defined(MFG_UNLOCK_RESHADE_UI_CLIENT)
+    if (!BackendUsesNativeFile()) return;
+    if (!statusStale)
+    {
+        gVsyncMode = static_cast<int>(snapshot.vsyncMode);
+        gReflexFrameLimitFps = static_cast<int>(snapshot.reflexFrameLimitFps);
+    }
+    const int previousLimit = gReflexFrameLimitFps;
+    bool changed = false;
+    ImGui::BeginDisabled(statusStale);
+    const bool dynamic = snapshot.dynamicMode || snapshot.appliedDynamicMode;
+    ImGui::BeginDisabled(dynamic);
+    bool limitEnabled = gReflexFrameLimitFps > 0;
+    if (ImGui::Checkbox("Limit FPS with Reflex", &limitEnabled) && !dynamic)
+    {
+        gReflexFrameLimitFps = limitEnabled ? std::clamp(gReflexCustomLimitFps, 1, 1000) : 0;
+        changed = true;
+    }
+    if (limitEnabled)
+    {
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::DragInt("Reflex limit (FPS)", &gReflexCustomLimitFps,
+            1.0f, 1, 1000);
+        if (ImGui::IsItemDeactivatedAfterEdit() && !dynamic)
+        {
+            gReflexCustomLimitFps = std::clamp(gReflexCustomLimitFps, 1, 1000);
+            gReflexFrameLimitFps = gReflexCustomLimitFps;
+            changed = true;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (changed)
+    {
+        const BOOL saved = NativeFilePersistPresentation(static_cast<uint32_t>(gVsyncMode),
+            static_cast<uint32_t>(gReflexFrameLimitFps));
+        gLastApplyAttempted = true;
+        gLastApplyAccepted = saved != FALSE;
+        gLastNativeConfigPersisted = saved != FALSE;
+        gPresentationSaveFailed = !saved;
+        if (!saved) gReflexFrameLimitFps = previousLimit;
+    }
+    if (dynamic)
+        ImGui::TextUnformatted("Reflex limit is paused while Dynamic MFG is enabled. The saved limit is retained.");
+    if (gReflexFrameLimitFps > 0)
+    {
+        ImGui::Text("Reflex limit request: %d FPS", gReflexFrameLimitFps);
+        const uint32_t requestedUs = (1000000u + gReflexFrameLimitFps - 1u) / gReflexFrameLimitFps;
+        if (!dynamic && !statusStale && !changed && snapshot.reflexAppliedKnown && !snapshot.reflexLimitPending
+            && !snapshot.reflexRestorePending && snapshot.reflexAppliedFrameLimitUs == requestedUs
+            && snapshot.reflexStatus == static_cast<uint32_t>(reflex_control::Status::eApplied))
+            ImGui::Text("Accepted Reflex limit: %.2f FPS", 1000000.0 / snapshot.reflexAppliedFrameLimitUs);
+        else if (snapshot.reflexRestorePending)
+            ImGui::TextUnformatted("Restoring the game's Reflex limit...");
+        else if (!dynamic)
+            ImGui::TextUnformatted(statusStale ? "Reflex status is temporarily unavailable."
+                : ReflexPendingMessage(snapshot.reflexStatus));
+    }
+    else if (snapshot.reflexRestorePending)
+        ImGui::TextUnformatted("Restoring the game's Reflex limit...");
+    if (gPresentationSaveFailed)
+        ImGui::TextUnformatted("The presentation settings could not be saved.");
+#endif
+}
+
+void DrawPresentationDebug(const MfgUnlockReShadeSnapshot& snapshot)
+{
+    ImGui::Text("Reflex: available=%u accepted=%u limit=%u us pending=%u restore=%u status=%u result=%d",
+        snapshot.reflexControlAvailable, snapshot.reflexAppliedKnown, snapshot.reflexAppliedFrameLimitUs,
+        snapshot.reflexLimitPending, snapshot.reflexRestorePending, snapshot.reflexStatus,
+        snapshot.reflexLastResult);
+    ImGui::Text("Reflex module: %u.%u.%u generation=%llu hooks=0x%X",
+        snapshot.reflexModuleVersionMajor, snapshot.reflexModuleVersionMinor,
+        snapshot.reflexModuleVersionPatch, static_cast<unsigned long long>(snapshot.reflexModuleGeneration),
+        snapshot.reflexHookMask);
+}
+
 void DrawSettings(reshade::api::effect_runtime* runtime)
 {
     gOverlayVisitedThisFrame = true;
@@ -1493,25 +2012,84 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
 
     MfgUnlockReShadeSnapshot snapshot{};
-    if (!BackendGetSnapshot(&snapshot))
-    {
+    bool haveSnapshot = BackendGetSnapshot(&snapshot) != FALSE;
+    bool statusStale = false;
+    bool nativeFile = false;
 #if defined(MFG_UNLOCK_RESHADE_UI_CLIENT)
-        ImGui::TextUnformatted("RTX40MFG backend is not loaded.");
+    nativeFile = BackendUsesNativeFile();
+    if (nativeFile)
+    {
+        if (gLastNativeDisplayPath != gNativeStatusPath)
+        {
+            gLastNativeDisplayPath = gNativeStatusPath;
+            gHaveNativeDisplay = false;
+        }
+        if (haveSnapshot)
+        {
+            gLastNativeDisplay = snapshot;
+            gHaveNativeDisplay = true;
+        }
+        else
+        {
+            statusStale = true;
+            if (gHaveNativeDisplay) { snapshot = gLastNativeDisplay; haveSnapshot = true; }
+        }
+    }
+#endif
+    if (!haveSnapshot)
+    {
+        if (nativeFile)
+        {
+            ImGui::TextUnformatted("Waiting for current backend status. Saved settings are preserved.");
+            return;
+        }
+#if defined(MFG_UNLOCK_RESHADE_UI_CLIENT)
+        ImGui::TextUnformatted(MFG_PRODUCT " backend is not loaded.");
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+        ImGui::TextWrapped("The integrated core is unavailable. Check the "
+            "startup log and restart the game with one " MFG_PRODUCT " module.");
+#else
         ImGui::TextWrapped("The UI loaded correctly. Install "
-            "RTX40MFG.asi through Ultimate ASI Loader and fully "
+            MFG_PRODUCT ".asi through Ultimate ASI Loader and fully "
             "restart the game.");
+#endif
 #else
         ImGui::TextUnformatted("Native bridge snapshot is unavailable.");
 #endif
         return;
     }
 
+    if (snapshot.gpuFamily == 2u)
+        ImGui::TextUnformatted("Ampere (RTX 30) - experimental");
+    else if (snapshot.gpuFamily == 1u)
+        ImGui::TextUnformatted("Ada (RTX 40)");
+    else if (snapshot.gpuFamily == 3u)
+    {
+        ImGui::TextWrapped("The game changed graphics adapters. Restart the game to select a new GPU.");
+        return;
+    }
+    else
+        ImGui::TextUnformatted("Waiting for a supported game GPU");
+
+    if (std::strcmp(snapshot.patchRoute, "remix") == 0)
+    {
+        ImGui::TextUnformatted("RTX Remix detected");
+        ImGui::TextWrapped("Frame generation and its multiplier are managed "
+            "in the RTX Remix menu.");
+        ImGui::Text("Provider patch: %s", snapshot.backportReadyAtCreate
+            ? "ready at feature creation" : "waiting for frame generation");
+        DrawPresetControls(snapshot, statusStale);
+        return;
+    }
     const int safeMaximumMultiplier = std::clamp(
         static_cast<int>(snapshot.safeMaximumMultiplier), 2, 6);
     const bool dynamicCapabilityKnown =
         snapshot.dynamicMfgSupportKnown != FALSE;
     const bool dynamicSupported = dynamicCapabilityKnown
-        && snapshot.dynamicMfgSupported != FALSE;
+        && snapshot.dynamicMfgSupported != FALSE
+        && (!UiAmpere() || safeMaximumMultiplier == 6);
+    const bool dynamicUnsupported = dynamicCapabilityKnown && !dynamicSupported
+        && snapshot.activeWrapperObserved && snapshot.bridgeReady;
     if (snapshot.nvidiaCompatibilityResolved)
     {
         if (snapshot.nvidiaCompatibilityTier == 4
@@ -1539,31 +2117,45 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     {
         ImGui::TextUnformatted("Available maximum: detecting active wrapper");
     }
-    ImGui::Text("Frame Generation: %s",
+    ImGui::Text("Frame Generation: %s (game intent: %s)",
+        snapshot.appliedFrameGenerationOn ? "On" : "Off",
         snapshot.gameFrameGenerationOn ? "On" : "Off");
+    DrawPresetControls(snapshot, statusStale);
+    DrawPresentationControls(snapshot, statusStale);
     const bool fpsSampleCurrent = snapshot.realFpsMilli > 0
-        && snapshot.dlssFpsMilli > 0
         && snapshot.fpsSampleAgeMs <= 2000;
-    if (snapshot.gameFrameGenerationOn && fpsSampleCurrent)
+    if (snapshot.appliedFrameGenerationOn && fpsSampleCurrent)
     {
-        ImGui::Text("FPS: %.1f real | %.1f DLSS",
-            static_cast<double>(snapshot.realFpsMilli) / 1000.0,
-            static_cast<double>(snapshot.dlssFpsMilli) / 1000.0);
+        if (snapshot.dlssFpsMilli > 0)
+            ImGui::Text("FPS: %.1f real | %.1f DLSS",
+                static_cast<double>(snapshot.realFpsMilli) / 1000.0,
+                static_cast<double>(snapshot.dlssFpsMilli) / 1000.0);
+        else
+            ImGui::Text("FPS: %.1f real | DLSS unavailable",
+                static_cast<double>(snapshot.realFpsMilli) / 1000.0);
     }
 #if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
-    else if (snapshot.gameFrameGenerationOn && gSampleFrameTelemetry)
+    else if (snapshot.appliedFrameGenerationOn && gSampleFrameTelemetry)
     {
         ImGui::TextUnformatted("FPS: measuring...");
     }
 #endif
-    if (snapshot.statusProtocolVersion < 18)
+    if (snapshot.statusProtocolVersion != MFG_STATUS_VERSION_NUMBER)
     {
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+        ImGui::TextWrapped("Restart with the matching single-module build. "
+            "The current status protocol is older than this UI expects.");
+#else
         ImGui::TextWrapped("Update RTX40MFG.asi and RTX40MFGCore.dll "
             "together; the loaded core uses an older protocol.");
+#endif
     }
     else if (!snapshot.bridgeReady)
     {
-        ImGui::TextUnformatted("Waiting for an active DLSS-G pipeline.");
+        ImGui::TextUnformatted(snapshot.universalRouteFailure
+            == static_cast<uint32_t>(universal_route_policy::Failure::eAwaitingOptionsRequest)
+            ? "Waiting for the game to request Frame Generation."
+            : "Waiting for an active DLSS-G pipeline.");
     }
     if (snapshot.streamlineRebuildRequired
         || snapshot.pipelineMayPredateDetour)
@@ -1573,90 +2165,140 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
 
     ImGui::Separator();
+    // Keep an already-open popup and its appearance stable across a missed
+    // read. Disabled input prevents cached capabilities from authorizing writes.
+    ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 1.0f);
+    ImGui::BeginDisabled(statusStale);
     bool settingsChanged = false;
     static const char* fixedModes[] = {
         "2x", "3x", "4x", "5x", "6x"
     };
-    if (gDynamicMode && dynamicCapabilityKnown && !dynamicSupported)
+    // Capability can disappear in menus and during map transitions. Rendering
+    // that state must not overwrite the user's persisted Dynamic request.
+    if (UiAmpere())
     {
-        gFollowGameMode = true;
-        gDynamicMode = false;
+        gFollowGameMode = false;
         gDynamicExperimental56 = false;
-        settingsChanged = true;
-    }
-
-    const char* dynamicLabel = dynamicSupported
-        ? "Dynamic"
-        : dynamicCapabilityKnown
-            ? "Dynamic (unavailable)"
-            : "Dynamic (checking...)";
-    const char* currentMode = gFollowGameMode
-        ? "Follow game"
-        : gDynamicMode
-            ? dynamicLabel
-            : fixedModes[
-                std::clamp(gMultiplier, 2, safeMaximumMultiplier) - 2];
-    if (ImGui::BeginCombo("MFG mode", currentMode))
-    {
-        if (ImGui::Selectable("Follow game", gFollowGameMode))
+        gGeneratedOnlyDebug = false;
+        static const char* ampereModes[]{"Off", "2x FG", "3x MFG", "4x MFG",
+            "5x MFG (experimental)", "6x MFG (experimental)"};
+        const char* dynamicLabel = dynamicSupported ? "Dynamic"
+            : dynamicCapabilityKnown ? "Dynamic (unavailable)" : "Dynamic (checking...)";
+        const char* selectedMode = gDynamicMode ? dynamicLabel : ampereModes[std::clamp(gMultiplier, 1, 6) - 1];
+        if (ImGui::BeginCombo("Frame Generation", selectedMode))
         {
-            gFollowGameMode = true;
-            gDynamicMode = false;
-            settingsChanged = true;
-        }
-        for (int multiplier = 2; multiplier <= safeMaximumMultiplier;
-             ++multiplier)
-        {
-            const bool selected = !gFollowGameMode && !gDynamicMode
-                && gMultiplier == multiplier;
-            if (ImGui::Selectable(fixedModes[multiplier - 2], selected))
+            for (int value = 1; value <= 6; ++value)
             {
-                gFollowGameMode = false;
+                ImGui::BeginDisabled(value > safeMaximumMultiplier);
+                if (ImGui::Selectable(ampereModes[value - 1], !gDynamicMode && gMultiplier == value)
+                    && value <= safeMaximumMultiplier)
+                { gMultiplier = value; gDynamicMode = false; settingsChanged = true; }
+                ImGui::EndDisabled();
+            }
+            ImGui::BeginDisabled(!dynamicSupported);
+            if (ImGui::Selectable(dynamicLabel, gDynamicMode) && dynamicSupported)
+            { gMultiplier = std::max(gMultiplier, 2); gDynamicMode = true; settingsChanged = true; }
+            ImGui::EndDisabled();
+            ImGui::EndCombo();
+        }
+    }
+    else
+    {
+        const char* dynamicLabel = dynamicSupported
+            ? "Dynamic"
+            : dynamicUnsupported
+                ? "Dynamic (not supported)"
+                : "Dynamic (checking...)";
+        const char* currentMode = gFollowGameMode
+            ? "Follow game"
+            : gDynamicMode
+                ? dynamicLabel
+                : fixedModes[
+                    std::clamp(gMultiplier, 2, safeMaximumMultiplier) - 2];
+        if (ImGui::BeginCombo("MFG mode", currentMode))
+        {
+            if (ImGui::Selectable("Follow game", gFollowGameMode))
+            {
+                gFollowGameMode = true;
                 gDynamicMode = false;
-                gMultiplier = multiplier;
                 settingsChanged = true;
             }
+            for (int multiplier = 2; multiplier <= safeMaximumMultiplier;
+                 ++multiplier)
+            {
+                const bool selected = !gFollowGameMode && !gDynamicMode
+                    && gMultiplier == multiplier;
+                if (ImGui::Selectable(fixedModes[multiplier - 2], selected))
+                {
+                    gFollowGameMode = false;
+                    gDynamicMode = false;
+                    gMultiplier = multiplier;
+                    settingsChanged = true;
+                }
+            }
+            ImGui::BeginDisabled(!dynamicSupported);
+            if (ImGui::Selectable(dynamicLabel, gDynamicMode)
+                && dynamicSupported)
+            {
+                gFollowGameMode = false;
+                gDynamicMode = true;
+                settingsChanged = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::EndCombo();
         }
-        ImGui::BeginDisabled(!dynamicSupported);
-        if (ImGui::Selectable(dynamicLabel, gDynamicMode)
-            && dynamicSupported)
+        if (dynamicUnsupported)
         {
-            gFollowGameMode = false;
-            gDynamicMode = true;
-            settingsChanged = true;
+            ImGui::TextWrapped("This game does not support Dynamic MFG.");
         }
-        ImGui::EndDisabled();
-        ImGui::EndCombo();
+        else if (!gFollowGameMode && gDynamicMode && !dynamicSupported)
+        {
+            ImGui::TextUnformatted(
+                "Dynamic selection is saved; waiting for runtime support.");
+        }
+        if (snapshot.activeWrapperObserved && safeMaximumMultiplier < 6)
+        {
+            const char* modes = safeMaximumMultiplier < 5 ? "5x or 6x MFG" : "6x MFG";
+            if (snapshot.nvidiaCompatibilityResolved && snapshot.nvidiaPolicyCeilingMultiplier > 0
+                && snapshot.nvidiaPolicyCeilingMultiplier < 6)
+                ImGui::TextWrapped("This game does not support %s.", modes);
+            else if (!snapshot.compatibilityFallback && snapshot.wrapperNativeMaximumMultiplier > 0
+                && snapshot.wrapperNativeMaximumMultiplier < 6)
+                ImGui::TextWrapped("This game does not support %s with its current Frame Generation integration.", modes);
+            else
+                ImGui::TextWrapped("%s is unavailable with the current Frame Generation setup (limited to %dx).",
+                    safeMaximumMultiplier < 5 ? "5x/6x MFG" : "6x MFG", safeMaximumMultiplier);
+        }
     }
-    if (dynamicCapabilityKnown && !dynamicSupported)
+    if (!gFollowGameMode && gDynamicMode)
     {
-        ImGui::TextUnformatted(
-            "Dynamic mode is not supported by this game.");
-    }
-    if (!gFollowGameMode && gDynamicMode && dynamicSupported)
-    {
-        if (ImGui::Checkbox("Lock target to refresh rate",
+        ImGui::BeginDisabled(!dynamicSupported);
+        if (ImGui::Checkbox("Use display refresh rate as target",
                 &gDynamicLockToRefreshRate))
         {
             settingsChanged = true;
         }
         if (!gDynamicLockToRefreshRate)
         {
-            ImGui::DragInt("Custom target FPS",
+            ImGui::DragInt("Target FPS",
                 &gDynamicCustomTargetFrameRate, 1.0f, 1, 1000);
             if (ImGui::IsItemDeactivatedAfterEdit())
                 settingsChanged = true;
         }
-        if (safeMaximumMultiplier >= 6)
-        {
-            if (ImGui::Checkbox("Enable Dynamic 5X/6X (experimental)",
-                    &gDynamicExperimental56))
-            {
-                settingsChanged = true;
-            }
-        }
+        ImGui::EndDisabled();
+        if (gDynamicLockToRefreshRate)
+            ImGui::TextUnformatted("Requested Dynamic target: display refresh rate");
+        else
+            ImGui::Text("Requested Dynamic target: %d FPS", gDynamicCustomTargetFrameRate);
+        if (!snapshot.appliedDynamicTargetValid)
+            ImGui::TextUnformatted("Applied Dynamic target: waiting for an accepted Dynamic request");
+        else if (snapshot.appliedDynamicTargetFrameRate == 0.0f)
+            ImGui::TextUnformatted("Applied Dynamic target: display refresh rate");
+        else
+            ImGui::Text("Applied Dynamic target: %.2f FPS", snapshot.appliedDynamicTargetFrameRate);
+        ImGui::TextWrapped("Dynamic adjusts frame generation toward this target; it does not set a hard FPS limit.");
     }
-    if (gLastApplyAttempted
+    if (gLastApplyAttempted && !gPresetSaveFailed
         && (!gLastApplyAccepted || !gLastNativeConfigPersisted))
     {
         if (gLastApplyAccepted)
@@ -1671,10 +2313,66 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
 #if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
     if (ImGui::CollapsingHeader("Debug"))
     {
-        if (ImGui::Checkbox("Generated frames only",
-                &gGeneratedOnlyDebug))
+        ImGui::Text("Runtime FG V-Sync capability: %s", !snapshot.fgVsyncSupportKnown
+            ? "unknown" : snapshot.fgVsyncSupported ? "supported" : "unavailable");
+        DrawPresentationDebug(snapshot);
+        if (UiAmpere())
         {
-            settingsChanged = true;
+            ImGui::Text("Ampere SM86 | D3D12 | FG preset: %s",
+                snapshot.ampereLegacySinglePreset ? "Original preset"
+                    : DlssgPresetName(snapshot.dlssgPresetSelectionFrozen
+                        ? snapshot.dlssgPresetLatched : snapshot.dlssgPresetRequested));
+            ImGui::Text("Ampere provider: %s | Preset query: %s",
+                snapshot.ampereProgramReadyMfg ? "MFG program prepared" : "pending",
+                snapshot.presetQueries ? "observed" : "pending");
+            ImGui::Text("Kernel program: %s | Cache status: %u", snapshot.ampereKernelImage == 2 ? "native SM86"
+                : snapshot.ampereKernelImage == 1 ? "SM86 PTX" : "pending", snapshot.ampereNativeCacheStatus);
+            if (snapshot.ampereFailure)
+                ImGui::TextWrapped("Ampere failure: %u (%s)", snapshot.ampereFailure,
+                    ampere_diagnostics::FailureName(snapshot.ampereFailure));
+            ImGui::Text("Create attempts: %llu | blocked before NGX: %llu | created: %llu",
+                static_cast<unsigned long long>(snapshot.ampereCreateAttempts),
+                static_cast<unsigned long long>(snapshot.ampereCreateBlockedBeforeProvider),
+                static_cast<unsigned long long>(snapshot.ampereCreatedFeatures));
+            ImGui::Text("Evaluation attempts: %llu | accepted: %llu",
+                static_cast<unsigned long long>(snapshot.ampereEvaluateAttempts),
+                static_cast<unsigned long long>(snapshot.ampereEvaluations));
+            if (snapshot.ampereCandidateVersionMajor)
+                ImGui::Text("Observed provider candidate: %u.%u.%u",
+                    snapshot.ampereCandidateVersionMajor, snapshot.ampereCandidateVersionMinor,
+                    snapshot.ampereCandidateVersionBuild);
+            ImGui::Text("Program preparation: %s (%u)",
+                ampere_diagnostics::PreparationName(snapshot.amperePreparationStage), snapshot.amperePreparationStage);
+            if (snapshot.ampereStartupFailureMask)
+                ImGui::TextWrapped("Startup incomplete: %s%s%s%s%s%s%s%s",
+                    (snapshot.ampereStartupFailureMask & 0x01u) ? "Streamline startup; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x02u) ? "NGX runtime route; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x04u) ? "provider route; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x08u) ? "startup capacity; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x10u) ? "D3D12 device; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x20u) ? "Ampere adapter; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x40u) ? "kernel program; " : "",
+                    (snapshot.ampereStartupFailureMask & 0x80u) ? "fatal boundary; " : "");
+            if (snapshot.amperePrimaryFailure)
+                ImGui::TextWrapped("Current first failure: %u (%s) | NGX: 0x%08X",
+                    snapshot.amperePrimaryFailure, ampere_diagnostics::FailureName(snapshot.amperePrimaryFailure),
+                    snapshot.amperePrimaryNgxResult);
+            if (snapshot.ampereFirstFailure)
+                ImGui::TextWrapped("First failure this run: %u (%s) | NGX: 0x%08X",
+                    snapshot.ampereFirstFailure, ampere_diagnostics::FailureName(snapshot.ampereFirstFailure),
+                    snapshot.ampereFirstNgxResult);
+            if (snapshot.ampereLastFailure && snapshot.ampereLastFailure != snapshot.amperePrimaryFailure)
+                ImGui::TextWrapped("Latest failure: %u (%s) | NGX: 0x%08X",
+                    snapshot.ampereLastFailure, ampere_diagnostics::FailureName(snapshot.ampereLastFailure),
+                    snapshot.ampereLastNgxResult);
+        }
+        if (!UiAmpere())
+        {
+            if (ImGui::Checkbox("Generated frames only",
+                    &gGeneratedOnlyDebug))
+            {
+                settingsChanged = true;
+            }
         }
 
         ImGui::Separator();
@@ -1738,7 +2436,8 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
                 snapshot.activeLastCallRevision),
             static_cast<unsigned long long>(
                 snapshot.activeLastAcceptedRevision));
-        ImGui::Text("FG: %s | Off accepted: %s | Release observed: %s",
+        ImGui::Text("FG applied/intent: %s/%s | Off accepted: %s | Release observed: %s",
+            snapshot.appliedFrameGenerationOn ? "on" : "off",
             snapshot.gameFrameGenerationOn ? "on" : "off",
             YesNo(snapshot.frameGenerationOffAccepted),
             YesNo(snapshot.releaseObserved));
@@ -1783,10 +2482,13 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
 #else
     if (ImGui::CollapsingHeader("Debug"))
     {
-        if (ImGui::Checkbox("Generated frames only",
-                &gGeneratedOnlyDebug))
+        if (!UiAmpere())
         {
-            settingsChanged = true;
+            if (ImGui::Checkbox("Generated frames only",
+                    &gGeneratedOnlyDebug))
+            {
+                settingsChanged = true;
+            }
         }
         ImGui::Separator();
         ImGui::TextUnformatted("Core and bridge");
@@ -1887,6 +2589,9 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     ImGui::Text("Dynamic capability: %s",
         !dynamicCapabilityKnown ? "checking"
             : dynamicSupported ? "supported" : "unsupported");
+    ImGui::Text("Runtime FG V-Sync capability: %s", !snapshot.fgVsyncSupportKnown
+        ? "unknown" : snapshot.fgVsyncSupported ? "supported" : "unavailable");
+        DrawPresentationDebug(snapshot);
     if (snapshot.followGameMode)
     {
         ImGui::Text("Requested: follow game  Applied: %s %ux",
@@ -1908,28 +2613,28 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     if (snapshot.dynamicTargetFrameRate == 0)
     {
         ImGui::TextUnformatted(
-            "Dynamic target: refresh rate (wire value 0)");
+            "Saved Dynamic target: display refresh rate");
     }
     else
     {
-        ImGui::Text("Dynamic target: %u FPS",
+        ImGui::Text("Saved Dynamic target: %u FPS",
             snapshot.dynamicTargetFrameRate);
     }
-    ImGui::Text("Desired revision: %llu | Applied revision: %llu",
+    ImGui::Text("Backend request revision: %llu | Applied revision: %llu",
         static_cast<unsigned long long>(snapshot.desiredRevision),
         static_cast<unsigned long long>(snapshot.appliedRevision));
-    ImGui::Text("Dynamic 5X/6X: %s | Generated-only desired/applied: %s/%s",
-        YesNo(snapshot.dynamicExperimental56),
+    ImGui::Text("Generated-only desired/applied: %s/%s",
         YesNo(snapshot.generatedOnlyDebug),
         YesNo(snapshot.appliedGeneratedOnlyDebug));
-    ImGui::Text("UI refresh lock: %s | custom target: %d FPS",
+    ImGui::Text("Use refresh as target: %s | custom target: %d FPS",
         gDynamicLockToRefreshRate ? "yes" : "no",
         gDynamicCustomTargetFrameRate);
     ImGui::Text("Last UI apply: attempted %s | accepted %s | saved %s",
         gLastApplyAttempted ? "yes" : "no",
         gLastApplyAccepted ? "yes" : "no",
         gLastNativeConfigPersisted ? "yes" : "no");
-    ImGui::Text("FG on: %s | rebuild: %s | pipeline predates detour: %s",
+    ImGui::Text("FG applied/intent: %s/%s | rebuild: %s | pipeline predates detour: %s",
+        YesNo(snapshot.appliedFrameGenerationOn),
         YesNo(snapshot.gameFrameGenerationOn),
         YesNo(snapshot.streamlineRebuildRequired),
         YesNo(snapshot.pipelineMayPredateDetour));
@@ -1949,7 +2654,7 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
         YesNo(snapshot.getStateEntryDetourCurrent),
         YesNo(snapshot.ngxCreateEntryDetourCurrent),
         YesNo(snapshot.ngxEvaluateEntryDetourCurrent));
-    ImGui::Text("Create midpoint ready: %s | per-sample synthesis: %s",
+    ImGui::Text("Create program ready: %s | synthesis: %s",
         YesNo(snapshot.backportReadyAtCreate),
         YesNo(snapshot.perSampleSynthesisReady));
     ImGui::Text("High-capability publication allowed: %s",
@@ -2001,14 +2706,12 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
 
     const char* uiState = snapshot.uiRecompositionForced
-        ? "enabled (forced)" : snapshot.uiRecompositionEnabled
-            ? "enabled" : snapshot.uiInputsReady
-                ? "inputs ready" : "game-managed";
+        ? "legacy override accepted" : snapshot.uiRecompositionEnabled
+            ? "game option enabled (last accepted)" : "game-managed";
     ImGui::Text("UI recomposition: %s", uiState);
-    ImGui::Text("UI inputs: %s | enabled: %s | forced: %s",
-        YesNo(snapshot.uiInputsReady),
-        YesNo(snapshot.uiRecompositionEnabled),
-        YesNo(snapshot.uiRecompositionForced));
+    ImGui::Text("Tagged UI input coherence: %s",
+        snapshot.uiInputsReady ? "established" : "not established");
+    ImGui::TextUnformatted("Tag observations do not verify displayed UI.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Streamline and OTA");
@@ -2089,16 +2792,22 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
 #endif
 
+    ImGui::EndDisabled();
+    ImGui::PopStyleVar();
+    if (nativeFile)
+        ImGui::TextDisabled("Status: %s", statusStale
+            ? "Temporarily unavailable; controls paused" : "Live");
     if (settingsChanged)
         ApplySettings(runtime, true);
 }
 }
 
+#if !defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 extern "C" __declspec(dllexport) const char* AUTHOR = "dashdogy";
 
 #if defined(MFG_UNLOCK_RESHADE_UI_CLIENT)
 extern "C" __declspec(dllexport) const char* NAME =
-    "Universal RTX 40 MFG Unlock V1.2";
+    "Universal RTX 40 MFG Unlock V1.3";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
     "Universal DLSS Multi Frame Generation enabler for supported games on "
     "NVIDIA GeForce RTX 40 Series GPUs.";
@@ -2205,3 +2914,19 @@ void ProcessDetach(HMODULE self) noexcept
 #endif
 }
 }
+
+#else
+namespace standalone_ui
+{
+void Initialize(HMODULE self)
+{
+    gSelf = self;
+    if (!gInitialized.exchange(true, std::memory_order_acq_rel))
+        LoadSettings();
+}
+void Draw()
+{
+    DrawSettings(nullptr);
+}
+}
+#endif

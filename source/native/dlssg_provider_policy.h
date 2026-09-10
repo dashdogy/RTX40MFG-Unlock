@@ -94,4 +94,8 @@ bool ReadProviderVersion(
 bool SupportedProviderVersionMatches(const wchar_t* path) noexcept;
 bool IsDlssgImplementationModule(HMODULE module) noexcept;
 bool IsSupportedProvider(HMODULE module, const wchar_t* path) noexcept;
+// Reuses embedded-version eligibility only while owning a process-lifetime
+// reference to that loaded module. Export identity is still checked on every
+// call. Retention prevents unloading and base-address reuse across generations.
+bool IsSupportedRetainedProvider(HMODULE module) noexcept;
 }

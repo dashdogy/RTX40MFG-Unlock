@@ -1,163 +1,125 @@
-# Universal RTX 40 MFG Unlocker
+# Universal RTXMFG — v1.3.2
 
-Universal DLSS Multi Frame Generation enabler for supported Windows x64 games
-on NVIDIA GeForce RTX 40 Series GPUs. V1.2 adds Follow game, fixed 2X through
-the verified maximum, and Dynamic controls to games that already provide
-Streamline DLSS Frame Generation.
+DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
+with experimental RTX 30 support. v1.3.2 combines the backend and menu into one
+DLL, with fixed multipliers up to 6x and Dynamic MFG where supported.
 
-The same build supports DirectX 12 and Vulkan. It combines NVIDIA's listed
-maximum for each game with the active Streamline wrapper capacity, exposing up to 6X
-when both allow it and falling back to a supported lower maximum. It does not
-add DLSS Frame Generation to games that do not already support it.
+**RTX 30 series support is very early and experimental. It may not work in some
+games or configurations, even when the menu loads.**
 
-This is unsupported research software. Higher multipliers and Vulkan support
-remain experimental and may cause artifacts, frozen presentation, black
-screens, or crashes.
-
-## V1.2 changes
-
-1. Added one Universal build for DirectX 12 and Vulkan games.
-2. Added live fixed and Dynamic controls through the ReShade menu.
-3. Added automatic game capability limits, Ada temporal correction, and telemetry.
-
-### 310.9.1 source hotfix candidate (core 1.2.0.23)
-
-Adds exactly DLSS-G 310.9.1 to provider eligibility and the existing verified
-310.9 temporal profile. The original feature identity, payload hashes,
-structural discovery, adapter, timing and publication checks remain in force.
-Unknown 310.9.2 stays rejected.
-
-For an existing V1.2 installation, close the game, back up `RTX40MFGCore.dll`,
-and replace only that core with the hotfix candidate. Keep the V1.2 ASI,
-ReShade add-on, loader configuration and user settings. Do not mix this core
-with the V1.3 single-DLL package.
-
-Local source/harness validation does not establish provider execution or
-correct final-present content in a game. This hotfix does not add the newer
-Streamline V-Sync or Reflex controls.
+The game must already have a Streamline DLSS Frame Generation integration.
+Available modes depend on the GPU and game.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
 
 ## Install
 
-Requires Windows x64, an RTX 40 Series GPU, a game with working Streamline DLSS
-Frame Generation, [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader),
-and [ReShade](https://reshade.me/) with extension support for the menu.
+The v1.3.2 download contains **`RTXMFG.dll`**. The menu is built in; no separate
+ReShade or external loader installation is needed.
 
-Close the game and copy these files beside its real executable:
+1. Close the game. If upgrading from a split release, remove the old mod
+   components as described below first.
+2. Download `RTXMFG-v1.3.2.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+   and extract it.
+3. Rename `RTXMFG.dll` to **one** supported filename below that the game loads
+   early. Place it beside the **actual game executable**, not the launcher.
+4. Launch the game, enable DLSS Frame Generation where available, and press
+   **Backspace** to open the menu.
+
+Install only one copy. Do not overwrite a DLL belonging to the game or another
+mod; choose another suitable name if it is already occupied. Leaving the file
+named `RTXMFG.dll` does not make the game load it automatically.
+
+### Supported filenames
 
 ```text
-RTX40MFGCore.dll
-RTX40MFG.asi
-RTX40MFG-UI.addon64
+version.dll
+dinput8.dll
+winmm.dll
+d3d9.dll
+d3d10.dll
+d3d11.dll
+d3d12.dll
+dxgi.dll
+dsound.dll
+wininet.dll
+winhttp.dll
+binkw64.dll
+bink2w64.dll
+xinput1_1.dll
+xinput1_2.dll
+xinput1_3.dll
+xinput1_4.dll
+xinput9_1_0.dll
+xinputuap.dll
 ```
 
-Install Ultimate ASI Loader under a supported proxy name that the game loads
-early. Merge the supplied `global.ini` values into the matching UAL proxy file,
-such as `dinput8.ini` or `version.ini`; do not overwrite unrelated loader
-settings. Remove legacy
-`RTX40MFG-Universal.asi` and `RTX40MFG-Bridge.asi` files before upgrading, but
-keep `RTX40MFG-Universal.json` to preserve the selected mode.
+The correct name depends on the game. A supported name must actually be loaded
+before Frame Generation starts; Vulkan games may not load DirectX proxy names.
 
-Do not replace or bundle a game's Streamline or NVIDIA DLLs. An NVIDIA App OTA
-override may supply the active Frame Generation wrapper and provider separately.
+**For Bink games:** back up the game's original DLL first, then rename
+`binkw64.dll` to `binkw64Hooked.dll`, or `bink2w64.dll` to
+`bink2w64Hooked.dll`. Give RTXMFG the original filename and keep both files
+beside the executable. These routes require the game's original Bink DLL.
 
-### DirectX 12
+## Upgrade
 
-Install ReShade for DirectX 10/11/12. ReShade normally owns `dxgi.dll`, so give
-Ultimate ASI Loader a different supported proxy name that the game imports at
-startup, commonly `dinput8.dll` or `version.dll`. Never install both loaders
-under the same proxy filename.
+When upgrading from v1.2, move `RTX40MFGCore.dll`, `RTX40MFG.asi`, and
+`RTX40MFG-UI.addon64` to a backup outside the game's loading directories.
+Also remove older Universal/Bridge mod components or corresponding RTX 30 split
+files, if installed. Preserve unrelated mods and their loaders.
 
-### Vulkan
+v1.3.2 saves settings in `RTXMFG-Universal.json`. Older RTX40MFG/RTX30MFG settings
+are not imported automatically; reselect your preferences in the menu.
 
-Select Vulkan in the ReShade installer. Use Ultimate ASI Loader under an early
-proxy unrelated to DirectX that the game imports, such as `dinput8.dll`,
-`version.dll`, or `winmm.dll`; a Vulkan game may never load `dxgi.dll` or
-`d3d12.dll`. The mod files are otherwise identical to the DirectX 12 install.
-
-The ASI must load before the first Frame Generation pipeline is created. If the
-menu asks for recreation, toggle Frame Generation Off and On or restart with an
-earlier loader proxy.
-
-### Frozen image or black screen above 2x
-
-If selecting a multiplier above 2x freezes the image while the game keeps
-running, try the following before deleting settings or reinstalling:
-
-1. Close the game.
-2. Open the game's profile in the NVIDIA App. Under **DLSS Override - Model
-   Presets**, set **Frame Generation** to **Preset B** and apply the change.
-3. Restart the game and test the desired multiplier.
-
-Users in [issue #6](https://github.com/dashdogy/RTX40MFG-Unlock/issues/6)
-reported that forcing Preset B restored presentation in Crimson Desert and
-Star Wars: Zero Company. Cyberpunk was also in the original report, but its
-recovery was not separately confirmed. This is a reported workaround; the
-underlying cause and correct output at every multiplier remain unverified.
-File removal and rebooting had mixed results, so preserve your configuration
-when trying the preset change.
-
-### ReShade status flicker
-
-Flickering status in the ReShade panel can persist after Preset B resolves the
-frozen image. Treat it as a separate symptom. A user
-[suggested using Ultimate ASI Loader's `dinput8.dll` proxy](https://github.com/dashdogy/RTX40MFG-Unlock/issues/6#issuecomment-5545273216)
-for the flicker, but the affected recipient has not confirmed that fix.
-If testing a different UAL proxy, fully close the game and back up the current
-loader setup first; preserve proxy files belonging to other mods.
-
-If either problem persists, include the game and mod version, GPU and driver,
-Frame Generation preset, selected multiplier, UAL proxy filename (if used),
-and relevant logs in the bug report. State whether the game image freezes,
-the ReShade status flickers, or both.
+For later single-DLL updates, replace only the installed RTXMFG DLL, keeping
+its chosen filename and your settings.
 
 ## Usage
 
-Open ReShade and select the **DLSS MFG** tab. Choose Follow game, a fixed
-multiplier, or Dynamic when the active stack supports it. Changes are sent
-immediately; no Apply button is required. The normal panel shows real and DLSS
-output FPS, while detailed route and interval telemetry stays under Debug.
+Press **Backspace** to open or close the menu. The hotkey can be changed there.
 
-## How it works
+- Choose **Follow game**, a fixed multiplier, or **Dynamic** when available.
+- Dynamic can target the display refresh rate or a custom FPS value.
+- Select **Game/driver**, **Preset A**, or **Preset B** where supported.
+  Preset changes after initialization require a restart.
+- **Limit FPS with Reflex** provides a separate cap where supported.
+  The manual cap is unavailable while Dynamic is selected or active.
 
-`RTX40MFG.asi` imports `RTX40MFGCore.dll`, loading the core before the ASI entry
-point. The core intercepts the active Streamline and NGX function paths before
-feature creation, validates the adapter, wrapper, provider, and requested
-capacity, then publishes the Ada temporal correction and forwards the call.
+Check the status line for pending changes or restart instructions.
+Use the game or driver settings for V-Sync.
 
-Only verified code and data inside the process are changed; NVIDIA files on disk are
-left untouched. Unknown ownership, layout, timing, or capacity fails closed.
-FPS counters and telemetry are diagnostic and do not by themselves prove
-correct final presentation frame spacing.
+## Compatibility and troubleshooting
 
-Logs are written to `%TEMP%\MfgUnlock-<PID>.log` and temporal samples to
-`%TEMP%\MfgUnlock-intervals-<PID>.csv`.
+RTX 40 has DirectX 12 and experimental Vulkan paths. RTX 30 support is
+**very early, experimental, and DirectX 12 only**. Some games or configurations
+may not work at all. Dynamic MFG is unavailable on Vulkan.
+Compatibility varies by game; artifacts, freezes, black screens and crashes
+remain possible.
 
-## Cyberpunk 2077
+If the menu does not appear, check the executable folder, chosen proxy name,
+and any leftover split components. Fully close the game before changing files.
 
-The dedicated Cyberpunk 2077 mod is still available on [Nexus Mods](https://www.nexusmods.com/cyberpunk2077/mods/33286).
+For frozen presentation, some users reported that **Preset B** helped in
+[issue #6](https://github.com/dashdogy/RTX40MFG-Unlock/issues/6). Restart after
+changing presets. This is a reported workaround, not a fix for every game.
 
-## Build
+For [bug reports](https://github.com/dashdogy/RTX40MFG-Unlock/issues), include
+the game, GPU, driver, proxy filename, multiplier and preset, plus the matching
+`%TEMP%\RTXMFG-<PID>.log` and `RTXMFG-Universal.<PID>.status.json`.
 
-Requires Visual Studio 2022, CMake 3.24+, Streamline SDK 2.12.0, and compatible
-ReShade and ImGui source trees.
+## Uninstall
 
-```powershell
-cmake -S .\source\native -B .\build -G "Visual Studio 17 2022" -A x64 `
-  -DSTREAMLINE_ROOT="C:\path\to\streamline" `
-  -DMFG_UNLOCK_BUILD_UNIVERSAL_UI=ON `
-  -DRESHADE_ROOT="C:\path\to\reshade" `
-  -DIMGUI_ROOT="C:\path\to\reshade\deps\imgui"
-cmake --build .\build --config Release --parallel --target `
-  RTX40MFGCore RTX40MFGAuto RTX40MFGReShadeUI
-```
+Close the game and remove the renamed RTXMFG DLL. Restore any original DLL
+you renamed to a `Hooked` filename. Keep `RTXMFG-Universal.json` if you want
+to retain your settings.
 
-## License
+## Links and licence
 
-Original code in this repository is licensed under the [MIT License](LICENSE).
-Reuse and redistribution are permitted provided the copyright and license
-notice are retained. NVIDIA Streamline, NGX, ReShade, Ultimate ASI Loader, and
-other external components remain subject to their respective terms. The
-bundled MinHook source retains its own license in
-the [MinHook license](source/native/third_party/minhook/LICENSE.txt).
+The dedicated Cyberpunk 2077 mod is also available on
+[Nexus Mods](https://www.nexusmods.com/cyberpunk2077/mods/33286).
+
+Original project code is licensed under the [MIT License](LICENSE).
+For source builds, see [BUILD.md](BUILD.md).
+
+Third-party components retain their respective licences and notices.

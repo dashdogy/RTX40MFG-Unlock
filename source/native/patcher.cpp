@@ -1,13 +1,43 @@
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+#include "single_module.h"
+#include "single_overlay.h"
+#endif
 #include "shared.h"
+#include "build_variant.h"
+#include "unified_control_paths.h"
+#include "ui_status_json.h"
+#include "ui_input_coherence.h"
+#include "ampere_backend.h"
+#include "adapter_discovery.h"
+#include "ngx_initialization.h"
+#include "ngx_runtime_dispatch.h"
+#include "ampere_gpu.h"
+#include "ampere_policy.h"
+#include "gpu_dispatch.h"
+#include "gpu_selection_policy.h"
 #include "midpoint_fix.h"
+#include "early_provider_load.h"
+#include "output_pull_experiment.h"
+#include "prev2curr_experiment.h"
+#include "output_pull_telemetry.h"
+namespace gpu_backend = gpu_dispatch;
+inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
+
 #include "dlssg_provider_policy.h"
+#include "reflex_control.h"
+#include "vsync_control.h"
+#include "ngx_runtime_policy.h"
+#include "dlssg_preset.h"
+#include "present_counter.h"
 #include "entry_detour.h"
+#include "protected_pointer.h"
 #include "nvidia_mfg_policy.h"
 #include "selective_ota_wrapper_policy.h"
 #include "streamline_ota_policy.h"
 #include "temporal_interval_trace.h"
 #include "universal_route_policy.h"
 #include "universal_wrapper_profile.h"
+#include "vulkan_capability.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -20,6 +50,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
@@ -55,10 +86,14 @@ static_assert(offsetof(VulkanInfoPrefix, device) == 32);
 static_assert(offsetof(VulkanInfoPrefix, physicalDevice) == 48);
 
 FILE* gLog = nullptr;
-std::atomic<bool> gDesiredFollowGame{true};
-std::atomic<uint32_t> gDesiredMultiplier{2};
+std::atomic<bool> gDesiredFollowGame{false};
+std::atomic<uint32_t> gDesiredMultiplier{2u};
 std::atomic<bool> gDesiredDynamicMode{false};
 std::atomic<uint32_t> gDynamicTargetFrameRate{0};
+std::atomic<uint32_t> gDlssgPresetRequested{2};
+std::atomic<uint32_t> gVsyncMode{0};
+std::atomic<uint32_t> gReflexFrameLimitFps{0};
+std::mutex gControlSnapshotMutex;
 std::atomic<bool> gDynamicExperimental56{false};
 std::atomic<bool> gGeneratedOnlyDebug{false};
 std::atomic<uint64_t> gDesiredRevision{0};
@@ -87,6 +122,7 @@ std::atomic<LoadLibraryExWFn> gOriginalStreamlineLoadLibraryExW{nullptr};
 std::atomic<bool> gSlCommonResolverDiscoveryInstalled{false};
 std::atomic<bool> gStreamlineLoaderDiscoveryInstalled{false};
 std::atomic<uint64_t> gStreamlineLoaderDiscoveryCalls{0};
+std::atomic<uintptr_t> gRemixRuntimeBase{0};
 std::atomic<bool> gMainResolverDiscoveryInstalled{false};
 std::atomic<bool> gSlInitIatFallbackInstalled{false};
 std::atomic<bool> gSlInitResolverFallbackActive{false};
@@ -120,18 +156,28 @@ std::atomic<bool> gSetOptionsHookExposed{false};
 std::atomic<bool> gGetStateHookExposed{false};
 std::atomic<bool> gSetOptionsSeen{false};
 std::atomic<bool> gGetStateSeen{false};
+// This records the host's unadjusted request.  Keep it separate from the mode
+// accepted after applying the mod control: an accepted mod-generated Off must
+// not erase the host's continuing On intent.
 std::atomic<bool> gGameFrameGenerationOn{false};
+std::atomic<uint32_t> gGameFrameGenerationViewport{UINT32_MAX};
+std::atomic<bool> gAppliedFrameGenerationOn{false};
+std::atomic<uint64_t> gPresentationLifecycleEpoch{1};
 std::atomic<int32_t> gLastSetOptionsResult{static_cast<int32_t>(sl::Result::eErrorNotInitialized)};
 std::atomic<int32_t> gLastGetStateResult{static_cast<int32_t>(sl::Result::eErrorNotInitialized)};
 std::atomic<bool> gAppliedDynamicMode{false};
 std::atomic<uint32_t> gAppliedMultiplier{0};
-std::atomic<uint32_t> gAppliedDynamicTargetFrameRate{0};
+std::atomic<float> gAppliedDynamicTargetFrameRate{0.0f};
+std::atomic<bool> gAppliedDynamicTargetValid{false};
 std::atomic<bool> gAppliedDynamicExperimental56{false};
 std::atomic<bool> gAppliedGeneratedOnlyDebug{false};
 std::atomic<uint32_t> gActualFramesPresented{0};
 std::atomic<uint32_t> gNumFramesToGenerateMax{0};
 std::atomic<uint32_t> gDlssgStatus{0};
 std::atomic<bool> gDynamicMfgSupported{false};
+std::atomic<bool> gDynamicMfgCapabilityKnown{false};
+std::atomic<bool> gFgVsyncSupportKnown{false};
+std::atomic<bool> gFgVsyncSupported{false};
 std::atomic<uint64_t> gStateSampleTick{0};
 std::atomic<uint64_t> gSetOptionsCalls{0};
 std::atomic<uint64_t> gSetOptionsResolverFallbackCalls{0};
@@ -155,6 +201,7 @@ enum class NgxProviderSelectionSource : uint32_t
     eProviderEntry = 1,
     eRuntimeCaller = 2,
     eRuntimeUniqueCandidate = 3,
+    eRuntimeDispatchTable = 4,
 };
 std::atomic<uint32_t> gActiveNgxDispatchRoute{
     static_cast<uint32_t>(NgxDispatchRoute::ePending)};
@@ -174,6 +221,18 @@ std::atomic<bool> gBackportReadyAtCreate{false};
 std::atomic<bool> gPipelineMayPredateDetour{false};
 std::atomic<bool> gRestartRequired{false};
 std::atomic<bool> gDllNotificationRegistered{false};
+early_provider_load::Tracker<> gOutputPullMaskLoads;
+struct OutputPullMaskInitEvidence
+{
+    entry_detour::Handle handle{};
+    HMODULE owner = nullptr;
+    uint64_t generation = 0;
+};
+std::mutex gOutputPullMaskInitMutex;
+OutputPullMaskInitEvidence gOutputPullMaskSlInit;
+OutputPullMaskInitEvidence gOutputPullMaskVulkanInit;
+thread_local entry_detour::Snapshot gAmpereNativeInitBoundary{};
+thread_local uint64_t gAmpereNativeInitTicket = 0;
 std::atomic<bool> gModuleInventoryDirty{true};
 std::atomic<bool> gLiveHookInstalled{false};
 std::atomic<bool> gSetOptionsResolverFallbackActive{false};
@@ -202,12 +261,12 @@ std::atomic<uint32_t> gGameColorHeight{0};
 std::atomic<uint32_t> gGameHudlessBufferFormat{0};
 std::atomic<uint32_t> gGameUiBufferFormat{0};
 std::atomic<bool> gGameUiRecompositionEnabled{false};
-std::atomic<bool> gUiInputsReady{false};
 std::atomic<bool> gAppliedUiRecompositionEnabled{false};
 std::atomic<bool> gAppliedUiRecompositionForced{false};
 std::atomic<uint64_t> gSetTagCalls{0};
 std::atomic<uint64_t> gSetTagForFrameCalls{0};
 std::atomic<uint32_t> gRealFpsMilli{0};
+std::atomic<uint32_t> gFpsOutputSource{0}; // 0 unavailable, 1 callback, 2 DXGI, 3 estimate.
 std::atomic<uint32_t> gDlssFpsMilli{0};
 std::atomic<uint32_t> gFpsSampleWindowMs{0};
 std::atomic<uint64_t> gFpsSampleTick{0};
@@ -216,6 +275,8 @@ std::atomic<bool> gLogReady{false};
 std::mutex gStreamlineCallMutex;
 std::mutex gLastOptionsMutex;
 std::mutex gModuleMutex;
+std::mutex gImportPublicationMutex;
+std::mutex gActiveControlRouteMutex;
 std::mutex gUiTagMutex;
 std::mutex gSelectiveOtaDlssgWrapperMutex;
 std::once_flag gNvidiaCompatibilityOnce;
@@ -232,7 +293,6 @@ constexpr uint32_t kRouteExternal = 2u;
 constexpr uint32_t kMinimumMultiplier = 2u;
 constexpr uint32_t kMaximumMultiplier = 6u;
 constexpr uint64_t kNotInitializedRetryDelayMs = 500;
-constexpr uint64_t kUiTagFreshnessMs = 2500;
 
 uint64_t PackEntryHandle(entry_detour::Handle handle) noexcept
 {
@@ -259,13 +319,16 @@ enum class SelectiveOtaDlssgWrapperFailure : uint32_t
 
 struct ControlConfig
 {
-    bool followGame = true;
-    uint32_t multiplier = 2;
+    bool followGame = false;
+    uint32_t multiplier = 2u;
     bool dynamic = false;
     uint32_t dynamicTargetFrameRate = 0;
+    uint32_t dlssgPreset = 2;
+    uint32_t vsyncMode = 0;
+    uint32_t reflexFrameLimitFps = 0;
     bool dynamicExperimental56 = false;
     bool generatedOnlyDebug = false;
-    bool intervalLogging = true;
+    bool intervalLogging = gpu_dispatch::IsAda() || UseAmpere();
     bool selectiveOtaDlssgWrapper = false;
 };
 
@@ -282,6 +345,38 @@ struct LastGameOptions
     bool valid = false;
 };
 
+struct RetainedFeatureIdentity
+{
+    uintptr_t handle = 0;
+    uintptr_t runtime = 0;
+    uint64_t runtimeGeneration = 0;
+    uintptr_t provider = 0;
+    uint64_t providerGeneration = 0;
+    uintptr_t wrapper = 0;
+    uint64_t wrapperGeneration = 0;
+    uint64_t publication = 0;
+    uint64_t adapterLuid = 0;
+    uint32_t generatedFrameCapacity = 0;
+    uint64_t lifetime = 0;
+    uint64_t createAttemptEpoch = 0;
+
+    explicit operator bool() const noexcept
+    {
+        return handle != 0 && runtime != 0 && runtimeGeneration != 0
+            && provider != 0 && providerGeneration != 0 && wrapper != 0
+            && wrapperGeneration != 0 && publication != 0
+            && generatedFrameCapacity != 0 && lifetime != 0;
+    }
+};
+
+struct AcceptedOffEvidence
+{
+    RetainedFeatureIdentity feature{};
+    uint32_t routeSlot = UINT32_MAX;
+    uint32_t viewport = UINT32_MAX;
+    uint64_t revision = 0;
+};
+
 using PFun_slSetDataInternal = sl::Result(
     const sl::BaseStructure* inputs, sl::CommandBuffer* commandBuffer);
 using PFun_slGetDataInternal = sl::Result(
@@ -296,6 +391,7 @@ struct ModuleRecord
     HMODULE module = nullptr;
     std::wstring path;
     uint64_t generation = 0;
+    uint64_t freshLoadToken = 0;
     uint32_t controlRouteSlot = UINT32_MAX;
     bool wrapperExport = false;
     bool wrapperCandidate = false;
@@ -331,8 +427,8 @@ struct ControlRouteRecord
     uint64_t generation = 0;
     std::wstring path;
     FileVersion version{};
-    bool wrapperPatched = false;
-    uint32_t compiledMaximumGeneratedFrames = 0;
+    std::atomic<bool> wrapperPatched{false};
+    std::atomic<uint32_t> compiledMaximumGeneratedFrames{0};
 
     entry_detour::Handle publicSetHandle{};
     entry_detour::Handle publicGetHandle{};
@@ -363,46 +459,17 @@ struct ControlRouteRecord
     std::atomic<uint64_t> releaseCalls{0};
 };
 
-struct UiResourceTagState
-{
-    bool active = false;
-    sl::ResourceLifecycle lifecycle = sl::ResourceLifecycle::eOnlyValidNow;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t top = 0;
-    uint32_t left = 0;
-    uint32_t format = 0;
-    uint64_t lastSeenTick = 0;
-};
-
-struct UiViewportTagState
-{
-    uint32_t viewport = UINT32_MAX;
-    UiResourceTagState hudless{};
-    UiResourceTagState uiAlpha{};
-    UiResourceTagState uiColorAlpha{};
-};
-
-struct UiInputSnapshot
-{
-    bool hudless = false;
-    bool uiAlpha = false;
-    bool uiColorAlpha = false;
-    bool dimensionsKnown = false;
-    bool dimensionsMatch = false;
-    bool ready = false;
-    uint32_t hudlessWidth = 0;
-    uint32_t hudlessHeight = 0;
-    uint32_t uiWidth = 0;
-    uint32_t uiHeight = 0;
-    uint32_t uiFormat = 0;
-    uint64_t oldestAgeMs = 0;
-};
+using UiInputSnapshot = ui_input_coherence::Snapshot;
 
 LastGameOptions gLastGameOptions;
+RetainedFeatureIdentity gRetainedFrameGenerationFeature;
+RetainedFeatureIdentity gFreshRecreatedFrameGenerationFeature;
+AcceptedOffEvidence gAcceptedOffEvidence;
+std::mutex gFrameGenerationLifetimeMutex;
+std::atomic<uint64_t> gFrameGenerationCreateAttemptEpoch{0};
 std::vector<ModuleRecord> gModuleRecords;
 std::array<ControlRouteRecord, kControlRouteCapacity> gControlRoutes{};
-std::vector<UiViewportTagState> gUiViewportTags;
+ui_input_coherence::Tracker gUiInputTracker;
 std::mutex gControlRouteMutex;
 std::atomic<uint64_t> gNextModuleGeneration{1};
 std::atomic<uint32_t> gActiveControlRouteSlot{UINT32_MAX};
@@ -412,6 +479,8 @@ std::atomic<DWORD> gInternalControlBypassTlsIndex{TLS_OUT_OF_INDEXES};
 LARGE_INTEGER gFpsCounterFrequency{};
 LARGE_INTEGER gFpsWindowStart{};
 uint64_t gFpsWindowOutputFrames = 0;
+bool gFpsWindowOutputAvailable = false;
+frame_telemetry::PresentCounter gFpsPresentCounter;
 std::array<uint64_t, temporal_interval_trace::kFirstSampleHandleCapacity>
     gFpsWindowFirstSamples{};
 bool gFpsTelemetryActive = false;
@@ -424,10 +493,14 @@ HMODULE ModuleFromAddress(const void* address);
 std::wstring LoadedModulePath(HMODULE module);
 bool UsesNvidiaOtaCache(const std::wstring& path);
 void RecomputeModuleStateLocked();
+void ObserveAmpereFeatureLifetime(
+    const ampere_backend::FeatureLifetimeEvent& event) noexcept;
+void EnsureAmpereFeatureLifetimeObserver() noexcept;
 ControlRouteRecord* ActiveControlRoute() noexcept;
 const char* ControlPathName(ControlEntryPath path) noexcept;
 void SetUniversalRouteFailure(UniversalRouteFailure failure) noexcept;
 bool ActiveSetterCovered(const ControlRouteRecord& route) noexcept;
+bool SetterEntryCovered(const ControlRouteRecord& route) noexcept;
 bool StateEntryCovered(const ControlRouteRecord& route) noexcept;
 bool TryInstallSetOptionsEntryDetour(HMODULE wrapper, void* resolvedTarget);
 bool TryInstallGetStateEntryDetour(HMODULE wrapper, void* resolvedTarget);
@@ -437,6 +510,8 @@ uint32_t EnsureControlRoute(HMODULE wrapper, const std::wstring& path,
 bool InstallControlRouteEntries(uint32_t routeSlot);
 bool InstallControlRouteLifecycleEntry(uint32_t routeSlot);
 bool TryInstallSlInitEntryDetour(HMODULE interposer, void* resolvedTarget);
+void WINAPI BeforeNgxD3D12EvaluateFeature(void*, uintptr_t, const void*, void*, uintptr_t, uintptr_t, entry_detour::Handle, const void*) noexcept;
+void WINAPI BeforeNgxRuntimeD3D12EvaluateFeature(void*, uintptr_t, const void*, void*, uintptr_t, uintptr_t, entry_detour::Handle, const void*) noexcept;
 bool TryInstallNgxCreateEntryDetour(HMODULE provider, const std::wstring& path,
     uint64_t generation);
 bool TryInstallNgxEvaluateEntryDetour(
@@ -459,7 +534,38 @@ bool InstallSlCommonResolverDiscovery(
     HMODULE module, const std::wstring& path);
 bool InstallStreamlineLoaderDiscovery(
     HMODULE module, const std::wstring& path);
+ModuleRecord InspectLoadedModule(HMODULE, const std::wstring&);
 void InspectAlreadyLoadedModules();
+ampere_gpu::PreparationBoundary ResolveAmperePreparationBoundary(HMODULE, uint64_t) noexcept;
+bool AmperePreparationStillCurrent(HMODULE, const ampere_gpu::PreparationBoundary&) noexcept;
+void PrepareNgxInitialization(void* device, const entry_detour::Snapshot& entry,
+    const void* caller, bool firstInit) noexcept;
+bool OutputPullMaskEarlyInitProven(HMODULE provider, NgxGraphicsApi api) noexcept;
+void ObserveOutputPullMaskSlInitResult(
+    const entry_detour::Snapshot& before, bool succeeded) noexcept;
+void ObserveOutputPullMaskVulkanInit(entry_detour::Handle handle) noexcept;
+
+sl::Result InvokeAmpereDeviceSetup(PFun_slSetD3DDevice* original, void* device)
+{
+    sl::Result result = sl::Result::eErrorNotInitialized;
+    ampere_backend::BeginStartup();
+    __try
+    {
+        InspectAlreadyLoadedModules();
+        result = original(device);
+        InspectAlreadyLoadedModules();
+    }
+    __finally { ampere_backend::EndStartup(result == sl::Result::eOk); }
+    return result;
+}
+
+sl::Result InvokeAmpereInit(PFun_slInit* original, const sl::Preferences& preferences, uint64_t version)
+{
+    ampere_backend::BeginInit();
+    __try { return original(preferences, version); }
+    __finally { ampere_backend::EndInit(); }
+}
+
 void ConfigureSelectiveOtaDlssgWrapper(bool requested,
     bool providerSupported, bool loaderDiscoveryReady);
 std::wstring SelectiveOtaDlssgWrapperRedirectPath(
@@ -543,148 +649,163 @@ nvidia_mfg_policy::CapacityDecision CurrentCapacityDecision() noexcept
 
 uint32_t SafeMaximumMultiplier() noexcept
 {
-    const uint32_t maximum = std::clamp(
-        CurrentCapacityDecision().effectiveMaximumMultiplier,
-        kMinimumMultiplier, kMaximumMultiplier);
+    const uint32_t maximum = UseAmpere()
+        ? (ampere_backend::Ready()
+            && ampere_backend::StartupMaximumGeneratedFrames() == ampere_policy::kMaximumGeneratedFrames
+            && ampere_backend::CertifiedMaximumGeneratedFrames() == ampere_policy::kMaximumGeneratedFrames
+            ? ampere_policy::kMaximumGeneratedFrames + 1u : 2u)
+        : gpu_dispatch::IsAda() ? std::clamp(
+            CurrentCapacityDecision().effectiveMaximumMultiplier,
+            kMinimumMultiplier, kMaximumMultiplier) : 2u;
     gSafeMaximumMultiplier.store(maximum, std::memory_order_release);
     return maximum;
 }
 
 uint32_t EffectiveMultiplier(const ControlConfig& control) noexcept
 {
-    return std::clamp(control.multiplier, kMinimumMultiplier,
-        SafeMaximumMultiplier());
+    if (UseAmpere())
+    {
+        return std::clamp(control.multiplier, 1u, SafeMaximumMultiplier());
+    }
+    else
+    {
+        return std::clamp(control.multiplier, kMinimumMultiplier,
+            SafeMaximumMultiplier());
+    }
 }
 
-UiResourceTagState CaptureUiResourceTag(const sl::ResourceTag& tag, uint64_t tick)
+ui_input_coherence::Generation CurrentUiInputGeneration() noexcept
 {
-    UiResourceTagState state{};
-    if (!tag.resource || !tag.resource->native)
-        return state;
+    const auto* route = ActiveControlRoute();
+    const bool current = route && route->structureCompatible.load(std::memory_order_acquire);
+    return {current ? reinterpret_cast<uintptr_t>(route->wrapper) : 0,
+        current ? route->generation : 0,
+        gActiveNgxProviderBase.load(std::memory_order_acquire),
+        gActiveNgxProviderGeneration.load(std::memory_order_acquire),
+        gFrameGenerationCreateAttemptEpoch.load(std::memory_order_acquire),
+        gPresentationLifecycleEpoch.load(std::memory_order_acquire),
+        ui_input_coherence::resourceEpoch.load(std::memory_order_acquire)};
+}
 
-    state.active = true;
-    state.lifecycle = tag.lifecycle;
+void InvalidateUiInputEvidence(uint32_t viewport = UINT32_MAX) noexcept
+{
+    ui_input_coherence::InvalidateResources();
+    std::lock_guard lock(gUiTagMutex);
+    gUiInputTracker.Invalidate(viewport);
+}
+
+ui_input_coherence::Resource CaptureUiResourceTag(const sl::ResourceTag& tag,
+    uint64_t tick) noexcept
+{
+    ui_input_coherence::Resource state{};
+    state.observed = true;
     state.lastSeenTick = tick;
+    if (!tag.resource || !tag.resource->native) return state;
+    const auto& resource = *tag.resource;
+    state.active = true;
+    state.native = reinterpret_cast<uintptr_t>(resource.native);
+    state.view = reinterpret_cast<uintptr_t>(resource.view);
+    state.type = static_cast<uint32_t>(resource.type);
+    state.lifecycle = static_cast<uint32_t>(tag.lifecycle);
     state.top = tag.extent.top;
     state.left = tag.extent.left;
-    state.width = tag.extent.width != 0 ? tag.extent.width : tag.resource->width;
-    state.height = tag.extent.height != 0 ? tag.extent.height : tag.resource->height;
-    state.format = tag.resource->nativeFormat;
+    state.width = tag.extent.width ? tag.extent.width : resource.width;
+    state.height = tag.extent.height ? tag.extent.height : resource.height;
+    state.format = resource.nativeFormat;
+    // Do not dereference a retained resource later or infer native bounds from
+    // an address. Unknown descriptions remain observations, never ready input.
+    state.shapeKnown = tag.structType == sl::ResourceTag::s_structType
+        && tag.structVersion == sl::kStructVersion1
+        && resource.structType == sl::Resource::s_structType
+        && resource.structVersion == sl::kStructVersion1
+        && resource.type == sl::ResourceType::eTex2d && state.format
+        && tag.lifecycle >= sl::ResourceLifecycle::eOnlyValidNow
+        && tag.lifecycle <= sl::ResourceLifecycle::eValidUntilEvaluate
+        && resource.width && resource.height && state.width && state.height
+        && state.left <= resource.width && state.width <= resource.width - state.left
+        && state.top <= resource.height && state.height <= resource.height - state.top;
     return state;
-}
-
-bool UiTagFresh(const UiResourceTagState& state, uint64_t now)
-{
-    return state.active && state.lastSeenTick != 0 && now >= state.lastSeenTick
-        && now - state.lastSeenTick <= kUiTagFreshnessMs;
 }
 
 UiInputSnapshot ReadUiInputSnapshot(uint32_t viewport)
 {
-    UiInputSnapshot snapshot{};
-    const uint64_t now = GetTickCount64();
+    const auto generation = CurrentUiInputGeneration();
+    const bool active = viewport == gLastOptionsViewport.load(std::memory_order_acquire);
     std::lock_guard lock(gUiTagMutex);
-    const auto found = std::find_if(gUiViewportTags.begin(), gUiViewportTags.end(),
-        [&](const UiViewportTagState& state) { return state.viewport == viewport; });
-    if (found == gUiViewportTags.end())
-        return snapshot;
-
-    snapshot.hudless = UiTagFresh(found->hudless, now);
-    snapshot.uiAlpha = UiTagFresh(found->uiAlpha, now);
-    snapshot.uiColorAlpha = UiTagFresh(found->uiColorAlpha, now);
-    const UiResourceTagState* ui = snapshot.uiAlpha ? &found->uiAlpha
-        : snapshot.uiColorAlpha ? &found->uiColorAlpha : nullptr;
-    if (!snapshot.hudless || !ui)
-        return snapshot;
-
-    snapshot.hudlessWidth = found->hudless.width;
-    snapshot.hudlessHeight = found->hudless.height;
-    snapshot.uiWidth = ui->width;
-    snapshot.uiHeight = ui->height;
-    snapshot.uiFormat = ui->format;
-    snapshot.dimensionsKnown = snapshot.hudlessWidth != 0
-        && snapshot.hudlessHeight != 0 && snapshot.uiWidth != 0
-        && snapshot.uiHeight != 0;
-    snapshot.dimensionsMatch = snapshot.dimensionsKnown
-        && found->hudless.top == ui->top && found->hudless.left == ui->left
-        && snapshot.hudlessWidth == snapshot.uiWidth
-        && snapshot.hudlessHeight == snapshot.uiHeight;
-
-    const uint32_t colorWidth = gGameColorWidth.load(std::memory_order_relaxed);
-    const uint32_t colorHeight = gGameColorHeight.load(std::memory_order_relaxed);
-    if (snapshot.dimensionsMatch && colorWidth != 0 && colorHeight != 0)
+    auto snapshot = gUiInputTracker.Read(viewport, generation, GetTickCount64(),
+        active ? gGameColorWidth.load(std::memory_order_relaxed) : 0,
+        active ? gGameColorHeight.load(std::memory_order_relaxed) : 0,
+        active ? gGameHudlessBufferFormat.load(std::memory_order_relaxed) : 0,
+        active ? gGameUiBufferFormat.load(std::memory_order_relaxed) : 0);
+    if (generation != CurrentUiInputGeneration())
     {
-        snapshot.dimensionsMatch = snapshot.hudlessWidth == colorWidth
-            && snapshot.hudlessHeight == colorHeight;
+        snapshot.ready = false;
+        snapshot.generationCurrent = false;
+        snapshot.failure = ui_input_coherence::Failure::eGenerationChanged;
     }
-
-    const uint64_t hudlessAge = now - found->hudless.lastSeenTick;
-    const uint64_t uiAge = now - ui->lastSeenTick;
-    snapshot.oldestAgeMs = std::max(hudlessAge, uiAge);
-    snapshot.ready = snapshot.dimensionsMatch;
     return snapshot;
 }
 
-void RefreshUiInputReadiness(uint32_t viewport)
+struct UiTagBatch
 {
-    if (viewport == UINT32_MAX)
-        return;
-    const UiInputSnapshot snapshot = ReadUiInputSnapshot(viewport);
-    const bool previous = gUiInputsReady.exchange(snapshot.ready, std::memory_order_acq_rel);
-    if (previous == snapshot.ready)
-        return;
+    uint32_t viewport = UINT32_MAX;
+    bool valid = false;
+    bool framed = false;
+    uint32_t frame = 0;
+    uint64_t tick = 0;
+    ui_input_coherence::Generation generation{};
+    std::array<ui_input_coherence::Resource, 3> resources{};
+};
 
-    if (gControlReady.load(std::memory_order_acquire))
-        gDesiredRevision.fetch_add(1, std::memory_order_release);
-    Log(L"UI inputs changed: ready=%d viewport=%u hudless=%d uiAlpha=%d "
-        L"uiColorAlpha=%d dimensionsKnown=%d dimensionsMatch=%d "
-        L"hudless=%ux%u ui=%ux%u",
-        snapshot.ready, viewport, snapshot.hudless, snapshot.uiAlpha,
-        snapshot.uiColorAlpha, snapshot.dimensionsKnown, snapshot.dimensionsMatch,
-        snapshot.hudlessWidth, snapshot.hudlessHeight,
-        snapshot.uiWidth, snapshot.uiHeight);
-}
-
-void CaptureUiResourceTags(const sl::ViewportHandle& viewport,
-    const sl::ResourceTag* tags, uint32_t numTags)
+UiTagBatch PrepareUiResourceTags(const sl::ViewportHandle& viewport,
+    const sl::ResourceTag* tags, uint32_t numTags, bool framed, uint32_t frame)
 {
-    if (!tags || numTags == 0 || numTags > 1024)
-        return;
-
-    const uint32_t viewportValue = static_cast<uint32_t>(viewport);
-    const uint64_t tick = GetTickCount64();
-    bool relevant = false;
+    UiTagBatch batch{};
+    if (!tags || !numTags || numTags > 1024) return batch;
+    batch.viewport = static_cast<uint32_t>(viewport);
+    batch.framed = framed;
+    batch.frame = frame;
+    batch.tick = GetTickCount64();
+    batch.generation = CurrentUiInputGeneration();
+    // Copy bounded metadata while the caller's descriptors are valid. No COM
+    // references, caller chains, or FrameToken pointers survive this call.
+    for (uint32_t index = 0; index < numTags; ++index)
     {
-        std::lock_guard lock(gUiTagMutex);
-        auto found = std::find_if(gUiViewportTags.begin(), gUiViewportTags.end(),
-            [&](const UiViewportTagState& state) { return state.viewport == viewportValue; });
-        if (found == gUiViewportTags.end())
+        const auto& tag = tags[index];
+        size_t slot = 3;
+        if (tag.type == sl::kBufferTypeHUDLessColor) slot = 0;
+        else if (tag.type == sl::kBufferTypeUIAlpha) slot = 1;
+        else if (tag.type == sl::kBufferTypeUIColorAndAlpha) slot = 2;
+        if (slot != 3)
         {
-            gUiViewportTags.push_back({});
-            found = std::prev(gUiViewportTags.end());
-            found->viewport = viewportValue;
-        }
-
-        for (uint32_t index = 0; index < numTags; ++index)
-        {
-            const sl::ResourceTag& tag = tags[index];
-            UiResourceTagState* destination = nullptr;
-            if (tag.type == sl::kBufferTypeHUDLessColor)
-                destination = &found->hudless;
-            else if (tag.type == sl::kBufferTypeUIAlpha)
-                destination = &found->uiAlpha;
-            else if (tag.type == sl::kBufferTypeUIColorAndAlpha)
-                destination = &found->uiColorAlpha;
-            if (!destination)
-                continue;
-            *destination = CaptureUiResourceTag(tag, tick);
-            relevant = true;
+            batch.resources[slot] = CaptureUiResourceTag(tag, batch.tick);
+            batch.valid = true;
         }
     }
+    // A new explicitly framed tagging call advances the observed frame even
+    // if it contains only other inputs, so previous-frame UI cannot linger.
+    batch.valid = batch.valid || framed;
+    return batch;
+}
 
-    const uint32_t activeViewport = gLastOptionsViewport.load(std::memory_order_acquire);
-    if (relevant && (activeViewport == UINT32_MAX || activeViewport == viewportValue))
-        RefreshUiInputReadiness(viewportValue);
+void RecordUiResourceTags(const UiTagBatch& batch)
+{
+    if (!batch.valid) return;
+    {
+        std::lock_guard lock(gUiTagMutex);
+        if (batch.generation != CurrentUiInputGeneration())
+        {
+            gUiInputTracker.Invalidate(batch.viewport);
+            return;
+        }
+        auto* entry = gUiInputTracker.Begin(batch.viewport, batch.framed,
+            batch.frame, batch.generation, batch.tick);
+        if (!entry) return;
+        for (size_t slot = 0; slot < batch.resources.size(); ++slot)
+            if (batch.resources[slot].observed)
+                gUiInputTracker.Observe(*entry,
+                    static_cast<ui_input_coherence::Kind>(slot), batch.resources[slot]);
+    }
 }
 
 bool DlssgStateAvailable(sl::Result result) noexcept
@@ -697,6 +818,8 @@ void ResetFpsTelemetry() noexcept
 {
     gFpsWindowStart = {};
     gFpsWindowOutputFrames = 0;
+    gFpsWindowOutputAvailable = false;
+    gFpsOutputSource.store(0, std::memory_order_relaxed);
     const temporal_interval_trace::Snapshot intervalTrace =
         temporal_interval_trace::ReadSnapshot();
     for (size_t index = 0;
@@ -712,7 +835,8 @@ void ResetFpsTelemetry() noexcept
     gFpsSampleTick.store(0, std::memory_order_release);
 }
 
-void UpdateFpsTelemetryForOutputPresent()
+void UpdateFpsTelemetryForOutputPresent(uint32_t outputFrames,
+    bool outputAvailable, uint32_t outputSource)
 {
     LARGE_INTEGER now{};
     if (!QueryPerformanceCounter(&now))
@@ -724,6 +848,7 @@ void UpdateFpsTelemetryForOutputPresent()
     {
         gFpsWindowStart = now;
         gFpsWindowOutputFrames = 0;
+        gFpsWindowOutputAvailable = outputAvailable;
         const temporal_interval_trace::Snapshot intervalTrace =
             temporal_interval_trace::ReadSnapshot();
         for (size_t index = 0;
@@ -736,7 +861,8 @@ void UpdateFpsTelemetryForOutputPresent()
         return;
     }
 
-    ++gFpsWindowOutputFrames;
+    gFpsWindowOutputFrames += outputFrames;
+    gFpsWindowOutputAvailable &= outputAvailable;
     const uint64_t elapsedTicks = static_cast<uint64_t>(
         now.QuadPart - gFpsWindowStart.QuadPart);
     const uint64_t minimumTicks = static_cast<uint64_t>(
@@ -761,11 +887,13 @@ void UpdateFpsTelemetryForOutputPresent()
 
     const uint64_t frequency = static_cast<uint64_t>(gFpsCounterFrequency.QuadPart);
     const auto rateMilli = [&](uint64_t frames) {
-        return static_cast<uint32_t>(std::min<uint64_t>(UINT32_MAX,
-            (frames * frequency * 1000u + elapsedTicks / 2u) / elapsedTicks));
+        return frame_telemetry::RateMilli(frames, frequency, elapsedTicks);
     };
     gRealFpsMilli.store(rateMilli(realFrames), std::memory_order_relaxed);
-    gDlssFpsMilli.store(rateMilli(gFpsWindowOutputFrames),
+    gDlssFpsMilli.store(gFpsWindowOutputAvailable
+        ? rateMilli(gFpsWindowOutputFrames) : 0u,
+        std::memory_order_relaxed);
+    gFpsOutputSource.store(gFpsWindowOutputAvailable ? outputSource : 0u,
         std::memory_order_relaxed);
     gFpsSampleWindowMs.store(static_cast<uint32_t>(
         std::min<uint64_t>(UINT32_MAX,
@@ -774,6 +902,7 @@ void UpdateFpsTelemetryForOutputPresent()
     gFpsSampleTick.store(GetTickCount64(), std::memory_order_release);
     gFpsWindowStart = now;
     gFpsWindowOutputFrames = 0;
+    gFpsWindowOutputAvailable = outputAvailable;
 }
 
 void ResetIntervalFpsWindow(
@@ -794,7 +923,7 @@ void UpdateFpsTelemetryWithoutPresentCallback()
 {
     std::lock_guard telemetryLock(gFpsTelemetryMutex);
     const uint64_t nowTick = GetTickCount64();
-    if (!gGameFrameGenerationOn.load(std::memory_order_acquire))
+    if (!gAppliedFrameGenerationOn.load(std::memory_order_acquire))
     {
         if (gRealFpsMilli.load(std::memory_order_relaxed) != 0
             || gDlssFpsMilli.load(std::memory_order_relaxed) != 0)
@@ -873,6 +1002,7 @@ void UpdateFpsTelemetryWithoutPresentCallback()
             realFrames = std::max(realFrames, current - previous);
     }
 
+#if !defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     uint32_t presentedMultiplier = gActualFramesPresented.load(
         std::memory_order_relaxed);
     if (presentedMultiplier < kMinimumMultiplier
@@ -883,6 +1013,7 @@ void UpdateFpsTelemetryWithoutPresentCallback()
     }
     presentedMultiplier = std::clamp(
         presentedMultiplier, kMinimumMultiplier, kMaximumMultiplier);
+#endif
     const uint64_t frequency = static_cast<uint64_t>(
         gFpsCounterFrequency.QuadPart);
     const auto rateMilli = [&](uint64_t frames) {
@@ -890,8 +1021,16 @@ void UpdateFpsTelemetryWithoutPresentCallback()
             (frames * frequency * 1000u + elapsedTicks / 2u) / elapsedTicks));
     };
     gRealFpsMilli.store(rateMilli(realFrames), std::memory_order_relaxed);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    // The selected mode and the latest GetState result are not output counts
+    // for this time window. Keep the real rate if DXGI telemetry is unavailable.
+    gDlssFpsMilli.store(0, std::memory_order_relaxed);
+    gFpsOutputSource.store(0, std::memory_order_relaxed);
+#else
     gDlssFpsMilli.store(rateMilli(realFrames * presentedMultiplier),
         std::memory_order_relaxed);
+    gFpsOutputSource.store(3, std::memory_order_relaxed);
+#endif
     gFpsSampleWindowMs.store(static_cast<uint32_t>(
         std::min<uint64_t>(UINT32_MAX,
             (elapsedTicks * 1000u + frequency / 2u) / frequency)),
@@ -907,7 +1046,11 @@ void RecordDlssgStateResult(
     gGetStateSeen.store(true, std::memory_order_release);
     gLastGetStateResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
     if (!DlssgStateAvailable(result))
+    {
+        gFgVsyncSupportKnown.store(false, std::memory_order_release);
+        gFgVsyncSupported.store(false, std::memory_order_release);
         return;
+    }
 
     const uint32_t previous =
         gActualFramesPresented.exchange(state.numFramesActuallyPresented,
@@ -915,14 +1058,51 @@ void RecordDlssgStateResult(
     gDlssgStatus.store(static_cast<uint32_t>(state.status), std::memory_order_relaxed);
     if (state.structVersion >= sl::kStructVersion2)
         gNumFramesToGenerateMax.store(
-            state.numFramesToGenerateMax, std::memory_order_relaxed);
+            UseAmpere() ? std::min(state.numFramesToGenerateMax, kMaximumMultiplier - 1u)
+                : state.numFramesToGenerateMax, std::memory_order_relaxed);
+    bool dynamicChanged = false;
+    if (state.structVersion < sl::kStructVersion4)
+    {
+        gFgVsyncSupportKnown.store(false, std::memory_order_release);
+        gFgVsyncSupported.store(false, std::memory_order_release);
+    }
     if (state.structVersion >= sl::kStructVersion4)
-        gDynamicMfgSupported.store(
-            state.bIsDynamicMFGSupported == sl::Boolean::eTrue,
+    {
+        // Dynamic V-Sync additionally requires the verified 2.14.1 runtime
+        // and D3D12 route; this field alone remains a general FG capability.
+        const bool vsyncKnown = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue
+            || state.bIsVsyncSupportAvailable == sl::Boolean::eFalse;
+        gFgVsyncSupported.store(vsyncKnown
+            && state.bIsVsyncSupportAvailable == sl::Boolean::eTrue,
             std::memory_order_relaxed);
+        gFgVsyncSupportKnown.store(vsyncKnown, std::memory_order_release);
+        const bool known = state.bIsDynamicMFGSupported == sl::Boolean::eTrue
+            || state.bIsDynamicMFGSupported == sl::Boolean::eFalse;
+        const bool supported = known
+            && state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+        dynamicChanged = gDynamicMfgSupported.exchange(supported,
+            std::memory_order_relaxed) != supported;
+        dynamicChanged = (gDynamicMfgCapabilityKnown.exchange(known,
+            std::memory_order_release) != known) || dynamicChanged;
+    }
     gStateSampleTick.store(GetTickCount64(), std::memory_order_release);
+    bool capacityChanged = false;
+    if (UseAmpere())
+    {
+        static std::atomic<uint32_t> previousCapacity{0};
+        const uint32_t capacity = ampere_backend::CertifiedMaximumGeneratedFrames();
+        capacityChanged = previousCapacity.exchange(capacity) != capacity;
+    }
+    if (capacityChanged || dynamicChanged)
+    {
+        // A bootstrap clamp or unsupported Dynamic request is not the desired
+        // final mode. Reapply after the owned allocation/capability changes on
+        // either supported GPU family, including late Ada initialization.
+        gAppliedRevision.store(0, std::memory_order_release);
+        gAttemptedRevision.store(0, std::memory_order_release);
+    }
 
-    if (previous != state.numFramesActuallyPresented)
+    if (!UseAmpere() && previous != state.numFramesActuallyPresented)
         Log(L"DLSS-G state sample: frames presented since prior query=%u "
             L"(maximum generated per real frame=%u, status=%u)",
             state.numFramesActuallyPresented,
@@ -932,12 +1112,15 @@ void RecordDlssgStateResult(
 
 bool DynamicMfgCapabilityKnown() noexcept
 {
-    return gStateSampleTick.load(std::memory_order_acquire) != 0;
+    return gDynamicMfgCapabilityKnown.load(std::memory_order_acquire);
 }
 
 bool DynamicMfgSupported() noexcept
 {
     return DynamicMfgCapabilityKnown()
+        && gActiveNgxGraphicsApi.load(std::memory_order_acquire)
+            != static_cast<uint32_t>(NgxGraphicsApi::eVulkan)
+        && (!UseAmpere() || SafeMaximumMultiplier() == ampere_policy::kMaximumGeneratedFrames + 1u)
         && gDynamicMfgSupported.load(std::memory_order_acquire);
 }
 
@@ -966,7 +1149,11 @@ uint32_t ClassifyLoadedRoute(const std::wstring& path)
 
 bool AdapterVerifiedForApi(NgxGraphicsApi api) noexcept
 {
-    return midpoint_fix::AdapterVerified()
+    if (UseAmpere())
+    {
+        return api == NgxGraphicsApi::eD3D12 && gpu_backend::AdapterVerified();
+    }
+    return gpu_backend::AdapterVerified()
         && (api != NgxGraphicsApi::eVulkan
             || gVulkanAdapterVerified.load(std::memory_order_acquire));
 }
@@ -1057,12 +1244,19 @@ bool BridgeReady()
     }
     const entry_detour::Snapshot create = EffectiveNgxCreateDetour();
     const entry_detour::Snapshot evaluate = EffectiveNgxEvaluateDetour();
+    const bool awaitingOptions = control
+        && control->activeSetterPath.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(ControlEntryPath::eNone)
+        && control->setterCalls.load(std::memory_order_acquire) == 0
+        && gNgxFrameGenerationCreateCalls.load(std::memory_order_acquire) == 0
+        && gActiveNgxProviderBase.load(std::memory_order_acquire) == 0;
     const universal_route_policy::Readiness state{
         control != nullptr,
         control && control->wrapperPatched,
         control && control->structureCompatible.load(
             std::memory_order_acquire),
-        control && ActiveSetterCovered(*control),
+        control && (awaitingOptions ? SetterEntryCovered(*control)
+                                   : ActiveSetterCovered(*control)),
         control && StateEntryCovered(*control),
         gActiveNgxProviderBase.load(std::memory_order_acquire) != 0,
         gProviderChangedAfterCreate.load(std::memory_order_acquire),
@@ -1070,8 +1264,9 @@ bool BridgeReady()
         evaluate.current,
         AdapterVerifiedForApi(static_cast<NgxGraphicsApi>(
             gActiveNgxGraphicsApi.load(std::memory_order_acquire))),
-        midpoint_fix::Ready()
+        gpu_backend::Ready()
             && gFirstCreateMidpointReady.load(std::memory_order_acquire),
+        awaitingOptions,
     };
     const UniversalRouteFailure failure =
         universal_route_policy::EvaluateReadiness(state);
@@ -1081,6 +1276,9 @@ bool BridgeReady()
 
 const char* PatchRouteName()
 {
+    const uintptr_t remix = gRemixRuntimeBase.load(std::memory_order_acquire);
+    if (remix && remix != UINTPTR_MAX && !ActiveControlRoute())
+        return "remix"; // Detection only; Remix owns FG options and allocation.
     if (!BridgeReady())
         return "pending";
 
@@ -1126,7 +1324,7 @@ bool TryParseUnsigned(const std::string& content, const char* name,
             return false;
         ++end;
     }
-    if (parsed < minimum || parsed > maximum)
+    if (parsed < minimum || parsed > maximum || !ui_status_json::ValueEnd(content, end))
         return false;
     value = static_cast<uint32_t>(parsed);
     return true;
@@ -1156,6 +1354,8 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
         return false;
 
     const std::string content(data, size);
+    if (!ui_status_json::CompleteObject(content))
+        return false;
     ControlConfig parsed{};
     size_t followGameOffset = 0;
     if (FindJsonValue(content, "followGame", followGameOffset))
@@ -1170,7 +1370,7 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
         parsed.followGame = false;
     }
     if (!TryParseUnsigned(content, "multiplier",
-        kMinimumMultiplier, kMaximumMultiplier, parsed.multiplier))
+        1u, kMaximumMultiplier, parsed.multiplier))
         return false;
 
     size_t modeOffset = 0;
@@ -1194,21 +1394,35 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
             parsed.dynamicTargetFrameRate))
         return false;
 
+    size_t presetOffset = 0;
+    if (FindJsonValue(content, "dlssgPreset", presetOffset)
+        && !TryParseUnsigned(content, "dlssgPreset", 0, 2, parsed.dlssgPreset))
+        return false;
+
     size_t experimentalOffset = 0;
+    size_t pacingOffset = 0;
+    if (FindJsonValue(content, "vsyncMode", pacingOffset)
+        && !TryParseUnsigned(content, "vsyncMode", 0, 2, parsed.vsyncMode))
+        return false;
+    if (FindJsonValue(content, "reflexFrameLimitFps", pacingOffset)
+        && !TryParseUnsigned(content, "reflexFrameLimitFps", 0, 1000,
+            parsed.reflexFrameLimitFps))
+        return false;
     if (FindJsonValue(content, "dynamicExperimental56", experimentalOffset)
         && !TryParseBoolean(content, "dynamicExperimental56",
             parsed.dynamicExperimental56))
         return false;
 
     size_t intervalLoggingOffset = 0;
-    bool legacyIntervalLogging = true;
+    bool legacyIntervalLogging = gpu_dispatch::IsAda() || UseAmpere();
     if (FindJsonValue(content, "intervalLogging", intervalLoggingOffset)
         && !TryParseBoolean(content, "intervalLogging",
             legacyIntervalLogging))
         return false;
-    // Protocol 18 release tracing is always active. Accept the retired setting
-    // so existing files remain valid, but never let it disable diagnostics.
-    parsed.intervalLogging = true;
+    // Both selected backends retain temporal-request tracing for FPS telemetry.
+    // Accept legacy false settings without allowing them to disable collection.
+    parsed.intervalLogging = gpu_dispatch::IsAda() || UseAmpere()
+        || legacyIntervalLogging;
 
     size_t generatedOnlyOffset = 0;
     if (FindJsonValue(content, "generatedOnlyDebug", generatedOnlyOffset)
@@ -1228,6 +1442,13 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
     // key so existing configs migrate without being rejected, but never arm it.
     parsed.selectiveOtaDlssgWrapper = false;
 
+    if (UseAmpere())
+    {
+        if (!ampere_policy::ControlValid(parsed.multiplier, parsed.dynamic,
+                parsed.dynamicExperimental56, parsed.generatedOnlyDebug)) return false;
+        parsed.followGame = false;
+    }
+    parsed.dynamicExperimental56 = false;
     control = parsed;
     return true;
 }
@@ -1261,7 +1482,7 @@ ControlConfig ReadInitialControl()
     ControlConfig control{};
     wchar_t value[16]{};
     const DWORD length = GetEnvironmentVariableW(
-        L"RTX40_MFG_ACTIVE_MULTIPLIER", value, _countof(value));
+        MFG_ENV_PREFIX_W L"ACTIVE_MULTIPLIER", value, _countof(value));
     if (length == 1 && value[0] >= L'2' && value[0] <= L'6')
         control.multiplier = static_cast<uint32_t>(value[0] - L'0');
 
@@ -1275,7 +1496,7 @@ ControlConfig ReadInitialControl()
     // as the first-launch fallback; the next CET selection is written to the
     // sandbox-local file watched by this core.
     const std::wstring executableConfig = JoinPath(
-        gExecutableDirectory, L"RTX40MFG-Universal.json");
+        gExecutableDirectory, MFG_CONFIG_W);
     if (_wcsicmp(gConfigPath.c_str(), executableConfig.c_str()) != 0
         && ReadControlFile(executableConfig, fileControl))
     {
@@ -1285,11 +1506,28 @@ ControlConfig ReadInitialControl()
     return control;
 }
 
+uint32_t ReadInitialDlssgPreset() noexcept
+{
+    // Called at the first provider settings query if the worker has not yet
+    // published control. Registering this callback in DllMain performs no I/O.
+    try { return ReadInitialControl().dlssgPreset; }
+    catch (...) { return 2; }
+}
+
 std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableDirectory)
 {
+#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
+    // The integrated UI owns this transport; an old CET script is not a
+    // consumer of the unified filenames and must not redirect the worker.
+    return unified_control_paths::Config(executableDirectory);
+#endif
+    if (UseAmpere())
+    {
+        return JoinPath(executableDirectory, MFG_CONFIG_W);
+    }
     std::wstring explicitPath(32768, L'\0');
     const DWORD explicitLength = GetEnvironmentVariableW(
-        L"RTX40_MFG_CONFIG_PATH", explicitPath.data(),
+        MFG_CONFIG_ENV_W, explicitPath.data(),
         static_cast<DWORD>(explicitPath.size()));
     if (explicitLength > 0 && explicitLength < explicitPath.size())
     {
@@ -1298,13 +1536,17 @@ std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableD
     }
 
 #if defined(MFG_UNLOCK_UNIVERSAL_CONFIG)
+#if !(MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT || MFG_UNLOCK_OUTPUT_PULL_TELEMETRY)
+    // The isolated OutputPull builds pair with the executable-side ReShade UI.
+    // Preserve the stock CET autodetection only outside this experiment.
     const std::wstring cetDirectory = JoinPath(executableDirectory,
         L"plugins\\cyber_engine_tweaks\\mods\\RTX40MFG");
     if (IsRegularFile(JoinPath(cetDirectory, L"init.lua")))
     {
-        return JoinPath(cetDirectory, L"RTX40MFG-Universal.json");
+        return JoinPath(cetDirectory, MFG_CONFIG_W);
     }
-    return JoinPath(executableDirectory, L"RTX40MFG-Universal.json");
+#endif
+    return JoinPath(executableDirectory, MFG_CONFIG_W);
 #else
     const std::wstring cetPath = JoinPath(executableDirectory,
         L"plugins\\cyber_engine_tweaks\\mods\\RTX40MFG\\config.json");
@@ -1324,9 +1566,16 @@ std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableD
 std::wstring ResolveStatusPath(const std::wstring& configPath,
     const std::wstring& executableDirectory)
 {
+#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
+    return unified_control_paths::Status(configPath, executableDirectory);
+#endif
+    if (UseAmpere())
+    {
+        return JoinPath(executableDirectory, MFG_STATUS_W);
+    }
     std::wstring explicitPath(32768, L'\0');
     const DWORD explicitLength = GetEnvironmentVariableW(
-        L"RTX40_MFG_STATUS_PATH", explicitPath.data(),
+        MFG_STATUS_ENV_W, explicitPath.data(),
         static_cast<DWORD>(explicitPath.size()));
     if (explicitLength > 0 && explicitLength < explicitPath.size())
     {
@@ -1336,15 +1585,15 @@ std::wstring ResolveStatusPath(const std::wstring& configPath,
 
 #if defined(MFG_UNLOCK_UNIVERSAL_CONFIG)
     const std::wstring universalConfig = JoinPath(
-        executableDirectory, L"RTX40MFG-Universal.json");
+        executableDirectory, MFG_CONFIG_W);
     const std::wstring cetConfig = JoinPath(executableDirectory,
         L"plugins\\cyber_engine_tweaks\\mods\\RTX40MFG\\"
-        L"RTX40MFG-Universal.json");
+        MFG_CONFIG_W);
     if (_wcsicmp(configPath.c_str(), universalConfig.c_str()) == 0
         || _wcsicmp(configPath.c_str(), cetConfig.c_str()) == 0)
     {
         return JoinPath(ParentPath(configPath),
-            L"RTX40MFG-Universal.status.json");
+            MFG_STATUS_W);
     }
 #endif
     return JoinPath(ParentPath(configPath), L"bridge_status.json");
@@ -1352,14 +1601,20 @@ std::wstring ResolveStatusPath(const std::wstring& configPath,
 
 uint64_t StoreControl(const ControlConfig& control)
 {
+    std::lock_guard controlLock(gControlSnapshotMutex);
     gDesiredFollowGame.store(control.followGame, std::memory_order_relaxed);
     gDesiredMultiplier.store(control.multiplier, std::memory_order_relaxed);
     gDesiredDynamicMode.store(control.dynamic, std::memory_order_relaxed);
     gDynamicTargetFrameRate.store(control.dynamicTargetFrameRate, std::memory_order_relaxed);
+    gDlssgPresetRequested.store(control.dlssgPreset, std::memory_order_relaxed);
+    gVsyncMode.store(control.vsyncMode, std::memory_order_relaxed);
+    gReflexFrameLimitFps.store(control.reflexFrameLimitFps, std::memory_order_relaxed);
+    dlssg_preset::SetRequested(control.dlssgPreset);
     gDynamicExperimental56.store(control.dynamicExperimental56, std::memory_order_relaxed);
     gGeneratedOnlyDebug.store(control.generatedOnlyDebug,
         std::memory_order_relaxed);
-    temporal_interval_trace::SetEnabled(true);
+    temporal_interval_trace::SetEnabled(gpu_dispatch::IsAda() || UseAmpere()
+        || control.intervalLogging);
     const uint64_t revision = gDesiredRevision.fetch_add(1, std::memory_order_release) + 1;
     gControlReady.store(true, std::memory_order_release);
     return revision;
@@ -1367,6 +1622,7 @@ uint64_t StoreControl(const ControlConfig& control)
 
 ControlSnapshot ReadControlSnapshot()
 {
+    std::lock_guard controlLock(gControlSnapshotMutex);
     ControlSnapshot snapshot{};
     for (;;)
     {
@@ -1377,6 +1633,11 @@ ControlSnapshot ReadControlSnapshot()
         snapshot.control.dynamic = gDesiredDynamicMode.load(std::memory_order_relaxed);
         snapshot.control.dynamicTargetFrameRate =
             gDynamicTargetFrameRate.load(std::memory_order_relaxed);
+        snapshot.control.dlssgPreset =
+            gDlssgPresetRequested.load(std::memory_order_relaxed);
+        snapshot.control.vsyncMode = gVsyncMode.load(std::memory_order_relaxed);
+        snapshot.control.reflexFrameLimitFps =
+            gReflexFrameLimitFps.load(std::memory_order_relaxed);
         snapshot.control.dynamicExperimental56 =
             gDynamicExperimental56.load(std::memory_order_relaxed);
         snapshot.control.generatedOnlyDebug =
@@ -1397,19 +1658,19 @@ void PublishLiveBridge(const ControlConfig& control)
         control.multiplier, kMinimumMultiplier, kMaximumMultiplier)), L'\0' };
     wchar_t target[16]{};
     swprintf_s(target, L"%u", control.dynamicTargetFrameRate);
-    SetEnvironmentVariableW(L"RTX40_MFG_ACTIVE_MULTIPLIER", multiplier);
-    SetEnvironmentVariableW(L"RTX40_MFG_ACTIVE_MODE",
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"ACTIVE_MULTIPLIER", multiplier);
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"ACTIVE_MODE",
         control.followGame ? L"follow"
             : control.dynamic ? L"dynamic" : L"fixed");
-    SetEnvironmentVariableW(L"RTX40_MFG_FOLLOW_GAME",
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"FOLLOW_GAME",
         control.followGame ? L"1" : L"0");
-    SetEnvironmentVariableW(L"RTX40_MFG_DYNAMIC_TARGET", target);
-    SetEnvironmentVariableW(L"RTX40_MFG_DYNAMIC_EXPERIMENTAL_56",
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"DYNAMIC_TARGET", target);
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"DYNAMIC_EXPERIMENTAL_56",
         control.dynamicExperimental56 ? L"1" : L"0");
-    SetEnvironmentVariableW(L"RTX40_MFG_GENERATED_ONLY_DEBUG",
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"GENERATED_ONLY_DEBUG",
         control.generatedOnlyDebug ? L"1" : L"0");
-    SetEnvironmentVariableW(L"RTX40_MFG_INTERVAL_LOGGING", L"1");
-    SetEnvironmentVariableW(L"RTX40_MFG_AUTO_BRIDGE", L"1");
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"INTERVAL_LOGGING", L"1");
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"AUTO_BRIDGE", L"1");
 }
 
 void PublishPatchRoute()
@@ -1417,7 +1678,7 @@ void PublishPatchRoute()
     const char* route = PatchRouteName();
     wchar_t wideRoute[16]{};
     MultiByteToWideChar(CP_UTF8, 0, route, -1, wideRoute, _countof(wideRoute));
-    SetEnvironmentVariableW(L"RTX40_MFG_PATCH_ROUTE", wideRoute);
+    SetEnvironmentVariableW(MFG_ENV_PREFIX_W L"PATCH_ROUTE", wideRoute);
 }
 
 uint64_t UnixTimeSeconds()
@@ -1498,6 +1759,127 @@ const char* ControlDetourMethod(const ControlRouteRecord* route,
         entry_detour::ReadSnapshot(handle).method);
 }
 
+struct PresentationRuntimeProof
+{
+    uintptr_t wrapper = 0;
+    uint64_t wrapperGeneration = 0;
+    uintptr_t provider = 0;
+    uint64_t providerGeneration = 0;
+    uint64_t createHandle = 0;
+    uint64_t evaluateHandle = 0;
+    uint64_t lifecycleEpoch = 0;
+    bool operator==(const PresentationRuntimeProof&) const = default;
+};
+
+std::mutex gPresentationProofMutex;
+PresentationRuntimeProof gPresentationProof{};
+uint64_t gPresentationRuntimeEpoch = 0;
+bool gPresentationProviderEligible = false;
+
+PresentationRuntimeProof CurrentPresentationProof() noexcept
+{
+    const auto* route = ActiveControlRoute();
+    return {route ? reinterpret_cast<uintptr_t>(route->wrapper) : 0,
+        route ? route->generation : 0,
+        gActiveNgxProviderBase.load(std::memory_order_acquire),
+        gActiveNgxProviderGeneration.load(std::memory_order_acquire),
+        gActiveNgxCreateHandle.load(std::memory_order_acquire),
+        gActiveNgxEvaluateHandle.load(std::memory_order_acquire),
+        gPresentationLifecycleEpoch.load(std::memory_order_acquire)};
+}
+
+bool FrameGenerationRuntimeCurrent() noexcept
+{
+    // Callback-time validation performs no filesystem or NVIDIA calls. The
+    // worker binds its version check to this exact selected route generation.
+    const auto* route = ActiveControlRoute();
+    if (!route || gActiveNgxGraphicsApi.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(NgxGraphicsApi::eUnknown)
+        || !gAppliedFrameGenerationOn.load(std::memory_order_acquire)
+        || gRestartRequired.load(std::memory_order_acquire)
+        || !BridgeReady()) return false;
+    const auto current = CurrentPresentationProof();
+    if (current.wrapper != reinterpret_cast<uintptr_t>(route->wrapper)
+        || current.wrapperGeneration != route->generation) return false;
+    std::lock_guard lock(gPresentationProofMutex);
+    return current.provider && current.providerGeneration
+        && current.createHandle && current.evaluateHandle
+        && current == gPresentationProof;
+}
+
+bool PresentationRuntimeCurrent() noexcept
+{
+    const auto* route = ActiveControlRoute();
+    if (!route || route->version.major != 2 || route->version.minor != 14
+        || route->version.build != 1 || !FrameGenerationRuntimeCurrent()) return false;
+    std::lock_guard lock(gPresentationProofMutex);
+    return gPresentationProviderEligible;
+}
+
+bool ReflexRuntimeCurrent() noexcept
+{
+    // The manual cap is suspended for both requested and game-owned Dynamic
+    // mode. Configure retains its saved value and the next proven Reflex
+    // callback restores the game's own options before any later re-enable.
+    if (gDesiredDynamicMode.load(std::memory_order_acquire)
+        || gAppliedDynamicMode.load(std::memory_order_acquire)
+        || !FrameGenerationRuntimeCurrent()) return false;
+    // Fixed D3D12 limiting uses the stable public Reflex API; it does not
+    // depend on the private Dynamic/V-Sync implementation or provider 310.9.1.
+    // Keep the existing Vulkan compatibility boundary intact.
+    return gActiveNgxGraphicsApi.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(NgxGraphicsApi::eD3D12)
+        || PresentationRuntimeCurrent();
+}
+
+bool VsyncRuntimeCurrent() noexcept
+{
+    // The optional V-Sync override is omitted from this release. Retain its
+    // saved field and ABI slots without authorizing a presentation mutation.
+    return false;
+}
+
+void UpdatePresentationPolicy(const ControlConfig& control)
+{
+    const auto current = CurrentPresentationProof();
+    bool changed = false;
+    {
+        std::lock_guard lock(gPresentationProofMutex);
+        changed = current != gPresentationProof;
+    }
+    if (changed)
+    {
+        const auto version = ReadFileVersion(LoadedModulePath(
+            reinterpret_cast<HMODULE>(current.provider)));
+        std::lock_guard lock(gPresentationProofMutex);
+        gPresentationProviderEligible = current.provider != 0
+            && current.providerGeneration != 0 && version.major == 310
+            && version.minor == 9 && version.build == 1;
+        gPresentationProof = current;
+        ++gPresentationRuntimeEpoch;
+    }
+    reflex_control::Configure(control.reflexFrameLimitFps, ReflexRuntimeCurrent());
+    vsync_control::Configure(0, false, gPresentationRuntimeEpoch);
+}
+
+void DiscoverReflexModule()
+{
+    // This function is called only by the normal worker, after loader discovery
+    // has returned. Never install this transport from a LoadLibrary callback.
+    std::vector<ModuleRecord> modules;
+    {
+        std::lock_guard lock(gModuleMutex);
+        for (const auto& record : gModuleRecords)
+        {
+            // This export identifies plugin candidates, including NVIDIA OTA
+            // filenames. ObserveModule then requires the owned Reflex entries.
+            if (record.wrapperExport) modules.push_back(record);
+        }
+    }
+    for (const auto& record : modules)
+        reflex_control::ObserveModule(record.module, record.path.c_str(), record.generation);
+}
+
 bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
 {
     if (gStatusPath.empty())
@@ -1505,7 +1887,6 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
 
     UpdateFpsTelemetryWithoutPresentCallback();
     const uint32_t uiViewport = gLastOptionsViewport.load(std::memory_order_acquire);
-    RefreshUiInputReadiness(uiViewport);
     const UiInputSnapshot uiInputs = ReadUiInputSnapshot(uiViewport);
     const bool bridgeReady = BridgeReady();
     const char* route = PatchRouteName();
@@ -1515,13 +1896,15 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     const bool getStateSeen = gGetStateSeen.load(std::memory_order_acquire);
     const bool gameFrameGenerationOn =
         gGameFrameGenerationOn.load(std::memory_order_acquire);
+    const bool appliedFrameGenerationOn =
+        gAppliedFrameGenerationOn.load(std::memory_order_acquire);
     const int32_t setOptionsResult =
         gLastSetOptionsResult.load(std::memory_order_relaxed);
     const int32_t getStateResult =
         gLastGetStateResult.load(std::memory_order_relaxed);
     const bool setOptionsAccepted = setOptionsResult == static_cast<int32_t>(sl::Result::eOk)
         || setOptionsResult == static_cast<int32_t>(sl::Result::eWarnOutOfVRAM);
-    const bool applied = gameFrameGenerationOn && appliedRevision != 0
+    const bool applied = appliedFrameGenerationOn && appliedRevision != 0
         && setOptionsAccepted;
     const bool pending = gameFrameGenerationOn && desiredRevision != appliedRevision;
     const uint64_t stateTick = gStateSampleTick.load(std::memory_order_acquire);
@@ -1560,10 +1943,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         == streamline_ota_policy::kLoadDownloadedPlugins);
     const uint32_t safeMaximumMultiplier = SafeMaximumMultiplier();
     const bool requestedMultiplierLimited =
-        !control.followGame
-        && (control.multiplier > safeMaximumMultiplier
-            || (control.dynamic && control.dynamicExperimental56
-                && safeMaximumMultiplier < kMaximumMultiplier));
+        !control.followGame && !control.dynamic
+        && control.multiplier > safeMaximumMultiplier;
     const bool setOptionsResolverFallbackActive =
         gSetOptionsResolverFallbackActive.load(std::memory_order_acquire);
     const uint64_t setOptionsResolverFallbackCalls =
@@ -1573,6 +1954,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
             && setOptionsResolverFallbackCalls > 0);
     const temporal_interval_trace::Snapshot intervalTrace =
         temporal_interval_trace::ReadSnapshot();
+    const auto preset = dlssg_preset::ReadSnapshot(reinterpret_cast<HMODULE>(
+        gActiveNgxProviderBase.load(std::memory_order_acquire)));
     const bool restartRequired =
         gRestartRequired.load(std::memory_order_acquire);
     const nvidia_mfg_policy::CapacityDecision compatibilityCapacity =
@@ -1608,7 +1991,9 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         ? "runtime-caller" : selectionSource
             == static_cast<uint32_t>(
                 NgxProviderSelectionSource::eRuntimeUniqueCandidate)
-        ? "runtime-unique-candidate" : "none";
+        ? "runtime-unique-candidate" : selectionSource
+            == static_cast<uint32_t>(NgxProviderSelectionSource::eRuntimeDispatchTable)
+        ? "runtime-dispatch-table" : "none";
     const UniversalRouteFailure routeFailure =
         static_cast<UniversalRouteFailure>(gUniversalRouteFailure.load(
             std::memory_order_acquire));
@@ -1618,7 +2003,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
 
     char json[16384]{};
     const int length = sprintf_s(json,
-        "{\"version\":18,\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
+        "{\"version\":" MFG_STATUS_VERSION ",\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
         "\"bridgeReady\":%s,\"liveHookInstalled\":%s,"
         "\"loaderCoreImported\":true,"
         "\"nvidiaCompatibilityResolved\":%s,"
@@ -1712,6 +2097,10 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"dynamicTargetFrameRate\":%u,"
         "\"dynamicExperimental56\":%s,\"generatedOnlyDebug\":%s,"
         "\"forcedMaximumMultiplier\":%u,"
+        "\"dlssgPresetRequested\":%u,\"dlssgPresetOverrideInstalled\":%s,"
+        "\"dlssgPresetOverrideFailure\":%u,\"dlssgPresetReadCount\":%llu,"
+        "\"dlssgCachedPresetInstalled\":%s,\"dlssgCachedPresetFailure\":%u,"
+        "\"dlssgCachedPresetRva\":%u,\"dlssgCachedPresetReadCount\":%llu,"
         "\"requestedMultiplierLimited\":%s,"
         "\"intervalLoggingEnabled\":%s,\"intervalLogReady\":%s,"
         "\"intervalValidSamples\":%llu,\"intervalInvalidSamples\":%llu,"
@@ -1719,20 +2108,24 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"intervalSeenIndexMask\":%u,\"intervalLastCount\":%d,"
         "\"intervalLastIndex\":%d,\"intervalLastPositionNumerator\":%u,"
         "\"intervalLastPositionDenominator\":%u,"
-        "\"intervalLogFile\":\"MfgUnlock-intervals-%lu.csv\","
+        "\"intervalLogFile\":\"" MFG_LOG_PREFIX "-intervals-%lu.csv\","
         "\"requestRevision\":%llu,\"appliedRevision\":%llu,"
         "\"applied\":%s,\"pending\":%s,\"gameFrameGenerationOn\":%s,"
+        "\"appliedFrameGenerationOn\":%s,"
         "\"appliedMode\":\"%s\",\"appliedMultiplier\":%u,"
-        "\"appliedDynamicTargetFrameRate\":%u,"
+        "\"appliedDynamicTargetFrameRate\":%.3f,"
+        "\"appliedDynamicTargetValid\":%s,"
         "\"appliedDynamicExperimental56\":%s,"
         "\"appliedGeneratedOnlyDebug\":%s,\"setOptionsSeen\":%s,"
         "\"setOptionsAccepted\":%s,"
         "\"setOptionsResult\":%d,\"getStateSeen\":%s,\"getStateResult\":%d,"
         "\"actualFramesPresented\":%u,\"numFramesToGenerateMax\":%u,"
         "\"realFpsMilli\":%u,\"dlssFpsMilli\":%u,"
+        "\"fpsOutputSource\":%u,"
         "\"fpsSampleWindowMs\":%u,\"fpsSampleAgeMs\":%llu,"
         "\"dlssgStatus\":%u,\"dynamicMfgSupportKnown\":%s,"
         "\"dynamicMfgSupported\":%s,"
+        "\"fgVsyncSupportKnown\":%s,\"fgVsyncSupported\":%s,"
         "\"gameOptionsStructVersion\":%u,\"gameUiRecompositionEnabled\":%s,"
         "\"gameHudlessBufferFormat\":%u,\"gameUiBufferFormat\":%u,"
         "\"hudlessTagActive\":%s,\"uiAlphaTagActive\":%s,"
@@ -1909,6 +2302,10 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         control.dynamicExperimental56 ? "true" : "false",
         control.generatedOnlyDebug ? "true" : "false",
         safeMaximumMultiplier,
+        control.dlssgPreset, preset.installed ? "true" : "false", preset.failure,
+        static_cast<unsigned long long>(preset.providerReads),
+        preset.cachedReaderInstalled ? "true" : "false", preset.cachedReaderFailure,
+        preset.cachedReaderRva, static_cast<unsigned long long>(preset.cachedReaderReads),
         requestedMultiplierLimited ? "true" : "false",
         intervalTrace.enabled ? "true" : "false",
         intervalTrace.logReady ? "true" : "false",
@@ -1924,9 +2321,11 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         static_cast<unsigned long long>(appliedRevision),
         applied ? "true" : "false", pending ? "true" : "false",
         gameFrameGenerationOn ? "true" : "false",
+        appliedFrameGenerationOn ? "true" : "false",
         gAppliedDynamicMode.load(std::memory_order_relaxed) ? "dynamic" : "fixed",
         gAppliedMultiplier.load(std::memory_order_relaxed),
-        gAppliedDynamicTargetFrameRate.load(std::memory_order_relaxed),
+        static_cast<double>(gAppliedDynamicTargetFrameRate.load(std::memory_order_relaxed)),
+        gAppliedDynamicTargetValid.load(std::memory_order_relaxed) ? "true" : "false",
         gAppliedDynamicExperimental56.load(std::memory_order_relaxed) ? "true" : "false",
         gAppliedGeneratedOnlyDebug.load(std::memory_order_relaxed) ? "true" : "false",
         setOptionsSeen ? "true" : "false",
@@ -1936,11 +2335,14 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         gNumFramesToGenerateMax.load(std::memory_order_relaxed),
         gRealFpsMilli.load(std::memory_order_relaxed),
         gDlssFpsMilli.load(std::memory_order_relaxed),
+        gFpsOutputSource.load(std::memory_order_relaxed),
         gFpsSampleWindowMs.load(std::memory_order_relaxed),
         static_cast<unsigned long long>(fpsAgeMs),
         gDlssgStatus.load(std::memory_order_relaxed),
         DynamicMfgCapabilityKnown() ? "true" : "false",
-        gDynamicMfgSupported.load(std::memory_order_relaxed) ? "true" : "false",
+        (UseAmpere() ? DynamicMfgSupported() : gDynamicMfgSupported.load(std::memory_order_relaxed)) ? "true" : "false",
+        gFgVsyncSupportKnown.load(std::memory_order_relaxed) ? "true" : "false",
+        gFgVsyncSupported.load(std::memory_order_relaxed) ? "true" : "false",
         gGameOptionsStructVersion.load(std::memory_order_relaxed),
         gGameUiRecompositionEnabled.load(std::memory_order_relaxed) ? "true" : "false",
         gGameHudlessBufferFormat.load(std::memory_order_relaxed),
@@ -2000,16 +2402,124 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     if (length <= 0)
         return false;
 
-    HANDLE file = CreateFileW(gStatusPath.c_str(), GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+    // ReShade reads concurrently. Publish a complete replacement so a reader
+    // sees the previous snapshot until the new one is ready, never a truncated
+    // or partially written status file.
+    const std::wstring temporary = gStatusPath + L".tmp";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
         return false;
 
+    std::string serialized(json, static_cast<size_t>(length));
+    const size_t gpuClosing = serialized.rfind('}');
+    if (gpuClosing == std::string::npos) { CloseHandle(file); return false; }
+    char gpu[192]{};
+    sprintf_s(gpu, ",\"product\":\"RTXMFG\",\"gpuFamily\":%u,\"gpuAdapterLuid\":%llu,\"gpuSelectionFailure\":%u",
+        static_cast<uint32_t>(gpu_dispatch::Selected()),
+        static_cast<unsigned long long>(gpu_dispatch::AdapterLuid()), gpu_dispatch::FailureCode());
+    serialized.insert(gpuClosing, gpu);
+    char presetStatus[512]{};
+    sprintf_s(presetStatus, ",\"dlssgPresetLatched\":%u,"
+        "\"dlssgPresetSelectionFrozen\":%s,\"dlssgPresetRestartRequired\":%s,"
+        "\"dlssgPresetObserved\":%u,\"dlssgPresetObservedValid\":%s,"
+        "\"dlssgPresetOverrideReadCount\":%llu",
+        preset.latched, preset.selectionFrozen ? "true" : "false",
+        preset.restartRequired ? "true" : "false", preset.observedPreset,
+        preset.observedPresetValid ? "true" : "false",
+        static_cast<unsigned long long>(preset.overrideReads));
+    serialized.insert(serialized.rfind('}'), presetStatus);
+    const auto vsync = vsync_control::ReadSnapshot();
+    const auto reflex = reflex_control::ReadSnapshot();
+    char pacing[2048]{};
+    sprintf_s(pacing, ",\"vsyncMode\":%u,\"reflexFrameLimitFps\":%u,"
+        "\"dynamicVsyncAvailable\":%s,\"vsyncControlAvailable\":%s,"
+        "\"vsyncOverrideApplied\":%s,\"vsyncPresentationObserved\":%s,"
+        "\"vsyncOriginalInterval\":%u,\"vsyncSubmittedInterval\":%u,\"vsyncFailure\":%u,"
+        "\"reflexControlAvailable\":%s,\"reflexAppliedKnown\":%s,"
+        "\"reflexAppliedFrameLimitUs\":%u,\"reflexLimitPending\":%s,"
+        "\"reflexRestorePending\":%s,\"reflexStatus\":%u,\"reflexLastResult\":%u,"
+        "\"reflexHookMask\":%u,\"reflexModuleVersionMajor\":%u,"
+        "\"reflexModuleVersionMinor\":%u,\"reflexModuleVersionPatch\":%u,"
+        "\"reflexModuleGeneration\":%llu",
+        control.vsyncMode, control.reflexFrameLimitFps,
+        VsyncRuntimeCurrent() && DynamicMfgSupported() ? "true" : "false",
+        vsync.available ? "true" : "false", vsync.overrideApplied ? "true" : "false",
+        vsync.matched ? "true" : "false", vsync.originalInterval, vsync.submittedInterval,
+        static_cast<uint32_t>(vsync.failure),
+        reflex.eligible && reflex.cachedPointersCovered && reflex.availabilityKnown
+            && reflex.lowLatencyAvailable ? "true" : "false",
+        reflex.appliedKnown ? "true" : "false", reflex.appliedFrameLimitUs,
+        reflex.pending ? "true" : "false", reflex.restorePending ? "true" : "false",
+        static_cast<uint32_t>(reflex.status), reflex.lastSetResult,
+        reflex.currentHookMask, reflex.moduleVersionMajor, reflex.moduleVersionMinor,
+        reflex.moduleVersionPatch, static_cast<unsigned long long>(reflex.moduleGeneration));
+    serialized.insert(serialized.rfind('}'), pacing);
+    if (UseAmpere())
+    {
+        const size_t closing = serialized.rfind('}');
+        if (closing == std::string::npos) { CloseHandle(file); return false; }
+        const auto diagnostic = ampere_backend::Diagnostics();
+        char ampere[2048]{};
+        sprintf_s(ampere, ",\"ampereProgramReadyMfg\":%s,"
+            "\"ampereFailure\":%u,\"presetQueries\":%llu,"
+            "\"ampereEvaluations\":%llu,\"ampereRejections\":%llu,"
+            "\"ampereNativeMaximum\":%u,\"ampereLastCreateCount\":%d,"
+            "\"ampereNativeMaximumReadResult\":%u,\"ampereStartupMaximum\":%u,\"amperePresentationBuffers\":%u,"
+            "\"ampereCreatedFeatures\":%llu,\"ampereSubmittedBatches\":%llu,"
+            "\"ampereKernelImage\":%u,\"ampereNativeCacheStatus\":%u,\"ampereCertifiedMaximum\":%u,"
+            "\"ampereFirstFailure\":%u,"
+            "\"ampereFirstNgxResult\":%u,"
+            "\"amperePrimaryFailure\":%u,"
+            "\"amperePrimaryNgxResult\":%u,"
+            "\"ampereLastFailure\":%u,"
+            "\"ampereLastNgxResult\":%u,"
+            "\"ampereCreateAttempts\":%llu,"
+            "\"ampereCreateBlockedBeforeProvider\":%llu,"
+            "\"ampereEvaluateAttempts\":%llu,"
+            "\"amperePreparationStage\":%u,\"ampereStartupFailureMask\":%u,"
+            "\"ampereCandidateVersionMajor\":%u,"
+            "\"ampereCandidateVersionMinor\":%u,"
+            "\"ampereCandidateVersionBuild\":%u,\"ampereLegacySinglePreset\":%s",
+            ampere_backend::Ready() ? "true" : "false", ampere_backend::FailureCode(),
+            static_cast<unsigned long long>(ampere_backend::PresetQueries()),
+            static_cast<unsigned long long>(ampere_backend::Evaluations()),
+            static_cast<unsigned long long>(ampere_backend::Rejections()),
+            ampere_backend::NativeMaximumGeneratedFrames(), ampere_backend::LastCreateCount(),
+            ampere_backend::NativeMaximumReadResult(), ampere_backend::StartupMaximumGeneratedFrames(), ampere_backend::PresentationBuffers(),
+            static_cast<unsigned long long>(ampere_backend::CreatedFeatures()),
+            static_cast<unsigned long long>(ampere_backend::SubmittedBatches()),
+            ampere_gpu::KernelImage(), ampere_gpu::NativeCacheStatus(),
+            ampere_backend::CertifiedMaximumGeneratedFrames(),
+            diagnostic.first.code,
+            diagnostic.first.ngxResult,
+            diagnostic.primary.code,
+            diagnostic.primary.ngxResult,
+            diagnostic.last.code,
+            diagnostic.last.ngxResult,
+            static_cast<unsigned long long>(diagnostic.createAttempts),
+            static_cast<unsigned long long>(diagnostic.createBlockedBeforeProvider),
+            static_cast<unsigned long long>(diagnostic.evaluateAttempts),
+            diagnostic.preparationStage, diagnostic.startupFailureMask,
+            static_cast<uint32_t>(diagnostic.candidateVersion >> 32),
+            static_cast<uint32_t>((diagnostic.candidateVersion >> 16) & 0xffffu),
+            static_cast<uint32_t>(diagnostic.candidateVersion & 0xffffu),
+            ampere_backend::LegacySinglePreset() ? "true" : "false");
+        serialized.insert(closing, ampere);
+    }
     DWORD written = 0;
-    const BOOL result = WriteFile(file, json, static_cast<DWORD>(length), &written, nullptr);
+    const BOOL result = WriteFile(file, serialized.data(), static_cast<DWORD>(serialized.size()), &written, nullptr);
+    // This is transient status, not durable settings. Completed cached writes
+    // are visible to readers; do not force disk flushes on each heartbeat.
+    const BOOL complete = result && written == serialized.size();
     CloseHandle(file);
-    return result && written == static_cast<DWORD>(length);
+    if (!complete || !MoveFileExW(temporary.c_str(), gStatusPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING))
+    {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
 }
 
 using ChainFindStatus = universal_route_policy::StructureStatus;
@@ -2060,14 +2570,27 @@ ChainFindStatus FindStructBounded(const sl::BaseStructure* chain,
             return ChainFindStatus::eMalformed;
         if (fields.type == T::s_structType)
         {
-            result = static_cast<const T*>(chain);
-            version = fields.version;
-            return ChainFindStatus::eFound;
+            if (UseAmpere())
+            {
+                // Validate the tail too: the complete chain is forwarded after
+                // our fixed options prefix, so a later cycle must not escape.
+                if (!result)
+                {
+                    result = static_cast<const T*>(chain);
+                    version = fields.version;
+                }
+            }
+            else
+            {
+                result = static_cast<const T*>(chain);
+                version = fields.version;
+                return ChainFindStatus::eFound;
+            }
         }
         chain = fields.next;
     }
     return chain ? ChainFindStatus::eMalformed
-                 : ChainFindStatus::eNotFound;
+                 : result ? ChainFindStatus::eFound : ChainFindStatus::eNotFound;
 }
 
 bool IsSupportedOptionsVersion(size_t version) noexcept
@@ -2117,27 +2640,298 @@ bool IsAcceptedControlResult(sl::Result result) noexcept
         static_cast<int32_t>(sl::Result::eWarnOutOfVRAM));
 }
 
-void RecordSetOptionsLifecycle(ControlRouteRecord& route, bool enabled,
-    sl::Result result) noexcept
+sl::Result HostControlResult(sl::Result result) noexcept
 {
-    if (!IsAcceptedControlResult(result))
-        return;
+    // Match the adjusted-options path at every validated DLSS-G boundary,
+    // including the initial native enable before BridgeReady. SL_FAILED
+    // treats all nonzero results as errors, including this accepted warning.
+    // Record the raw result before returning; real errors remain unchanged.
+    return result == sl::Result::eWarnOutOfVRAM ? sl::Result::eOk : result;
+}
+
+void ClearAppliedDynamicTelemetry() noexcept
+{
+    gAppliedDynamicTargetValid.store(false, std::memory_order_release);
+    gAppliedDynamicMode.store(false, std::memory_order_relaxed);
+    gAppliedDynamicTargetFrameRate.store(0.0f, std::memory_order_relaxed);
+    gAppliedDynamicExperimental56.store(false, std::memory_order_relaxed);
+}
+
+bool SameRetainedFeature(const RetainedFeatureIdentity& left,
+    const RetainedFeatureIdentity& right) noexcept
+{
+    return left.handle == right.handle && left.runtime == right.runtime
+        && left.runtimeGeneration == right.runtimeGeneration
+        && left.provider == right.provider
+        && left.providerGeneration == right.providerGeneration
+        && left.wrapper == right.wrapper
+        && left.wrapperGeneration == right.wrapperGeneration
+        && left.publication == right.publication
+        && left.adapterLuid == right.adapterLuid
+        && left.generatedFrameCapacity == right.generatedFrameCapacity
+        && left.lifetime == right.lifetime
+        && left.createAttemptEpoch == right.createAttemptEpoch;
+}
+
+bool SameObservedFeature(const RetainedFeatureIdentity& feature,
+    const ampere_backend::FeatureLifetimeEvent& event) noexcept
+{
+    return feature.handle == event.handle
+        && feature.lifetime == event.lifetime
+        && feature.runtime == event.runtime
+        && feature.runtimeGeneration == event.runtimeGeneration
+        && feature.provider == event.provider
+        && feature.providerGeneration == event.providerGeneration
+        && feature.wrapper == event.wrapper
+        && feature.wrapperGeneration == event.wrapperGeneration
+        && feature.publication == event.publication
+        && feature.adapterLuid == event.adapterLuid
+        && feature.generatedFrameCapacity == event.generatedFrameCapacity
+        && feature.createAttemptEpoch == event.createAttemptToken;
+}
+
+bool AmpereFeatureEntriesCurrent(uintptr_t runtimeOwner, uint64_t runtimeGeneration,
+    uintptr_t providerOwner, uint64_t providerGeneration) noexcept
+{
+    if (!runtimeOwner || !runtimeGeneration || !providerOwner || !providerGeneration)
+        return false;
+    const auto runtime = entry_detour::ReadSnapshot(
+        entry_detour::Kind::eNgxRuntimeD3D12CreateFeature,
+        reinterpret_cast<HMODULE>(runtimeOwner));
+    const auto provider = entry_detour::ReadSnapshot(
+        entry_detour::Kind::eNgxD3D12CreateFeature,
+        reinterpret_cast<HMODULE>(providerOwner));
+    if (!runtime.current || runtime.currentEntries != 1 || runtime.generation != runtimeGeneration
+        || !provider.current || provider.currentEntries != 1 || provider.generation != providerGeneration)
+        return false;
+    const auto selected = entry_detour::ReadSnapshot(UnpackEntryHandle(
+        gActiveNgxCreateHandle.load(std::memory_order_acquire)));
+    if (!selected.current) return false;
+    // A runtime may select its provider before forwarding, or the nested
+    // concrete provider may select the route. Both entries remain required;
+    // the selected kind determines which exact immutable handle must match.
+    if (selected.kind == entry_detour::Kind::eNgxRuntimeD3D12CreateFeature)
+        return selected.handle == runtime.handle;
+    if (selected.kind == entry_detour::Kind::eNgxD3D12CreateFeature)
+        return selected.handle == provider.handle;
+    return false;
+}
+
+bool RetainedFeatureMatchesRuntime(const RetainedFeatureIdentity& feature,
+    const ControlRouteRecord& route) noexcept
+{
+    if (!feature || feature.wrapper != reinterpret_cast<uintptr_t>(route.wrapper)
+        || feature.wrapperGeneration != route.generation
+        || feature.provider
+            != gActiveNgxProviderBase.load(std::memory_order_acquire)
+        || feature.providerGeneration
+            != gActiveNgxProviderGeneration.load(std::memory_order_acquire)
+        || feature.createAttemptEpoch
+            != gFrameGenerationCreateAttemptEpoch.load(std::memory_order_acquire)
+        || !gFrameGenerationCreateObserved.load(std::memory_order_acquire))
+        return false;
+    if (!AmpereFeatureEntriesCurrent(feature.runtime, feature.runtimeGeneration,
+            feature.provider, feature.providerGeneration))
+        return false;
+    if (!UseAmpere())
+        return false;
+    return feature.publication == ampere_gpu::Publication()
+        && feature.adapterLuid == ampere_gpu::AdapterLuid();
+}
+
+uint32_t ControlRouteSlot(const ControlRouteRecord& route) noexcept
+{
+    const ptrdiff_t slot = &route - gControlRoutes.data();
+    return slot >= 0 && static_cast<size_t>(slot) < gControlRoutes.size()
+        ? static_cast<uint32_t>(slot) : UINT32_MAX;
+}
+
+void RecordGameFrameGenerationIntent(const sl::ViewportHandle& viewport,
+    bool enabled) noexcept
+{
+    gGameFrameGenerationViewport.store(
+        static_cast<uint32_t>(viewport), std::memory_order_release);
+    gGameFrameGenerationOn.store(enabled, std::memory_order_release);
+}
+
+bool ControlRequestsEnabled(const ControlSnapshot& snapshot,
+    const sl::DLSSGOptions& source) noexcept
+{
+    if (!gGameFrameGenerationOn.load(std::memory_order_acquire)
+        || source.mode == sl::DLSSGMode::eOff)
+        return false;
+    if (!UseAmpere())
+        return true;
+    return snapshot.control.followGame
+        || snapshot.control.multiplier > 1;
+}
+
+bool CanReenableRetainedFeatureLocked(ControlRouteRecord& route,
+    const sl::ViewportHandle& viewport, const ControlSnapshot& snapshot,
+    const sl::DLSSGOptions& source,
+    RetainedFeatureIdentity* expectedLiveFeature = nullptr) noexcept
+{
+    if (expectedLiveFeature)
+        *expectedLiveFeature = {};
+    if (!ControlRequestsEnabled(snapshot, source))
+        return true;
+    // Ada retains its existing Streamline control contract.  The opaque
+    // handle/capacity observer below belongs only to the experimental Ampere
+    // backend; applying it to Ada would reject every live On revision.
+    if (!UseAmpere())
+        return true;
+    const uint32_t routeSlot = ControlRouteSlot(route);
+    if (routeSlot == UINT32_MAX
+        || !RetainedFeatureMatchesRuntime(
+            gRetainedFrameGenerationFeature, route))
+        return false;
+    if (!gAppliedFrameGenerationOn.load(std::memory_order_acquire))
+    {
+        const bool acceptedOff = gAcceptedOffEvidence.routeSlot == routeSlot
+            && gAcceptedOffEvidence.viewport
+                == static_cast<uint32_t>(viewport)
+            && SameRetainedFeature(gAcceptedOffEvidence.feature,
+                gRetainedFrameGenerationFeature);
+        const bool freshRecreation = SameRetainedFeature(
+            gFreshRecreatedFrameGenerationFeature,
+            gRetainedFrameGenerationFeature);
+        if (!acceptedOff && !freshRecreation)
+            return false;
+    }
+    const uint32_t requiredMultiplier = snapshot.control.followGame
+        ? std::max(source.numFramesToGenerate + 1u, 2u)
+        : EffectiveMultiplier(snapshot.control);
+    if (gRetainedFrameGenerationFeature.generatedFrameCapacity + 1u
+        < requiredMultiplier)
+        return false;
+    if (expectedLiveFeature)
+        *expectedLiveFeature = gRetainedFrameGenerationFeature;
+    return true;
+}
+
+bool CanReenableRetainedFeature(ControlRouteRecord& route,
+    const sl::ViewportHandle& viewport, const ControlSnapshot& snapshot,
+    const sl::DLSSGOptions& source,
+    RetainedFeatureIdentity* expectedLiveFeature = nullptr) noexcept
+{
+    std::unique_lock<std::mutex> lifetimeLock(gFrameGenerationLifetimeMutex, std::defer_lock);
+    if (UseAmpere()) lifetimeLock.lock();
+    return CanReenableRetainedFeatureLocked(route, viewport, snapshot, source, expectedLiveFeature);
+}
+
+bool RetainedFeatureStillExactForLiveOnLocked(ControlRouteRecord& route,
+    const sl::ViewportHandle& viewport,
+    const RetainedFeatureIdentity& expected) noexcept
+{
+    const uint32_t routeSlot = ControlRouteSlot(route);
+    if (!expected || routeSlot == UINT32_MAX
+        || !SameRetainedFeature(expected, gRetainedFrameGenerationFeature)
+        || !RetainedFeatureMatchesRuntime(
+            gRetainedFrameGenerationFeature, route))
+        return false;
+    if (gAppliedFrameGenerationOn.load(std::memory_order_acquire))
+        return true;
+    const bool acceptedOff = gAcceptedOffEvidence.routeSlot == routeSlot
+        && gAcceptedOffEvidence.viewport == static_cast<uint32_t>(viewport)
+        && SameRetainedFeature(
+            expected, gAcceptedOffEvidence.feature);
+    return acceptedOff || SameRetainedFeature(
+        expected, gFreshRecreatedFrameGenerationFeature);
+}
+
+void RecordAcceptedSetOptionsLifecycleLocked(ControlRouteRecord& route,
+    const sl::ViewportHandle& viewport, bool enabled) noexcept
+{
     route.lastAcceptedRevision.store(
         gDesiredRevision.load(std::memory_order_acquire),
         std::memory_order_release);
-    gGameFrameGenerationOn.store(enabled, std::memory_order_release);
+    if (gAppliedFrameGenerationOn.exchange(
+            enabled, std::memory_order_acq_rel) != enabled)
+        gPresentationLifecycleEpoch.fetch_add(1, std::memory_order_acq_rel);
     route.frameGenerationOffAccepted.store(!enabled,
         std::memory_order_release);
     if (enabled)
+    {
         route.releaseObserved.store(false, std::memory_order_release);
+        gAcceptedOffEvidence = {};
+        gFreshRecreatedFrameGenerationFeature = {};
+    }
+    else
+    {
+        InvalidateUiInputEvidence(static_cast<uint32_t>(viewport));
+        gFreshRecreatedFrameGenerationFeature = {};
+        if (!UseAmpere())
+        {
+            // Ada has no opaque NGX-feature observer. Preserve only the exact
+            // accepted route/viewport Off boundary: live Off -> On remains
+            // supported until a matching slFreeResources succeeds, at which
+            // point lifetime ownership is unprovable and restart is required.
+            const uint32_t routeSlot = ControlRouteSlot(route);
+            gAcceptedOffEvidence = routeSlot == UINT32_MAX
+                ? AcceptedOffEvidence{}
+                : AcceptedOffEvidence{{}, routeSlot,
+                    static_cast<uint32_t>(viewport),
+                    gDesiredRevision.load(std::memory_order_acquire)};
+        }
+        else
+        {
+            const uint32_t routeSlot = ControlRouteSlot(route);
+            if (routeSlot != UINT32_MAX
+                && RetainedFeatureMatchesRuntime(
+                    gRetainedFrameGenerationFeature, route))
+            {
+                gAcceptedOffEvidence = {gRetainedFrameGenerationFeature,
+                    routeSlot, static_cast<uint32_t>(viewport),
+                    gDesiredRevision.load(std::memory_order_acquire)};
+            }
+            else
+            {
+                // Off was accepted, but no exact retained feature is available
+                // for a later live Ampere On. Preserve the stopped state and
+                // require a known recreation boundary instead of guessing from
+                // route-wide flags.
+                gAcceptedOffEvidence = {};
+                gRestartRequired.store(true, std::memory_order_release);
+            }
+        }
+        ClearAppliedDynamicTelemetry();
+        gFgVsyncSupportKnown.store(false, std::memory_order_release);
+        gFgVsyncSupported.store(false, std::memory_order_release);
+    }
 }
 
-void ResetReleasedPipelineState(ControlRouteRecord& route) noexcept
+void RecordSetOptionsLifecycle(ControlRouteRecord& route,
+    const sl::ViewportHandle& viewport, bool enabled, sl::Result result) noexcept
 {
+    if (!IsAcceptedControlResult(result))
+        return;
+    std::lock_guard lifetimeLock(gFrameGenerationLifetimeMutex);
+    RecordAcceptedSetOptionsLifecycleLocked(route, viewport, enabled);
+}
+
+void ResetReleasedPipelineStateLocked(ControlRouteRecord& route) noexcept
+{
+    InvalidateUiInputEvidence();
+    gAppliedUiRecompositionEnabled.store(false, std::memory_order_release);
+    gAppliedUiRecompositionForced.store(false, std::memory_order_release);
+    gRetainedFrameGenerationFeature = {};
+    gFreshRecreatedFrameGenerationFeature = {};
+    gAcceptedOffEvidence = {};
+    gPresentationLifecycleEpoch.fetch_add(1, std::memory_order_acq_rel);
+    gFgVsyncSupportKnown.store(false, std::memory_order_release);
+    gFgVsyncSupported.store(false, std::memory_order_release);
+    gDynamicMfgCapabilityKnown.store(false, std::memory_order_release);
+    gDynamicMfgSupported.store(false, std::memory_order_release);
+    ClearAppliedDynamicTelemetry();
     route.frameGenerationOffAccepted.store(false,
         std::memory_order_release);
     route.releaseObserved.store(true, std::memory_order_release);
-    gGameFrameGenerationOn.store(false, std::memory_order_release);
+    gAppliedFrameGenerationOn.store(false, std::memory_order_release);
+    // Applied/attempted revisions are scoped to the released native feature.
+    // A later exact Create must receive the current request even when the
+    // config revision itself did not change across recreation.
+    gAppliedRevision.store(0, std::memory_order_release);
+    gAttemptedRevision.store(0, std::memory_order_release);
     gFrameGenerationCreateObserved.store(false, std::memory_order_release);
     gFirstCreateMidpointReady.store(false, std::memory_order_release);
     gBackportReadyAtCreate.store(false, std::memory_order_release);
@@ -2160,14 +2954,153 @@ void ResetReleasedPipelineState(ControlRouteRecord& route) noexcept
         L"will select one coherent wrapper/provider route");
 }
 
+void ResetReleasedPipelineState(ControlRouteRecord& route) noexcept
+{
+    std::lock_guard lifetimeLock(gFrameGenerationLifetimeMutex);
+    ResetReleasedPipelineStateLocked(route);
+}
+
+ControlRouteRecord* RouteForObservedFeature(
+    const ampere_backend::FeatureLifetimeEvent& event) noexcept
+{
+    for (auto& route : gControlRoutes)
+    {
+        if (route.claimed.load(std::memory_order_acquire)
+            && reinterpret_cast<uintptr_t>(route.wrapper) == event.wrapper
+            && route.generation == event.wrapperGeneration)
+            return &route;
+    }
+    return nullptr;
+}
+
+void ObserveAmpereFeatureLifetime(
+    const ampere_backend::FeatureLifetimeEvent& event) noexcept
+{
+    if (!UseAmpere() || !event.handle || !event.lifetime || !event.runtime
+        || !event.runtimeGeneration || !event.provider
+        || !event.providerGeneration || !event.wrapper
+        || !event.wrapperGeneration || !event.publication
+        || !event.generatedFrameCapacity || !event.createAttemptToken)
+        return;
+
+    ControlRouteRecord* route = RouteForObservedFeature(event);
+    if (!route)
+    {
+        gRestartRequired.store(true, std::memory_order_release);
+        return;
+    }
+
+    std::lock_guard lifetimeLock(gFrameGenerationLifetimeMutex);
+    if (event.phase == ampere_backend::FeatureLifetimePhase::eCreated)
+    {
+        // Older queued completions cannot adopt a newer in-flight operation's
+        // epoch even when NGX reuses the same numeric handle and modules.
+        if (event.createAttemptToken != gFrameGenerationCreateAttemptEpoch.load(
+                std::memory_order_acquire))
+            return;
+        if (!AmpereFeatureEntriesCurrent(event.runtime, event.runtimeGeneration,
+                event.provider, event.providerGeneration)
+            || event.provider
+                != gActiveNgxProviderBase.load(std::memory_order_acquire)
+            || event.providerGeneration
+                != gActiveNgxProviderGeneration.load(std::memory_order_acquire)
+            || event.publication != ampere_gpu::Publication()
+            || event.adapterLuid != ampere_gpu::AdapterLuid())
+        {
+            gRestartRequired.store(true, std::memory_order_release);
+            return;
+        }
+
+        // The backend snapshots mutations under its lifecycle lock and drains
+        // them in strict FIFO order after releasing it. Keep the monotonic
+        // lifetime comparison as a defensive identity gate for delayed or
+        // reentrant observer delivery and numeric handle reuse.
+        if (gRetainedFrameGenerationFeature
+            && gRetainedFrameGenerationFeature.runtime == event.runtime
+            && gRetainedFrameGenerationFeature.runtimeGeneration
+                == event.runtimeGeneration
+            && gRetainedFrameGenerationFeature.lifetime > event.lifetime)
+            return;
+
+        const bool replacesAcceptedOff = gRetainedFrameGenerationFeature
+            && SameRetainedFeature(gAcceptedOffEvidence.feature,
+                gRetainedFrameGenerationFeature);
+        const bool followsExactRelease = route->releaseObserved.load(
+            std::memory_order_acquire);
+        gRetainedFrameGenerationFeature = {
+            event.handle, event.runtime, event.runtimeGeneration,
+            event.provider, event.providerGeneration,
+            event.wrapper, event.wrapperGeneration,
+            event.publication, event.adapterLuid,
+            event.generatedFrameCapacity, event.lifetime,
+            event.createAttemptToken};
+        gFreshRecreatedFrameGenerationFeature = followsExactRelease
+            ? gRetainedFrameGenerationFeature : RetainedFeatureIdentity{};
+        gAcceptedOffEvidence = {};
+        route->releaseObserved.store(false, std::memory_order_release);
+        gFrameGenerationCreateObserved.store(true, std::memory_order_release);
+        if ((!gRestartRequired.load(std::memory_order_acquire)
+                || replacesAcceptedOff || followsExactRelease)
+            && !gProviderChangedAfterCreate.load(std::memory_order_acquire))
+            gRestartRequired.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (event.phase != ampere_backend::FeatureLifetimePhase::eReleased
+        || !SameObservedFeature(gRetainedFrameGenerationFeature, event))
+        return;
+
+    if (gRetainedFrameGenerationFeature.createAttemptEpoch
+        != gFrameGenerationCreateAttemptEpoch.load(std::memory_order_acquire))
+    {
+        // A newer Create has begun after this exact release mutation but before
+        // observer delivery. Retire only the old feature-scoped state: clearing
+        // the active dispatch/provider selection here would clobber the newer
+        // in-flight pre-Create publication. FIFO delivery lets its successful
+        // Created event consume releaseObserved and certify a fresh lifetime;
+        // if it fails, restart remains required.
+        gRetainedFrameGenerationFeature = {};
+        gFreshRecreatedFrameGenerationFeature = {};
+        gAcceptedOffEvidence = {};
+        gPresentationLifecycleEpoch.fetch_add(1, std::memory_order_acq_rel);
+        gFgVsyncSupportKnown.store(false, std::memory_order_release);
+        gFgVsyncSupported.store(false, std::memory_order_release);
+        gDynamicMfgCapabilityKnown.store(false, std::memory_order_release);
+        gDynamicMfgSupported.store(false, std::memory_order_release);
+        ClearAppliedDynamicTelemetry();
+        route->frameGenerationOffAccepted.store(false,
+            std::memory_order_release);
+        route->releaseObserved.store(true, std::memory_order_release);
+        gAppliedFrameGenerationOn.store(false, std::memory_order_release);
+        gAppliedRevision.store(0, std::memory_order_release);
+        gAttemptedRevision.store(0, std::memory_order_release);
+        gRestartRequired.store(true, std::memory_order_release);
+        return;
+    }
+    ResetReleasedPipelineStateLocked(*route);
+}
+
+void EnsureAmpereFeatureLifetimeObserver() noexcept
+{
+    // Storing the same callback is idempotent and avoids a publication window
+    // between a separate once flag and the observer pointer itself.
+    ampere_backend::SetFeatureLifetimeCallback(
+        &ObserveAmpereFeatureLifetime);
+}
+
 void SetUniversalRouteFailure(UniversalRouteFailure failure) noexcept
 {
     gUniversalRouteFailure.store(static_cast<uint32_t>(failure),
         std::memory_order_release);
 }
 
-void PublishActiveControlRoute(ControlRouteRecord& route)
+// The caller holds gActiveControlRouteMutex through slot and metadata publication.
+bool PublishActiveControlRoute(ControlRouteRecord& route)
 {
+    if (UseAmpere())
+    {
+        ampere_backend::ObserveActiveWrapper(route.wrapper, route.generation);
+    }
     const uintptr_t base = reinterpret_cast<uintptr_t>(route.wrapper);
     const uintptr_t previous = gActiveWrapperBase.exchange(
         base, std::memory_order_acq_rel);
@@ -2188,13 +3121,12 @@ void PublishActiveControlRoute(ControlRouteRecord& route)
         route.compiledMaximumGeneratedFrames, std::memory_order_release);
     if (previous != base)
     {
-        Log(L"Active DLSS-G wrapper selected by real call: generation=%llu "
-            L"patched=%d compiledMaximum=%u version=%u.%u.%u.%u path=%s",
-            static_cast<unsigned long long>(route.generation),
-            route.wrapperPatched, route.compiledMaximumGeneratedFrames,
-            route.version.major, route.version.minor, route.version.build,
-            route.version.privatePart, route.path.c_str());
+        gFgVsyncSupportKnown.store(false, std::memory_order_release);
+        gFgVsyncSupported.store(false, std::memory_order_release);
+        gDynamicMfgCapabilityKnown.store(false, std::memory_order_release);
+        gDynamicMfgSupported.store(false, std::memory_order_release);
     }
+    return previous != base;
 }
 
 bool ActivateControlRoute(uint32_t slot, ControlEntryPath path,
@@ -2203,6 +3135,7 @@ bool ActivateControlRoute(uint32_t slot, ControlEntryPath path,
     ControlRouteRecord* route = ControlRouteAt(slot);
     if (!route)
         return false;
+    std::unique_lock publicationLock(gActiveControlRouteMutex);
     uint32_t active = gActiveControlRouteSlot.load(
         std::memory_order_acquire);
     if (active == UINT32_MAX)
@@ -2222,7 +3155,7 @@ bool ActivateControlRoute(uint32_t slot, ControlEntryPath path,
         const universal_route_policy::Identity candidateIdentity{
             reinterpret_cast<uintptr_t>(route->wrapper), route->generation};
         universal_route_policy::Lifecycle lifecycle{};
-        lifecycle.frameGenerationOn = gGameFrameGenerationOn.load(
+        lifecycle.frameGenerationOn = gAppliedFrameGenerationOn.load(
             std::memory_order_acquire);
         lifecycle.pipelineCreated = gFrameGenerationCreateObserved.load(
             std::memory_order_acquire);
@@ -2253,7 +3186,17 @@ bool ActivateControlRoute(uint32_t slot, ControlEntryPath path,
     route->lastCallRevision.store(
         gDesiredRevision.load(std::memory_order_acquire),
         std::memory_order_release);
-    PublishActiveControlRoute(*route);
+    const bool changed = PublishActiveControlRoute(*route);
+    publicationLock.unlock();
+    if (changed)
+    {
+        Log(L"Active DLSS-G wrapper selected by real call: generation=%llu "
+            L"patched=%d compiledMaximum=%u version=%u.%u.%u.%u path=%s",
+            static_cast<unsigned long long>(route->generation),
+            route->wrapperPatched.load(), route->compiledMaximumGeneratedFrames.load(),
+            route->version.major, route->version.minor, route->version.build,
+            route->version.privatePart, route->path.c_str());
+    }
     InstallControlRouteLifecycleEntry(slot);
     if (!route->wrapperPatched)
     {
@@ -2269,6 +3212,8 @@ void InvalidateControlRoute(uint32_t slot,
 {
     if (ControlRouteRecord* route = ControlRouteAt(slot))
         route->structureCompatible.store(false, std::memory_order_release);
+    if (slot == gActiveControlRouteSlot.load(std::memory_order_acquire))
+        InvalidateUiInputEvidence();
     SetUniversalRouteFailure(failure);
 }
 
@@ -2307,6 +3252,15 @@ bool StateEntryCovered(const ControlRouteRecord& route) noexcept
             && route.publicGetOriginal.load(std::memory_order_acquire));
 }
 
+bool SetterEntryCovered(const ControlRouteRecord& route) noexcept
+{
+    return universal_route_policy::HasCoveredEntry(
+        ControlEntryCurrent(route.publicSetHandle),
+        ControlEntryCurrent(route.internalSetHandle),
+        route.publicSetResolverFallback.load(std::memory_order_acquire)
+            && route.publicSetOriginal.load(std::memory_order_acquire));
+}
+
 sl::DLSSGOptions CopyKnownOptions(const sl::DLSSGOptions& source, bool preserveNext)
 {
     sl::DLSSGOptions copy{};
@@ -2342,7 +3296,7 @@ sl::DLSSGOptions CopyKnownOptions(const sl::DLSSGOptions& source, bool preserveN
 
 sl::DLSSGOptions BuildAdjustedOptions(
     const sl::DLSSGOptions& source, const ControlSnapshot& snapshot,
-    bool preserveNext, bool enableUiRecomposition)
+    bool preserveNext)
 {
     sl::DLSSGOptions adjusted = CopyKnownOptions(source, preserveNext);
     if (!snapshot.control.followGame && snapshot.control.dynamic
@@ -2362,6 +3316,23 @@ sl::DLSSGOptions BuildAdjustedOptions(
         adjusted.numFramesToGenerate =
             EffectiveMultiplier(snapshot.control) - 1;
     }
+    if (UseAmpere())
+    {
+        if (snapshot.control.multiplier == 1 || source.mode == sl::DLSSGMode::eOff)
+            adjusted.mode = sl::DLSSGMode::eOff;
+        else if (snapshot.control.dynamic && DynamicMfgSupported())
+        {
+            adjusted.structVersion = sl::kStructVersion5;
+            adjusted.mode = sl::DLSSGMode::eDynamic;
+        }
+        else
+            adjusted.mode = sl::DLSSGMode::eOn;
+        adjusted.numFramesToGenerate = std::max(EffectiveMultiplier(snapshot.control), 2u) - 1u;
+        adjusted.dynamicTargetFrameRate = adjusted.mode == sl::DLSSGMode::eDynamic
+            ? static_cast<float>(snapshot.control.dynamicTargetFrameRate) : 0.0f;
+        adjusted.flags = static_cast<sl::DLSSGFlags>(static_cast<uint32_t>(adjusted.flags)
+            & ~static_cast<uint32_t>(sl::DLSSGFlags::eShowOnlyInterpolatedFrame));
+    }
     if (snapshot.control.generatedOnlyDebug)
     {
         adjusted.flags = static_cast<sl::DLSSGFlags>(
@@ -2369,18 +3340,21 @@ sl::DLSSGOptions BuildAdjustedOptions(
             | static_cast<uint32_t>(
                 sl::DLSSGFlags::eShowOnlyInterpolatedFrame));
     }
-    if (enableUiRecomposition)
-    {
-        adjusted.structVersion = std::max<size_t>(
-            adjusted.structVersion, sl::kStructVersion4);
-        adjusted.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
-    }
+    // UI recomposition changes provider allocations. Preserve the game's
+    // versioned option exactly; tagged-input metadata cannot authorize it.
     return adjusted;
 }
 
 void CaptureGameOptions(
     const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options)
 {
+    const uint32_t capturedViewport = static_cast<uint32_t>(viewport);
+    if (capturedViewport != gLastOptionsViewport.load(std::memory_order_acquire)
+        || options.colorWidth != gGameColorWidth.load(std::memory_order_relaxed)
+        || options.colorHeight != gGameColorHeight.load(std::memory_order_relaxed)
+        || options.hudLessBufferFormat != gGameHudlessBufferFormat.load(std::memory_order_relaxed)
+        || options.uiBufferFormat != gGameUiBufferFormat.load(std::memory_order_relaxed))
+        InvalidateUiInputEvidence(capturedViewport);
     {
         std::lock_guard lock(gLastOptionsMutex);
         gLastGameOptions.viewport = viewport;
@@ -2398,7 +3372,6 @@ void CaptureGameOptions(
     gGameUiRecompositionEnabled.store(options.structVersion >= sl::kStructVersion4
         && options.enableUserInterfaceRecomposition == sl::Boolean::eTrue,
         std::memory_order_relaxed);
-    RefreshUiInputReadiness(viewportValue);
 }
 
 bool ReadLastGameOptions(
@@ -2416,7 +3389,8 @@ bool ReadLastGameOptions(
 void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
     bool liveReapply, bool uiRecompositionEnabled, bool uiRecompositionForced,
     uint32_t effectiveMultiplier, bool effectiveDynamicMode,
-    bool effectiveDynamicExperimental56, bool dynamicOverrideApplied)
+    bool effectiveDynamicExperimental56, bool dynamicOverrideApplied,
+    float effectiveDynamicTargetFrameRate, bool effectiveDynamicTargetValid)
 {
     gSetOptionsSeen.store(true, std::memory_order_release);
     gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
@@ -2432,7 +3406,10 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
     gAppliedDynamicMode.store(effectiveDynamicMode, std::memory_order_relaxed);
     gAppliedMultiplier.store(effectiveMultiplier, std::memory_order_relaxed);
     gAppliedDynamicTargetFrameRate.store(
-        snapshot.control.dynamicTargetFrameRate, std::memory_order_relaxed);
+        effectiveDynamicTargetValid ? effectiveDynamicTargetFrameRate : 0.0f,
+        std::memory_order_relaxed);
+    gAppliedDynamicTargetValid.store(effectiveDynamicTargetValid,
+        std::memory_order_relaxed);
     gAppliedDynamicExperimental56.store(
         effectiveDynamicExperimental56, std::memory_order_relaxed);
     gAppliedGeneratedOnlyDebug.store(
@@ -2441,7 +3418,12 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
         uiRecompositionEnabled, std::memory_order_relaxed);
     gAppliedUiRecompositionForced.store(
         uiRecompositionForced, std::memory_order_relaxed);
-    gAppliedRevision.store(snapshot.revision, std::memory_order_release);
+    const bool desiredApplied = snapshot.control.followGame
+        || (snapshot.control.dynamic
+            ? dynamicOverrideApplied && effectiveDynamicMode
+            : !UseAmpere() || effectiveMultiplier == snapshot.control.multiplier);
+    gAppliedRevision.store(desiredApplied ? snapshot.revision : 0, std::memory_order_release);
+    if (!desiredApplied) gAttemptedRevision.store(0, std::memory_order_release);
     if (liveReapply)
         gLiveReapplyCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -2473,7 +3455,7 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
     Log(L"UI recomposition: enabled=%d forced=%d inputsReady=%d "
         L"gameEnabled=%d optionsVersion=%u hudlessFormat=%u uiFormat=%u",
         uiRecompositionEnabled, uiRecompositionForced,
-        gUiInputsReady.load(std::memory_order_relaxed),
+        ReadUiInputSnapshot(gLastOptionsViewport.load(std::memory_order_acquire)).ready,
         gGameUiRecompositionEnabled.load(std::memory_order_relaxed),
         gGameOptionsStructVersion.load(std::memory_order_relaxed),
         gGameHudlessBufferFormat.load(std::memory_order_relaxed),
@@ -2581,13 +3563,9 @@ sl::Result SubmitAdjustedOptionsImpl(
     ControlRouteRecord& route, const sl::ViewportHandle& viewport,
     const sl::DLSSGOptions& source, const ControlSnapshot& snapshot,
     bool liveReapply, SubmitOptions&& submitOptions,
-    QueryState&& queryState, bool hasState)
+    QueryState&& queryState, bool hasState,
+    const RetainedFeatureIdentity* expectedLiveFeature = nullptr)
 {
-    const UiInputSnapshot uiInputs = ReadUiInputSnapshot(
-        static_cast<uint32_t>(viewport));
-    const bool gameUiRecomposition = source.structVersion >= sl::kStructVersion4
-        && source.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
-    const bool forceUiRecomposition = uiInputs.ready && !gameUiRecomposition;
     const bool dynamicRequested = !snapshot.control.followGame
         && snapshot.control.dynamic;
     if (dynamicRequested && !DynamicMfgCapabilityKnown() && hasState)
@@ -2598,9 +3576,10 @@ sl::Result SubmitAdjustedOptionsImpl(
     }
 
     sl::DLSSGOptions adjusted = BuildAdjustedOptions(
-        source, snapshot, !liveReapply, uiInputs.ready);
+        source, snapshot, !liveReapply);
     bool dynamicOverrideApplied = dynamicRequested && DynamicMfgSupported();
     sl::Result result = submitOptions(adjusted);
+    sl::Result acceptedResult = result;
     if ((result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM)
         && hasState
         && (!liveReapply
@@ -2618,49 +3597,120 @@ sl::Result SubmitAdjustedOptionsImpl(
         && dynamicRequested && !dynamicOverrideApplied
         && DynamicMfgSupported())
     {
+        const sl::DLSSGOptions acceptedFallback = adjusted;
         adjusted = BuildAdjustedOptions(
-            source, snapshot, !liveReapply, uiInputs.ready);
+            source, snapshot, !liveReapply);
         dynamicOverrideApplied = true;
         result = submitOptions(adjusted);
+        if (IsAcceptedControlResult(result))
+            acceptedResult = result;
+        else
+        {
+            // The startup fallback was accepted even if the first Dynamic
+            // request failed. Keep that actual state separate from the latest
+            // submission error; neither the requested target nor an older
+            // accepted target describes the active options in this case.
+            adjusted = acceptedFallback;
+            dynamicOverrideApplied = false;
+        }
     }
 
     const bool preserveGameControl = snapshot.control.followGame
         || (dynamicRequested && !dynamicOverrideApplied);
-    const uint32_t effectiveMultiplier = preserveGameControl
+    const uint32_t effectiveMultiplier =
+        [&]() {
+            if (UseAmpere()) return adjusted.mode == sl::DLSSGMode::eOff ? 1u : adjusted.numFramesToGenerate + 1u;
+            return preserveGameControl
         ? std::clamp(std::min(source.numFramesToGenerate,
                 kMaximumMultiplier - 1u) + 1u,
             kMinimumMultiplier, SafeMaximumMultiplier())
         : EffectiveMultiplier(snapshot.control);
-    const bool effectiveDynamicMode = preserveGameControl
+        }();
+    const bool effectiveDynamicMode =
+        [&]() {
+            if (UseAmpere()) return adjusted.mode == sl::DLSSGMode::eDynamic;
+            return preserveGameControl
         ? source.mode == sl::DLSSGMode::eDynamic
             || source.mode == sl::DLSSGMode::eAuto
         : snapshot.control.dynamic;
-    const bool effectiveDynamicExperimental56 =
-        dynamicOverrideApplied
-        && snapshot.control.dynamicExperimental56
-        && SafeMaximumMultiplier() >= kMaximumMultiplier;
+        }();
+    const bool effectiveDynamicExperimental56 = false;
     const bool uiRecompositionEnabled = adjusted.structVersion >= sl::kStructVersion4
         && adjusted.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
-    RecordAppliedControl(snapshot, result, liveReapply,
-        uiRecompositionEnabled, forceUiRecomposition,
-        effectiveMultiplier, effectiveDynamicMode,
-        effectiveDynamicExperimental56, dynamicOverrideApplied);
-    if (result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM)
+    const bool effectiveDynamicTargetValid = adjusted.mode == sl::DLSSGMode::eDynamic
+        && std::isfinite(adjusted.dynamicTargetFrameRate)
+        && adjusted.dynamicTargetFrameRate >= 0.0f;
+    std::unique_lock<std::mutex> liveFeatureLock;
+    if (liveReapply && UseAmpere()
+        && adjusted.mode != sl::DLSSGMode::eOff
+        && IsAcceptedControlResult(acceptedResult))
     {
+        liveFeatureLock = std::unique_lock<std::mutex>(
+            gFrameGenerationLifetimeMutex);
+        if (!expectedLiveFeature
+            || !RetainedFeatureStillExactForLiveOnLocked(
+                route, viewport, *expectedLiveFeature))
+        {
+            gSetOptionsSeen.store(true, std::memory_order_release);
+            gLastSetOptionsResult.store(static_cast<int32_t>(result),
+                std::memory_order_relaxed);
+            gLastAttemptTick.store(GetTickCount64(),
+                std::memory_order_relaxed);
+            gAttemptedRevision.store(snapshot.revision,
+                std::memory_order_release);
+            gAppliedRevision.store(0, std::memory_order_release);
+            if (gAppliedFrameGenerationOn.exchange(
+                    false, std::memory_order_acq_rel))
+            {
+                gPresentationLifecycleEpoch.fetch_add(
+                    1, std::memory_order_acq_rel);
+            }
+            ClearAppliedDynamicTelemetry();
+            gFgVsyncSupportKnown.store(false, std::memory_order_release);
+            gFgVsyncSupported.store(false, std::memory_order_release);
+            gRestartRequired.store(true, std::memory_order_release);
+            Log(L"Accepted live On revision %llu left pending: retained "
+                L"feature changed during the setter call",
+                static_cast<unsigned long long>(snapshot.revision));
+            return HostControlResult(result);
+        }
+    }
+    RecordAppliedControl(snapshot, acceptedResult, liveReapply,
+        uiRecompositionEnabled, false,
+        effectiveMultiplier, effectiveDynamicMode,
+        effectiveDynamicExperimental56, dynamicOverrideApplied,
+        adjusted.dynamicTargetFrameRate, effectiveDynamicTargetValid);
+    if (result != acceptedResult)
+    {
+        gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+        gAttemptedRevision.store(snapshot.revision, std::memory_order_release);
+    }
+    if (IsAcceptedControlResult(acceptedResult))
+    {
+        if (liveFeatureLock.owns_lock())
+        {
+            RecordAcceptedSetOptionsLifecycleLocked(route, viewport,
+                adjusted.mode != sl::DLSSGMode::eOff);
+        }
+        else
+        {
+            RecordSetOptionsLifecycle(route, viewport,
+                adjusted.mode != sl::DLSSGMode::eOff, acceptedResult);
+        }
+        // The lifecycle helper also serves unsnapshotted game calls. Restore
+        // the exact revision accepted by this adjusted submission in case a
+        // newer config arrived while the native setter was running.
         route.lastAcceptedRevision.store(snapshot.revision,
             std::memory_order_release);
-        RecordSetOptionsLifecycle(route, true, result);
     }
-    // Some hosts treat every non-zero Result as a hard failure. Result 39 is a
-    // warning rather than a rejected options update, so preserve it in the
-    // bridge status while returning success to the host.
-    return result == sl::Result::eWarnOutOfVRAM ? sl::Result::eOk : result;
+    return HostControlResult(result);
 }
 
 sl::Result SubmitAdjustedOptions(
     ControlRouteRecord& route, const sl::ViewportHandle& viewport,
     const sl::DLSSGOptions& source, const ControlSnapshot& snapshot,
-    bool liveReapply)
+    bool liveReapply,
+    const RetainedFeatureIdentity* expectedLiveFeature = nullptr)
 {
     const bool hasState = RouteHasStateFunction(route);
     return SubmitAdjustedOptionsImpl(route, viewport, source, snapshot,
@@ -2670,13 +3720,16 @@ sl::Result SubmitAdjustedOptions(
         },
         [&](sl::DLSSGState& state, const sl::DLSSGOptions* options) {
             return CallRouteGetState(route, viewport, state, options);
-        }, hasState);
+        }, hasState, expectedLiveFeature);
 }
 
 void ReapplyPendingControl(const sl::ViewportHandle& viewport)
 {
     if (!gControlReady.load(std::memory_order_acquire)
         || !gGameFrameGenerationOn.load(std::memory_order_acquire)
+        || gGameFrameGenerationViewport.load(std::memory_order_acquire)
+            != static_cast<uint32_t>(viewport)
+        || gRestartRequired.load(std::memory_order_acquire)
         || !BridgeReady())
         return;
 
@@ -2684,6 +3737,15 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
     if (snapshot.revision == 0
         || snapshot.revision == gAppliedRevision.load(std::memory_order_acquire))
         return;
+    if (!snapshot.control.followGame && snapshot.control.dynamic
+        && !DynamicMfgSupported())
+        return;
+    if (UseAmpere())
+    {
+        if ((snapshot.control.dynamic && !DynamicMfgSupported())
+            || (!snapshot.control.dynamic && snapshot.control.multiplier > SafeMaximumMultiplier()))
+            return;
+    }
 
     const uint64_t attemptedRevision =
         gAttemptedRevision.load(std::memory_order_acquire);
@@ -2706,6 +3768,36 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
     sl::DLSSGOptions source{};
     if (!route || !ReadLastGameOptions(viewport, source))
         return;
+    RetainedFeatureIdentity expectedLiveFeature{};
+    std::unique_lock<std::mutex> lifetimeLock(gFrameGenerationLifetimeMutex, std::defer_lock);
+    if (UseAmpere())
+    {
+        lifetimeLock.lock();
+        const uint64_t token = gFrameGenerationCreateAttemptEpoch.load(std::memory_order_acquire);
+        const auto pending = ampere_backend::FeatureCreatePendingStatus(token);
+        if (pending == ampere_backend::FeatureCreatePendingState::eCurrent
+            || pending == ampere_backend::FeatureCreatePendingState::eReadBusy)
+            return;
+        if (pending == ampere_backend::FeatureCreatePendingState::eInvalid)
+        {
+            gRestartRequired.store(true, std::memory_order_release);
+            Log(L"Live On revision %llu blocked: unfinished feature lifecycle proof is no longer exact",
+                static_cast<unsigned long long>(snapshot.revision));
+            return;
+        }
+    }
+    if (!CanReenableRetainedFeatureLocked(*route, viewport, snapshot, source,
+            &expectedLiveFeature))
+    {
+        // The exact epoch/entry publication uses this same lifetime lock.
+        // A newer Create cannot slip between this decision and its latch.
+        gRestartRequired.store(true, std::memory_order_release);
+        Log(L"Live On revision %llu blocked: retained feature identity, "
+            L"capacity, provider, publication, or generation is no longer exact",
+            static_cast<unsigned long long>(snapshot.revision));
+        return;
+    }
+    if (lifetimeLock.owns_lock()) lifetimeLock.unlock();
     if (retryNotInitialized)
     {
         const uint64_t retry =
@@ -2717,7 +3809,8 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
 
     gSetOptionsCalls.fetch_add(1, std::memory_order_relaxed);
     const sl::Result result =
-        SubmitAdjustedOptions(*route, viewport, source, snapshot, true);
+        SubmitAdjustedOptions(*route, viewport, source, snapshot, true,
+            &expectedLiveFeature);
     if (result != sl::Result::eOk)
         Log(L"Live reapply failed for request revision %llu: result=%d",
             static_cast<unsigned long long>(snapshot.revision), static_cast<int>(result));
@@ -2730,6 +3823,9 @@ bool SameMfgControl(const ControlConfig& left,
         && left.multiplier == right.multiplier
         && left.dynamic == right.dynamic
         && left.dynamicTargetFrameRate == right.dynamicTargetFrameRate
+        && left.dlssgPreset == right.dlssgPreset
+        && left.vsyncMode == right.vsyncMode
+        && left.reflexFrameLimitFps == right.reflexFrameLimitFps
         && left.dynamicExperimental56 == right.dynamicExperimental56
         && left.generatedOnlyDebug == right.generatedOnlyDebug;
 }
@@ -2750,6 +3846,10 @@ void PublishProviderCreateState(HMODULE provider, bool backportReady)
         if (record.module != provider)
             continue;
         record.ngxTemporalPatched = backportReady;
+        if (UseAmpere())
+        {
+            record.ngxPatched = backportReady;
+        }
         break;
     }
     RecomputeModuleStateLocked();
@@ -2774,19 +3874,7 @@ bool ExportsNgxVulkanRoute(HMODULE module) noexcept
 
 bool IsNgxRuntimeModule(HMODULE module) noexcept
 {
-    const bool d3d12Runtime = ExportsNgxD3D12Route(module)
-        && GetProcAddress(module, "NVSDK_NGX_D3D12_Init_ProjectID");
-    const bool vulkanRuntime = ExportsNgxVulkanRoute(module)
-        && (GetProcAddress(module, "NVSDK_NGX_VULKAN_Init_with_ProjectID")
-            || GetProcAddress(
-                module, "NVSDK_NGX_VULKAN_Init_ProjectID")
-            || GetProcAddress(
-                module, "NVSDK_NGX_VULKAN_Init_ProjectID_Ext"));
-    return module
-        && (d3d12Runtime || vulkanRuntime)
-        && !GetProcAddress(module, "NVSDK_NGX_GetAPIVersion")
-        && !GetProcAddress(module, "NVSDK_NGX_GetGPUArchitecture")
-        && !dlssg_provider_policy::IsDlssgImplementationModule(module);
+    return ngx_runtime_policy::IsRuntime(module);
 }
 
 const wchar_t* NgxDispatchRouteName(NgxDispatchRoute route) noexcept
@@ -2844,7 +3932,7 @@ bool CommitNgxGraphicsApi(NgxGraphicsApi api) noexcept
 }
 
 bool ResolveUniqueHookedProvider(NgxGraphicsApi api, HMODULE& provider,
-    std::wstring& path) noexcept
+    std::wstring* path) noexcept
 {
     HMODULE candidate = nullptr;
     std::wstring candidatePath;
@@ -2884,36 +3972,60 @@ bool ResolveUniqueHookedProvider(NgxGraphicsApi api, HMODULE& provider,
                 continue;
             ++candidateCount;
             candidate = record.module;
-            candidatePath = record.path;
+            if (path)
+                candidatePath = record.path;
         }
     }
     if (universal_route_policy::ResolveProvider(false, candidateCount)
         != universal_route_policy::ProviderResolution::eUniqueCandidate)
         return false;
     provider = candidate;
-    path = std::move(candidatePath);
+    if (path)
+        *path = std::move(candidatePath);
     return true;
 }
 
 bool ResolveMidpointProvider(NgxDispatchRoute route, NgxGraphicsApi api,
     const entry_detour::Snapshot& detour, const void* originalCaller,
-    HMODULE& provider, std::wstring& path,
+    HMODULE& provider, std::wstring* path,
     NgxProviderSelectionSource& source)
 {
     provider = nullptr;
-    path.clear();
+    if (path)
+        path->clear();
     source = NgxProviderSelectionSource::eNone;
     if (route == NgxDispatchRoute::eProvider)
     {
         provider = detour.owner;
-        path = LoadedModulePath(provider);
-        if (provider && dlssg_provider_policy::IsSupportedProvider(
-                provider, path.c_str()))
+        if (dlssg_provider_policy::IsSupportedRetainedProvider(provider))
         {
+            if (path)
+                *path = LoadedModulePath(provider);
             source = NgxProviderSelectionSource::eProviderEntry;
             return true;
         }
         return false;
+    }
+
+    if (UseAmpere() && api == NgxGraphicsApi::eD3D12)
+    {
+        const auto create = detour.kind == entry_detour::Kind::eNgxRuntimeD3D12CreateFeature
+            ? detour : entry_detour::ReadSnapshot(entry_detour::Kind::eNgxRuntimeD3D12CreateFeature, detour.owner);
+        ngx_runtime_dispatch::Selection selected{};
+        const auto result = ngx_runtime_dispatch::Read(create, NVSDK_NGX_Feature_FrameGeneration, selected);
+        if (result == ngx_runtime_dispatch::ReadResult::eInvalid) return false;
+        if (result == ngx_runtime_dispatch::ReadResult::eSelected)
+        {
+            const auto entry = entry_detour::ReadSnapshot(entry_detour::Kind::eNgxD3D12CreateFeature, selected.provider);
+            if (!entry.current || entry.generation != ModuleGeneration(selected.provider)
+                || entry.target != reinterpret_cast<void*>(selected.target)
+                || !ngx_runtime_dispatch::StillCurrent(selected)
+                || !dlssg_provider_policy::IsSupportedRetainedProvider(selected.provider)) return false;
+            provider = selected.provider;
+            if (path) *path = LoadedModulePath(provider);
+            source = NgxProviderSelectionSource::eRuntimeDispatchTable;
+            return true;
+        }
     }
 
     // Prefer the preserved caller when the runtime really was entered by a
@@ -2922,15 +4034,16 @@ bool ResolveMidpointProvider(NgxDispatchRoute route, NgxGraphicsApi api,
     // has exactly one supported, patched provider with current Create and
     // Evaluate entry detours. Zero or multiple candidates remain fail-closed.
     provider = ModuleFromAddress(originalCaller);
-    path = LoadedModulePath(provider);
-    if (provider && dlssg_provider_policy::IsSupportedProvider(
-            provider, path.c_str()))
+    if (dlssg_provider_policy::IsSupportedRetainedProvider(provider))
     {
+        if (path)
+            *path = LoadedModulePath(provider);
         source = NgxProviderSelectionSource::eRuntimeCaller;
         return true;
     }
     provider = nullptr;
-    path.clear();
+    if (path)
+        path->clear();
     if (!ResolveUniqueHookedProvider(api, provider, path))
         return false;
     source = NgxProviderSelectionSource::eRuntimeUniqueCandidate;
@@ -2951,6 +4064,8 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
     // route publication, provider selection, or descriptor work.
     if (!frameGeneration)
         return;
+    if (UseAmpere())
+        EnsureAmpereFeatureLifetimeObserver();
     if (!CanResolveNgxDispatchRoute(route))
         return;
     const uint64_t observedCall = gNgxCreateCalls.fetch_add(
@@ -2974,7 +4089,7 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
         NgxProviderSelectionSource::eNone;
     const bool providerAccepted = detour.current
         && ResolveMidpointProvider(route, api, detour, originalCaller,
-            provider, path, selectionSource);
+            provider, &path, selectionSource);
 
     if (!providerAccepted)
     {
@@ -3024,15 +4139,10 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
     if (!CommitNgxDispatchRoute(route))
         return;
 
-    const bool firstPipelineCreate =
-        !gFrameGenerationCreateObserved.exchange(
-            true, std::memory_order_acq_rel);
-    gActiveNgxProviderGeneration.store(
-        ModuleGeneration(provider), std::memory_order_release);
-    gActiveNgxSelectionSource.store(static_cast<uint32_t>(selectionSource),
-        std::memory_order_release);
-    gActiveNgxCreateHandle.store(PackEntryHandle(entryHandle),
-        std::memory_order_release);
+    // A post-call lifecycle observer publishes the opaque handle only after
+    // native Create succeeds.  This pre-call epoch prevents an older Release
+    // completion from clearing route state after a newer Create has begun.
+    const uint64_t providerGeneration = ModuleGeneration(provider);
     const entry_detour::Kind evaluateKind = api == NgxGraphicsApi::eVulkan
         ? route == NgxDispatchRoute::eRuntime
             ? entry_detour::Kind::eNgxRuntimeVulkanEvaluateFeature
@@ -3042,10 +4152,37 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
             : entry_detour::Kind::eNgxD3D12EvaluateFeature;
     const entry_detour::Snapshot evaluate =
         entry_detour::ReadSnapshot(evaluateKind, detour.owner);
-    if (evaluate.current)
+    bool firstPipelineCreate = false;
     {
-        gActiveNgxEvaluateHandle.store(
-            PackEntryHandle(evaluate.handle), std::memory_order_release);
+        std::unique_lock<std::mutex> lifetimeLock(gFrameGenerationLifetimeMutex, std::defer_lock);
+        if (UseAmpere()) lifetimeLock.lock();
+        uint64_t createAttemptToken =
+            gFrameGenerationCreateAttemptEpoch.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+        if (!createAttemptToken)
+        {
+            createAttemptToken =
+                gFrameGenerationCreateAttemptEpoch.fetch_add(
+                    1, std::memory_order_acq_rel) + 1;
+        }
+        if (UseAmpere())
+        {
+            ampere_backend::SetCurrentFeatureCreateAttemptToken(
+                createAttemptToken);
+        }
+        firstPipelineCreate =
+            !gFrameGenerationCreateObserved.exchange(
+                true, std::memory_order_acq_rel);
+        gActiveNgxProviderGeneration.store(providerGeneration, std::memory_order_release);
+        gActiveNgxSelectionSource.store(static_cast<uint32_t>(selectionSource),
+            std::memory_order_release);
+        gActiveNgxCreateHandle.store(PackEntryHandle(entryHandle),
+            std::memory_order_release);
+        if (evaluate.current)
+        {
+            gActiveNgxEvaluateHandle.store(
+                PackEntryHandle(evaluate.handle), std::memory_order_release);
+        }
     }
     if (selectionSource
         == NgxProviderSelectionSource::eRuntimeUniqueCandidate
@@ -3060,7 +4197,7 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
     // the device that will create the FG feature, so validate that adapter at
     // the last safe pre-create point.
     if (api == NgxGraphicsApi::eD3D12
-        && !midpoint_fix::AdapterVerified() && commandContext)
+        && !gpu_backend::AdapterVerified() && commandContext)
     {
         auto* commandList = static_cast<ID3D12GraphicsCommandList*>(
             commandContext);
@@ -3069,13 +4206,54 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
                 __uuidof(ID3D12Device), reinterpret_cast<void**>(&device)))
             && device)
         {
-            midpoint_fix::ObserveD3D12Device(device);
+            gpu_backend::ObserveD3D12Device(device);
             device->Release();
         }
     }
+    if (gpu_dispatch::IsAda())
+    {
+        dlssg_preset::Prepare();
+        InspectLoadedModule(provider, path);
+    }
     const bool adapterVerified = AdapterVerifiedForApi(api);
-    const bool ready = adapterVerified
-        && midpoint_fix::PatchProvider(provider, path.c_str());
+    bool ready = adapterVerified
+        && gpu_backend::PatchProvider(provider, path.c_str());
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
+    if (ready && gpu_dispatch::IsAda())
+    {
+        const midpoint_fix::OutputPullMaskCreateBoundary boundary{
+            api == NgxGraphicsApi::eD3D12
+                ? midpoint_fix::OutputPullMaskGraphicsApi::eD3D12
+                : api == NgxGraphicsApi::eVulkan
+                    ? midpoint_fix::OutputPullMaskGraphicsApi::eVulkan
+                    : midpoint_fix::OutputPullMaskGraphicsApi::eUnknown,
+            firstPipelineCreate,
+            gPipelineMayPredateDetour.load(std::memory_order_acquire),
+            OutputPullMaskEarlyInitProven(provider, api)};
+        midpoint_fix::PrepareOutputPullMaskForCreate(
+            provider, path.c_str(), boundary);
+        const auto mask = midpoint_fix::ReadOutputPullMaskSnapshot();
+        // An unsupported optional optimization retains the temporal route.
+        // Uncertain publication/protection ownership must never be hidden by
+        // the readiness value captured before the optional publisher ran.
+        if (mask.requiresRestart)
+        {
+            ready = false;
+            gRestartRequired.store(true, std::memory_order_release);
+        }
+        else
+        {
+            ready = gpu_backend::Ready();
+        }
+    }
+#endif
+#if (MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT || MFG_UNLOCK_OUTPUT_PULL_TELEMETRY)
+    const bool outputPullReady = ready && api == NgxGraphicsApi::eD3D12
+        && midpoint_fix::PrepareOutputPullForCreate(provider, path.c_str());
+    const bool prev2CurrReady = outputPullReady
+        && midpoint_fix::PreparePrev2CurrForCreate(provider, path.c_str());
+    output_pull_telemetry::RecordCreate(outputPullReady, prev2CurrReady);
+#endif
     gBackportReadyAtCreate.store(ready, std::memory_order_release);
     if (firstPipelineCreate)
         gFirstCreateMidpointReady.store(ready, std::memory_order_release);
@@ -3130,36 +4308,8 @@ void WINAPI BeforeNgxRuntimeD3D12CreateFeature(void* commandList,
 bool TryInstallNgxCreateEntryDetour(
     HMODULE provider, const std::wstring& path, uint64_t generation)
 {
-    if (!provider
-        || !dlssg_provider_policy::IsSupportedProvider(
-            provider, path.c_str()))
-        return false;
-    void* target = reinterpret_cast<void*>(GetProcAddress(
-        provider, "NVSDK_NGX_D3D12_CreateFeature"));
-    if (!target)
-        return false;
-
-    void* trampoline = nullptr;
-    entry_detour::Handle detourHandle{};
-    entry_detour::InstallOptions installOptions{};
-    installOptions.generation = generation;
-    installOptions.allowRelocated = true;
-    installOptions.filterForwardArg2 = true;
-    installOptions.requiredForwardArg2 = static_cast<uintptr_t>(
-        NVSDK_NGX_Feature_FrameGeneration);
-    const bool installed = entry_detour::InstallForwarding(
-        entry_detour::Kind::eNgxD3D12CreateFeature,
-        provider, target, &BeforeNgxD3D12CreateFeature,
-        trampoline, installOptions, &detourHandle);
-    const entry_detour::Snapshot state =
-        entry_detour::ReadSnapshot(detourHandle);
-    Log(L"NGX CreateFeature entry detour: installed=%d current=%d "
-        L"cachedPointersCovered=%d method=%hs failure=%u "
-        L"targetRva=0x%X path=%s",
-        installed, state.current, state.cachedPointersCovered,
-        entry_detour::MethodName(state.method),
-        static_cast<uint32_t>(state.failure), state.targetRva, path.c_str());
-    return installed;
+    return ampere_backend::InstallRoute(provider, path.c_str(), generation, false,
+        &BeforeNgxD3D12CreateFeature, &BeforeNgxD3D12EvaluateFeature);
 }
 
 void BeforeNgxEvaluateFeatureForRoute(NgxDispatchRoute route,
@@ -3170,76 +4320,131 @@ void BeforeNgxEvaluateFeatureForRoute(NgxDispatchRoute route,
 {
     const uint32_t active = gActiveNgxDispatchRoute.load(
         std::memory_order_acquire);
-    if (active != static_cast<uint32_t>(route))
-        return;
     if (gActiveNgxGraphicsApi.load(std::memory_order_acquire)
         != static_cast<uint32_t>(api))
         return;
 
-    // Evaluate has no feature-id argument. Prefer the selected provider as the
-    // caller. Some games (including AFOP) enter the shared runtime through a
-    // runtime-owned dispatcher even though Create safely resolved one unique
-    // covered DLSS-G provider. For that shape, defer admission until the
-    // namespaced temporal parameters independently identify this as FG; an SR
-    // or other DLSS 5 Evaluate remains invisible to this telemetry path.
-    const bool callerIsSelectedProvider =
-        reinterpret_cast<uintptr_t>(ModuleFromAddress(originalCaller))
-        == gActiveNgxProviderBase.load(std::memory_order_acquire);
-    const bool selectedByUniqueCandidate =
-        gActiveNgxSelectionSource.load(std::memory_order_acquire)
-        == static_cast<uint32_t>(
-            NgxProviderSelectionSource::eRuntimeUniqueCandidate);
-    if (route == NgxDispatchRoute::eRuntime
-        && !callerIsSelectedProvider && !selectedByUniqueCandidate)
-        return;
-
-    const entry_detour::Snapshot detour =
-        entry_detour::ReadSnapshot(entryHandle);
-    HMODULE observedProvider = nullptr;
-    std::wstring observedPath;
-    NgxProviderSelectionSource selectionSource =
-        NgxProviderSelectionSource::eNone;
-    const bool providerResolved = detour.current
-        && ResolveMidpointProvider(route, api, detour, originalCaller,
-            observedProvider, observedPath, selectionSource);
-    if (!providerResolved || reinterpret_cast<uintptr_t>(observedProvider)
-            != gActiveNgxProviderBase.load(std::memory_order_acquire))
-        return;
-
-    uint64_t activeEvaluate = gActiveNgxEvaluateHandle.load(
-        std::memory_order_acquire);
-    const uint64_t requested = PackEntryHandle(entryHandle);
-    if (activeEvaluate == 0)
+    if (UseAmpere())
     {
-        gActiveNgxEvaluateHandle.compare_exchange_strong(
-            activeEvaluate, requested, std::memory_order_acq_rel,
-            std::memory_order_acquire);
-    }
-    if (gActiveNgxEvaluateHandle.load(std::memory_order_acquire)
-        != requested)
-        return;
-    (void)commandList;
-    (void)callback;
-    const auto* handle = reinterpret_cast<const NVSDK_NGX_Handle*>(
-        handleValue);
-    const auto* ngxParameters = static_cast<const NVSDK_NGX_Parameter*>(
-        parameters);
-    if (route == NgxDispatchRoute::eRuntime
-        && !callerIsSelectedProvider)
-    {
-        const bool validTemporalSample =
-            temporal_interval_trace::RecordIfValidTemporalSample(
-                handle, ngxParameters, midpoint_fix::Ready());
-        if (!universal_route_policy::CanInspectRuntimeEvaluate(false,
-                selectedByUniqueCandidate, validTemporalSample))
+        // The Ampere gate invokes this only inside an owned runtime operation.
+        // Check the pinned entry identity without reopening the provider file on
+        // every frame. Optional interval collection remains disabled by default.
+        const auto verified = entry_detour::ReadSnapshot(entryHandle);
+        if (api != NgxGraphicsApi::eD3D12 || route != NgxDispatchRoute::eProvider
+            || !verified.current || verified.kind != entry_detour::Kind::eNgxD3D12EvaluateFeature
+            || verified.owner != ampere_gpu::Provider()
+            || reinterpret_cast<uintptr_t>(verified.owner) != gActiveNgxProviderBase.load(std::memory_order_acquire)
+            || verified.generation != gActiveNgxProviderGeneration.load(std::memory_order_acquire))
             return;
+        const auto providerEvaluate = entry_detour::ReadSnapshot(
+            entry_detour::Kind::eNgxD3D12EvaluateFeature, verified.owner);
+        const auto selected = entry_detour::ReadSnapshot(UnpackEntryHandle(
+            gActiveNgxEvaluateHandle.load(std::memory_order_acquire)));
+        if (!providerEvaluate.current || providerEvaluate.currentEntries != 1
+            || providerEvaluate.handle != entryHandle || !selected.current)
+            return;
+        if (active == static_cast<uint32_t>(NgxDispatchRoute::eProvider))
+        {
+            if (selected.kind != entry_detour::Kind::eNgxD3D12EvaluateFeature
+                || selected.handle != entryHandle)
+                return;
+        }
+        else if (active == static_cast<uint32_t>(NgxDispatchRoute::eRuntime))
+        {
+            // Selection belongs to the outer runtime, while this observation
+            // still comes only from the admitted nested provider entry. Never
+            // record the outer callback or replace the selected route handle.
+            const auto runtimeEvaluate = entry_detour::ReadSnapshot(
+                entry_detour::Kind::eNgxRuntimeD3D12EvaluateFeature, selected.owner);
+            const auto create = entry_detour::ReadSnapshot(UnpackEntryHandle(
+                gActiveNgxCreateHandle.load(std::memory_order_acquire)));
+            if (selected.kind != entry_detour::Kind::eNgxRuntimeD3D12EvaluateFeature
+                || selected.owner != ModuleFromAddress(originalCaller)
+                || !runtimeEvaluate.current || runtimeEvaluate.currentEntries != 1
+                || runtimeEvaluate.handle != selected.handle
+                || !create.current || create.kind != entry_detour::Kind::eNgxRuntimeD3D12CreateFeature
+                || create.owner != selected.owner || create.generation != selected.generation
+                || !AmpereFeatureEntriesCurrent(reinterpret_cast<uintptr_t>(selected.owner), selected.generation,
+                    reinterpret_cast<uintptr_t>(verified.owner), verified.generation))
+                return;
+        }
+        else return;
+        temporal_interval_trace::Record(reinterpret_cast<const NVSDK_NGX_Handle*>(handleValue),
+            static_cast<const NVSDK_NGX_Parameter*>(parameters), gpu_backend::Ready());
+        gNgxEvaluateCalls.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
     else
     {
-        temporal_interval_trace::Record(
-            handle, ngxParameters, midpoint_fix::Ready());
+        if (active != static_cast<uint32_t>(route))
+            return;
+        // Evaluate has no feature-id argument. Prefer the selected provider as the
+        // caller. Some games (including AFOP) enter the shared runtime through a
+        // runtime-owned dispatcher even though Create safely resolved one unique
+        // covered DLSS-G provider. For that shape, defer admission until the
+        // namespaced temporal parameters independently identify this as FG; an SR
+        // or other DLSS 5 Evaluate remains invisible to this telemetry path.
+        const bool callerIsSelectedProvider =
+            reinterpret_cast<uintptr_t>(ModuleFromAddress(originalCaller))
+            == gActiveNgxProviderBase.load(std::memory_order_acquire);
+        const bool selectedByUniqueCandidate =
+            gActiveNgxSelectionSource.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(
+                NgxProviderSelectionSource::eRuntimeUniqueCandidate);
+        if (route == NgxDispatchRoute::eRuntime
+            && !callerIsSelectedProvider && !selectedByUniqueCandidate)
+            return;
+
+        const entry_detour::Snapshot detour =
+            entry_detour::ReadSnapshot(entryHandle);
+        HMODULE observedProvider = nullptr;
+        NgxProviderSelectionSource selectionSource =
+            NgxProviderSelectionSource::eNone;
+        const bool providerResolved = detour.current
+            && ResolveMidpointProvider(route, api, detour, originalCaller,
+                observedProvider, nullptr, selectionSource);
+        if (!providerResolved || reinterpret_cast<uintptr_t>(observedProvider)
+                != gActiveNgxProviderBase.load(std::memory_order_acquire))
+            return;
+
+        uint64_t activeEvaluate = gActiveNgxEvaluateHandle.load(
+            std::memory_order_acquire);
+        const uint64_t requested = PackEntryHandle(entryHandle);
+        if (activeEvaluate == 0)
+        {
+            gActiveNgxEvaluateHandle.compare_exchange_strong(
+                activeEvaluate, requested, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        if (gActiveNgxEvaluateHandle.load(std::memory_order_acquire)
+            != requested)
+            return;
+        (void)commandList;
+        (void)callback;
+        const auto* handle = reinterpret_cast<const NVSDK_NGX_Handle*>(
+            handleValue);
+        const auto* ngxParameters = static_cast<const NVSDK_NGX_Parameter*>(
+            parameters);
+        if (route == NgxDispatchRoute::eRuntime
+            && !callerIsSelectedProvider)
+        {
+            const bool validTemporalSample =
+                temporal_interval_trace::RecordIfValidTemporalSample(
+                    handle, ngxParameters, gpu_backend::Ready());
+            if (!universal_route_policy::CanInspectRuntimeEvaluate(false,
+                    selectedByUniqueCandidate, validTemporalSample))
+                return;
+        }
+        else
+        {
+            temporal_interval_trace::Record(
+                handle, ngxParameters, gpu_backend::Ready());
+        }
+        gNgxEvaluateCalls.fetch_add(1, std::memory_order_relaxed);
     }
-    gNgxEvaluateCalls.fetch_add(1, std::memory_order_relaxed);
+#if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
+    output_pull_telemetry::RecordEvaluate(handle);
+#endif
 }
 
 void WINAPI BeforeNgxD3D12EvaluateFeature(void* commandList,
@@ -3269,96 +4474,24 @@ void WINAPI BeforeNgxRuntimeD3D12EvaluateFeature(void* commandList,
 bool TryInstallNgxEvaluateEntryDetour(
     HMODULE provider, const std::wstring& path, uint64_t generation)
 {
-    if (!provider
-        || !dlssg_provider_policy::IsSupportedProvider(
-            provider, path.c_str()))
-        return false;
-    void* target = reinterpret_cast<void*>(GetProcAddress(
-        provider, "NVSDK_NGX_D3D12_EvaluateFeature"));
-    if (!target)
-        return false;
-
-    void* trampoline = nullptr;
-    entry_detour::Handle detourHandle{};
-    entry_detour::InstallOptions installOptions{};
-    installOptions.generation = generation;
-    installOptions.allowRelocated = true;
-    const bool installed = entry_detour::InstallForwarding(
-        entry_detour::Kind::eNgxD3D12EvaluateFeature,
-        provider, target, &BeforeNgxD3D12EvaluateFeature, trampoline,
-        installOptions, &detourHandle);
-    const entry_detour::Snapshot state =
-        entry_detour::ReadSnapshot(detourHandle);
-    Log(L"NGX EvaluateFeature entry detour: installed=%d current=%d "
-        L"cachedPointersCovered=%d method=%hs failure=%u "
-        L"targetRva=0x%X path=%s",
-        installed, state.current, state.cachedPointersCovered,
-        entry_detour::MethodName(state.method),
-        static_cast<uint32_t>(state.failure), state.targetRva, path.c_str());
-    return installed;
+    return ampere_backend::InstallRoute(provider, path.c_str(), generation, false,
+        &BeforeNgxD3D12CreateFeature, &BeforeNgxD3D12EvaluateFeature);
 }
 
 bool TryInstallNgxRuntimeCreateEntryDetour(
     HMODULE runtime, const std::wstring& path, uint64_t generation)
 {
-    if (!IsNgxRuntimeModule(runtime))
-        return false;
-    void* target = reinterpret_cast<void*>(GetProcAddress(
-        runtime, "NVSDK_NGX_D3D12_CreateFeature"));
-    if (!target)
-        return false;
-
-    void* trampoline = nullptr;
-    entry_detour::Handle detourHandle{};
-    entry_detour::InstallOptions installOptions{};
-    installOptions.generation = generation;
-    installOptions.allowRelocated = true;
-    installOptions.filterForwardArg2 = true;
-    installOptions.requiredForwardArg2 = static_cast<uintptr_t>(
-        NVSDK_NGX_Feature_FrameGeneration);
-    const bool installed = entry_detour::InstallForwarding(
-        entry_detour::Kind::eNgxRuntimeD3D12CreateFeature,
-        runtime, target, &BeforeNgxRuntimeD3D12CreateFeature, trampoline,
-        installOptions, &detourHandle);
-    const entry_detour::Snapshot state =
-        entry_detour::ReadSnapshot(detourHandle);
-    Log(L"NGX runtime CreateFeature entry detour: installed=%d current=%d "
-        L"cachedPointersCovered=%d method=%hs failure=%u "
-        L"targetRva=0x%X path=%s",
-        installed, state.current, state.cachedPointersCovered,
-        entry_detour::MethodName(state.method),
-        static_cast<uint32_t>(state.failure), state.targetRva, path.c_str());
-    return installed;
+    if (!IsNgxRuntimeModule(runtime)) return false;
+    return ampere_backend::InstallRoute(runtime, path.c_str(), generation, true,
+        &BeforeNgxRuntimeD3D12CreateFeature, &BeforeNgxRuntimeD3D12EvaluateFeature);
 }
 
 bool TryInstallNgxRuntimeEvaluateEntryDetour(
     HMODULE runtime, const std::wstring& path, uint64_t generation)
 {
-    if (!IsNgxRuntimeModule(runtime))
-        return false;
-    void* target = reinterpret_cast<void*>(GetProcAddress(
-        runtime, "NVSDK_NGX_D3D12_EvaluateFeature"));
-    if (!target)
-        return false;
-
-    void* trampoline = nullptr;
-    entry_detour::Handle detourHandle{};
-    entry_detour::InstallOptions installOptions{};
-    installOptions.generation = generation;
-    installOptions.allowRelocated = true;
-    const bool installed = entry_detour::InstallForwarding(
-        entry_detour::Kind::eNgxRuntimeD3D12EvaluateFeature,
-        runtime, target, &BeforeNgxRuntimeD3D12EvaluateFeature, trampoline,
-        installOptions, &detourHandle);
-    const entry_detour::Snapshot state =
-        entry_detour::ReadSnapshot(detourHandle);
-    Log(L"NGX runtime EvaluateFeature entry detour: installed=%d current=%d "
-        L"cachedPointersCovered=%d method=%hs failure=%u "
-        L"targetRva=0x%X path=%s",
-        installed, state.current, state.cachedPointersCovered,
-        entry_detour::MethodName(state.method),
-        static_cast<uint32_t>(state.failure), state.targetRva, path.c_str());
-    return installed;
+    if (!IsNgxRuntimeModule(runtime)) return false;
+    return ampere_backend::InstallRoute(runtime, path.c_str(), generation, true,
+        &BeforeNgxRuntimeD3D12CreateFeature, &BeforeNgxRuntimeD3D12EvaluateFeature);
 }
 
 void WINAPI BeforeNgxVulkanCreateFeature(void* commandBuffer,
@@ -3422,6 +4555,63 @@ void WINAPI BeforeNgxRuntimeVulkanCreateFeature1(void*,
         entryHandle, originalCaller);
 }
 
+NVSDK_NGX_Result NVSDK_CONV RejectUnsupportedVulkanCall(void*, uintptr_t, const void*, void*) noexcept
+{
+    return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+}
+
+bool WINAPI VulkanCreateGate(void* argument1, uintptr_t argument2, const void* argument3, void* argument4,
+    uintptr_t argument5, uintptr_t argument6, entry_detour::Handle handle, const void* caller) noexcept
+{
+    const auto entry = entry_detour::ReadSnapshot(handle);
+    if (!entry.current) return false;
+    const bool version1 = entry.kind == entry_detour::Kind::eNgxVulkanCreateFeature1
+        || entry.kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1;
+    const uintptr_t feature = version1 ? reinterpret_cast<uintptr_t>(argument3) : argument2;
+    if (!gpu_dispatch::AllowVulkanCreate(gpu_dispatch::Selected(),
+            feature == NVSDK_NGX_Feature_FrameGeneration,
+            gVulkanAdapterVerified.load(std::memory_order_acquire)))
+        return false;
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
+    // A forwarding gate runs before its pre-call callback. Run preparation
+    // inside this gate so an unsafe publication rejects this same native call.
+    entry_detour::ForwardPreCall before = nullptr;
+    switch (entry.kind)
+    {
+    case entry_detour::Kind::eNgxVulkanCreateFeature:
+        before = &BeforeNgxVulkanCreateFeature; break;
+    case entry_detour::Kind::eNgxRuntimeVulkanCreateFeature:
+        before = &BeforeNgxRuntimeVulkanCreateFeature; break;
+    case entry_detour::Kind::eNgxVulkanCreateFeature1:
+        before = &BeforeNgxVulkanCreateFeature1; break;
+    case entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1:
+        before = &BeforeNgxRuntimeVulkanCreateFeature1; break;
+    default:
+        return false;
+    }
+    before(argument1, argument2, argument3, argument4,
+        argument5, argument6, handle, caller);
+    if (feature == NVSDK_NGX_Feature_FrameGeneration
+        && midpoint_fix::OutputPullMaskRequiresRestart())
+        return false;
+#endif
+    return true;
+}
+
+bool WINAPI VulkanEvaluateGate(void*, uintptr_t, const void*, void*,
+    uintptr_t, uintptr_t, entry_detour::Handle handle, const void*) noexcept
+{
+    const auto entry = entry_detour::ReadSnapshot(handle);
+    return entry.current
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
+        && (entry.kind != entry_detour::Kind::eNgxVulkanEvaluateFeature
+            || !midpoint_fix::OutputPullMaskRequiresRestart())
+#endif
+        && gpu_dispatch::AllowVulkanEvaluate(gpu_dispatch::Selected(),
+        entry.kind == entry_detour::Kind::eNgxVulkanEvaluateFeature,
+        gVulkanAdapterVerified.load(std::memory_order_acquire));
+}
+
 bool InstallNgxVulkanCreateEntry(HMODULE owner,
     const std::wstring& path, uint64_t generation, const char* exportName,
     entry_detour::Kind kind, entry_detour::ForwardPreCall callback,
@@ -3434,13 +4624,15 @@ bool InstallNgxVulkanCreateEntry(HMODULE owner,
     entry_detour::InstallOptions options{};
     options.generation = generation;
     options.allowRelocated = true;
-    options.filterForwardArg2 = featureIsSecondArgument;
-    options.requiredForwardArg2 = static_cast<uintptr_t>(
-        NVSDK_NGX_Feature_FrameGeneration);
+    (void)featureIsSecondArgument; // The gate decodes both public Create ABIs.
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
+    callback = nullptr; // The gate prepares exactly once, then checks publication.
+#endif
     void* trampoline = nullptr;
     entry_detour::Handle handle{};
     const bool installed = entry_detour::InstallForwarding(kind, owner,
-        target, callback, trampoline, options, &handle);
+        target, callback, trampoline, options, &handle,
+        &VulkanCreateGate, reinterpret_cast<void*>(&RejectUnsupportedVulkanCall));
     const entry_detour::Snapshot state = entry_detour::ReadSnapshot(handle);
     Log(L"NGX Vulkan %hs entry detour: installed=%d current=%d "
         L"cachedPointersCovered=%d method=%hs failure=%u "
@@ -3520,7 +4712,8 @@ bool InstallNgxVulkanEvaluateEntry(HMODULE owner,
     void* trampoline = nullptr;
     entry_detour::Handle handle{};
     const bool installed = entry_detour::InstallForwarding(kind, owner,
-        target, callback, trampoline, options, &handle);
+        target, callback, trampoline, options, &handle,
+        &VulkanEvaluateGate, reinterpret_cast<void*>(&RejectUnsupportedVulkanCall));
     const entry_detour::Snapshot state = entry_detour::ReadSnapshot(handle);
     Log(L"NGX Vulkan EvaluateFeature entry detour: installed=%d current=%d "
         L"cachedPointersCovered=%d method=%hs failure=%u "
@@ -3550,32 +4743,78 @@ bool TryInstallNgxRuntimeVulkanEvaluateEntryDetour(
             &BeforeNgxRuntimeVulkanEvaluateFeature);
 }
 
+void PrepareVulkanProviderCapabilities(entry_detour::Handle handle)
+{
+    const auto entry = entry_detour::ReadSnapshot(handle);
+    if (!entry.current || !gpu_dispatch::IsAda()
+        || !gVulkanAdapterVerified.load(std::memory_order_acquire)
+        || !dlssg_provider_policy::IsSupportedRetainedProvider(entry.owner))
+        return;
+    // Only the provider actually entered by NGX may select the temporal
+    // program. Passive discovery can also see an unused bundled provider
+    // while NGX selects a different NVIDIA override image.
+    const auto path = LoadedModulePath(entry.owner);
+    const auto record = InspectLoadedModule(entry.owner, path);
+    const auto create = entry_detour::ReadSnapshot(
+        entry_detour::Kind::eNgxVulkanCreateFeature, entry.owner);
+    const auto evaluate = entry_detour::ReadSnapshot(
+        entry_detour::Kind::eNgxVulkanEvaluateFeature, entry.owner);
+    if (!record.ngxPatched || !create.current || !evaluate.current
+        || entry.generation != record.generation
+        || create.generation != record.generation || evaluate.generation != record.generation
+        || !gpu_backend::PatchProvider(entry.owner, path.c_str()))
+        return;
+    const auto capability = vulkan_capability::Find(entry.owner);
+    if (capability.threshold && *capability.threshold != 0x90)
+    {
+        const bool published = vulkan_capability::Publish(capability);
+        Log(L"Vulkan DLSS-G capability maximum: published=%d generatedFrames=5 "
+            L"targetRva=0x%X path=%s", published, capability.rva, path.c_str());
+    }
+}
+
 void WINAPI BeforeNgxVulkanInit(void*, uintptr_t, const void*,
-    void* physicalDevice, uintptr_t, uintptr_t, entry_detour::Handle,
+    void* physicalDevice, uintptr_t, uintptr_t, entry_detour::Handle handle,
     const void*) noexcept
 {
     const bool verified = physicalDevice
-        && midpoint_fix::ObserveVulkanPhysicalDevice(physicalDevice);
+        && gpu_backend::ObserveVulkanPhysicalDevice(physicalDevice);
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
+    {
+        if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
         gModuleInventoryDirty.store(true, std::memory_order_release);
+        InspectAlreadyLoadedModules();
+        ObserveOutputPullMaskVulkanInit(handle);
+        PrepareVulkanProviderCapabilities(handle);
+    }
 }
 
 void WINAPI BeforeNgxVulkanProjectInit(void*, uintptr_t, const void*,
-    void*, uintptr_t, uintptr_t physicalDevice, entry_detour::Handle,
+    void*, uintptr_t, uintptr_t physicalDevice, entry_detour::Handle handle,
     const void*) noexcept
 {
     const bool verified = physicalDevice
-        && midpoint_fix::ObserveVulkanPhysicalDevice(
+        && gpu_backend::ObserveVulkanPhysicalDevice(
             reinterpret_cast<void*>(physicalDevice));
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
+    {
+        if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
         gModuleInventoryDirty.store(true, std::memory_order_release);
+        InspectAlreadyLoadedModules();
+        ObserveOutputPullMaskVulkanInit(handle);
+        PrepareVulkanProviderCapabilities(handle);
+    }
 }
 
 bool TryInstallNgxVulkanAdapterEntryDetours(HMODULE module,
     const std::wstring& path, uint64_t generation)
 {
+    if (UseAmpere())
+    {
+        return false;
+    }
     if (!module || !ExportsNgxVulkanRoute(module))
         return false;
     struct AdapterEntry
@@ -3675,6 +4914,12 @@ bool ReadViewportValue(const sl::ViewportHandle* viewport,
     }
 }
 
+sl::DLSSGOptions AmpereFixedOptions(const sl::DLSSGOptions& source, bool preserveNext)
+{
+    return BuildAdjustedOptions(source, ReadControlSnapshot(), preserveNext);
+}
+
+
 sl::Result PassPublicSet(ControlRouteRecord& route,
     const sl::ViewportHandle& viewport,
     const sl::DLSSGOptions& options) noexcept
@@ -3684,7 +4929,21 @@ sl::Result PassPublicSet(ControlRouteRecord& route,
     if (!original)
         return sl::Result::eErrorNotInitialized;
     ScopedInternalControlBypass bypass;
-    return original(viewport, options);
+    if (UseAmpere())
+    {
+        sl::DLSSGOptions known{};
+        const sl::DLSSGOptions* found = nullptr;
+        size_t version = 0;
+        if (FindStructBounded(&options, found, version) != ChainFindStatus::eFound || found != &options)
+            return sl::Result::eErrorInvalidParameter;
+        if (!CopySupportedOptions(&options, known, true)) return sl::Result::eErrorInvalidParameter;
+        const sl::DLSSGOptions fixed = AmpereFixedOptions(known, true);
+        return original(viewport, fixed);
+    }
+    else
+    {
+        return original(viewport, options);
+    }
 }
 
 sl::Result HandlePublicSetOptions(uint32_t routeSlot,
@@ -3724,14 +4983,15 @@ sl::Result HandlePublicSetOptions(uint32_t routeSlot,
     const bool enabled = options.mode == sl::DLSSGMode::eOn
         || options.mode == sl::DLSSGMode::eAuto
         || options.mode == sl::DLSSGMode::eDynamic;
+    RecordGameFrameGenerationIntent(viewport, enabled);
     if (!enabled)
     {
         gSetOptionsSeen.store(true, std::memory_order_release);
         const sl::Result result = PassPublicSet(*route, viewport, options);
         gLastSetOptionsResult.store(static_cast<int32_t>(result),
             std::memory_order_relaxed);
-        RecordSetOptionsLifecycle(*route, false, result);
-        return result;
+        RecordSetOptionsLifecycle(*route, viewport, false, result);
+        return HostControlResult(result);
     }
 
     CaptureGameOptions(viewport, options);
@@ -3742,17 +5002,19 @@ sl::Result HandlePublicSetOptions(uint32_t routeSlot,
         gSetOptionsSeen.store(true, std::memory_order_release);
         gLastSetOptionsResult.store(static_cast<int32_t>(result),
             std::memory_order_relaxed);
-        RecordSetOptionsLifecycle(*route, true, result);
+        RecordSetOptionsLifecycle(*route, viewport, true, result);
         if (IsAcceptedControlResult(result)
             && !gFrameGenerationCreateObserved.load(
-                std::memory_order_acquire))
+                std::memory_order_acquire)
+            && (!UseAmpere() || !ampere_backend::EarlyInitObserved())
+            )
         {
             gPipelineMayPredateDetour.store(true,
                 std::memory_order_release);
             gRestartRequired.store(true, std::memory_order_release);
         }
         if (!IsAcceptedControlResult(result) || !BridgeReady())
-            return result;
+            return HostControlResult(result);
     }
 
     return SubmitAdjustedOptions(*route, viewport, options,
@@ -3771,6 +5033,35 @@ sl::Result HandlePublicGetState(uint32_t routeSlot, ControlEntryPath path,
     if (!original)
         return sl::Result::eErrorNotInitialized;
 
+    const auto passThrough = [&](bool record = true) {
+        if (UseAmpere())
+        {
+            const sl::DLSSGState* known = nullptr;
+            size_t version = 0;
+            if (FindStructBounded(&state, known, version) != ChainFindStatus::eFound
+                || !IsSupportedStateVersion(version)) return sl::Result::eErrorInvalidParameter;
+            sl::DLSSGOptions query{};
+            if (options)
+            {
+                const sl::DLSSGOptions* found = nullptr;
+                if (FindStructBounded(options, found, version) != ChainFindStatus::eFound
+                    || !CopySupportedOptions(options, query, true)) return sl::Result::eErrorInvalidParameter;
+                query = AmpereFixedOptions(query, true);
+            }
+            const auto result = original(viewport, state, options ? &query : nullptr);
+            if (DlssgStateAvailable(result) && state.structVersion >= sl::kStructVersion2)
+            {
+                state.numFramesToGenerateMax = std::min(state.numFramesToGenerateMax, ampere_policy::kMaximumGeneratedFrames);
+            }
+            if (record) RecordDlssgStateResult(result, state);
+            return result;
+        }
+        else
+        {
+            return original(viewport, state, options);
+        }
+    };
+
     BaseStructureFields stateFields{};
     if (!ReadBaseStructureFields(&state, stateFields)
         || stateFields.type != sl::DLSSGState::s_structType)
@@ -3778,14 +5069,14 @@ sl::Result HandlePublicGetState(uint32_t routeSlot, ControlEntryPath path,
         InvalidateControlRoute(routeSlot,
             UniversalRouteFailure::eMalformedStructureChain);
         ScopedInternalControlBypass bypass;
-        return original(viewport, state, options);
+        return passThrough();
     }
     if (!IsSupportedStateVersion(stateFields.version))
     {
         InvalidateControlRoute(routeSlot,
             UniversalRouteFailure::eUnknownStateVersion);
         ScopedInternalControlBypass bypass;
-        return original(viewport, state, options);
+        return passThrough();
     }
     if (options)
     {
@@ -3796,20 +5087,20 @@ sl::Result HandlePublicGetState(uint32_t routeSlot, ControlEntryPath path,
             InvalidateControlRoute(routeSlot,
                 UniversalRouteFailure::eMalformedStructureChain);
             ScopedInternalControlBypass bypass;
-            return original(viewport, state, options);
+            return passThrough();
         }
         if (!IsSupportedOptionsVersion(optionFields.version))
         {
             InvalidateControlRoute(routeSlot,
                 UniversalRouteFailure::eUnknownOptionsVersion);
             ScopedInternalControlBypass bypass;
-            return original(viewport, state, options);
+            return passThrough();
         }
     }
     if (!ActivateControlRoute(routeSlot, path, false))
     {
         ScopedInternalControlBypass bypass;
-        return original(viewport, state, options);
+        return passThrough();
     }
     std::lock_guard callLock(gStreamlineCallMutex);
     if (path == ControlEntryPath::eResolver)
@@ -3819,9 +5110,9 @@ sl::Result HandlePublicGetState(uint32_t routeSlot, ControlEntryPath path,
     }
     ReapplyPendingControl(viewport);
     ScopedInternalControlBypass bypass;
-    const sl::Result result = original(viewport, state, options);
+    const sl::Result result = passThrough(false);
     RecordDlssgStateResult(result, state);
-    return result;
+    return HostControlResult(result);
 }
 
 sl::Result HandleInternalSetData(uint32_t routeSlot,
@@ -3838,6 +5129,27 @@ sl::Result HandleInternalSetData(uint32_t routeSlot,
         return original(inputs, commandBuffer);
     const auto passThrough = [&]() {
         ScopedInternalControlBypass bypass;
+        if (UseAmpere())
+        {
+            const sl::DLSSGOptions* requested = nullptr;
+            const sl::ViewportHandle* selectedViewport = nullptr;
+            size_t optionsVersion = 0, viewportVersion = 0;
+            const auto shape = FindStructBounded(inputs, requested, optionsVersion);
+            if (shape == ChainFindStatus::eMalformed) return sl::Result::eErrorInvalidParameter;
+            if (shape == ChainFindStatus::eFound)
+            {
+                sl::DLSSGOptions known{};
+                uint32_t viewportValue = 0;
+                if (!CopySupportedOptions(requested, known, false)
+                    || FindStructBounded(inputs, selectedViewport, viewportVersion) != ChainFindStatus::eFound
+                    || !ReadViewportValue(selectedViewport, viewportValue)) return sl::Result::eErrorInvalidParameter;
+                sl::DLSSGOptions fixed = AmpereFixedOptions(known, false);
+                sl::ViewportHandle viewportCopy{viewportValue};
+                viewportCopy.next = &fixed;
+                fixed.next = const_cast<sl::BaseStructure*>(inputs);
+                return original(&viewportCopy, commandBuffer);
+            }
+        }
         return original(inputs, commandBuffer);
     };
 
@@ -3885,14 +5197,15 @@ sl::Result HandleInternalSetData(uint32_t routeSlot,
     const bool enabled = source.mode == sl::DLSSGMode::eOn
         || source.mode == sl::DLSSGMode::eAuto
         || source.mode == sl::DLSSGMode::eDynamic;
+    RecordGameFrameGenerationIntent(publicViewport, enabled);
     if (!enabled)
     {
         gSetOptionsSeen.store(true, std::memory_order_release);
         const sl::Result result = passThrough();
         gLastSetOptionsResult.store(static_cast<int32_t>(result),
             std::memory_order_relaxed);
-        RecordSetOptionsLifecycle(*route, false, result);
-        return result;
+        RecordSetOptionsLifecycle(*route, publicViewport, false, result);
+        return HostControlResult(result);
     }
 
     CaptureGameOptions(publicViewport, source);
@@ -3903,9 +5216,9 @@ sl::Result HandleInternalSetData(uint32_t routeSlot,
         gSetOptionsSeen.store(true, std::memory_order_release);
         gLastSetOptionsResult.store(static_cast<int32_t>(result),
             std::memory_order_relaxed);
-        RecordSetOptionsLifecycle(*route, true, result);
+        RecordSetOptionsLifecycle(*route, publicViewport, true, result);
         if (!IsAcceptedControlResult(result) || !BridgeReady())
-            return result;
+            return HostControlResult(result);
     }
 
     auto submit = [&](const sl::DLSSGOptions& adjustedSource) {
@@ -3940,9 +5253,29 @@ sl::Result HandleInternalGetData(uint32_t routeSlot,
         return sl::Result::eErrorNotInitialized;
     if (InternalControlBypassDepth() != 0)
         return original(inputs, outputs, commandBuffer);
-    const auto passThrough = [&]() {
+    const auto passThrough = [&](bool record = true) {
         ScopedInternalControlBypass bypass;
-        return original(inputs, outputs, commandBuffer);
+        if (UseAmpere())
+        {
+            const sl::DLSSGState* known = nullptr;
+            size_t version = 0;
+            const auto shape = FindStructBounded(outputs, known, version);
+            if (shape == ChainFindStatus::eMalformed || (shape == ChainFindStatus::eFound
+                && !IsSupportedStateVersion(version))) return sl::Result::eErrorInvalidParameter;
+            const auto result = original(inputs, outputs, commandBuffer);
+            if (known)
+            {
+                auto& state = *const_cast<sl::DLSSGState*>(known);
+                if (DlssgStateAvailable(result) && state.structVersion >= sl::kStructVersion2)
+                    state.numFramesToGenerateMax = std::min(state.numFramesToGenerateMax, ampere_policy::kMaximumGeneratedFrames);
+                if (record) RecordDlssgStateResult(result, state);
+            }
+            return result;
+        }
+        else
+        {
+            return original(inputs, outputs, commandBuffer);
+        }
     };
 
     const sl::DLSSGState* stateView = nullptr;
@@ -3996,10 +5329,10 @@ sl::Result HandleInternalGetData(uint32_t routeSlot,
     std::lock_guard callLock(gStreamlineCallMutex);
     const sl::ViewportHandle publicViewport{viewportValue};
     ReapplyPendingControl(publicViewport);
-    const sl::Result result = passThrough();
+    const sl::Result result = passThrough(false);
     auto& mutableState = *const_cast<sl::DLSSGState*>(stateView);
     RecordDlssgStateResult(result, mutableState);
-    return result;
+    return HostControlResult(result);
 }
 
 sl::Result HandleFreeResources(uint32_t routeSlot, sl::Feature feature,
@@ -4012,15 +5345,58 @@ sl::Result HandleFreeResources(uint32_t routeSlot, sl::Feature feature,
         route->freeResourcesOriginal, route->freeResourcesHandle);
     if (!original)
         return sl::Result::eErrorNotInitialized;
+    AcceptedOffEvidence expected{};
+    if (feature == sl::kFeatureDLSS_G)
+    {
+        std::lock_guard lifetimeLock(gFrameGenerationLifetimeMutex);
+        if (gAcceptedOffEvidence.routeSlot == routeSlot
+            && gAcceptedOffEvidence.viewport
+                == static_cast<uint32_t>(viewport))
+            expected = gAcceptedOffEvidence;
+    }
     const sl::Result result = original(feature, viewport);
     route->releaseCalls.fetch_add(1, std::memory_order_relaxed);
-    if (gActiveControlRouteSlot.load(std::memory_order_acquire) == routeSlot
-        && feature == sl::kFeatureDLSS_G
-        && IsAcceptedControlResult(result)
-        && route->frameGenerationOffAccepted.load(
-            std::memory_order_acquire))
+    if (feature == sl::kFeatureDLSS_G && IsAcceptedControlResult(result))
     {
-        ResetReleasedPipelineState(*route);
+        InvalidateUiInputEvidence(static_cast<uint32_t>(viewport));
+        if (static_cast<uint32_t>(viewport)
+            == gLastOptionsViewport.load(std::memory_order_acquire))
+        {
+            gAppliedUiRecompositionEnabled.store(false, std::memory_order_release);
+            gAppliedUiRecompositionForced.store(false, std::memory_order_release);
+        }
+    }
+    if (expected.routeSlot != UINT32_MAX
+        && IsAcceptedControlResult(result))
+    {
+        if (!expected.feature)
+        {
+            // Ada exposes no exact post-ReleaseFeature identity. The matching
+            // accepted free is therefore a one-way safety boundary even if an
+            // On call raced with the native free: do not reapply to a possibly
+            // released lifetime from polling.
+            gAppliedRevision.store(0, std::memory_order_release);
+            gAttemptedRevision.store(0, std::memory_order_release);
+            gRestartRequired.store(true, std::memory_order_release);
+            Log(L"Matching Ada DLSS-G resources were freed after accepted "
+                L"Off; exact feature recreation is unavailable, restart required");
+            return result;
+        }
+        std::lock_guard lifetimeLock(gFrameGenerationLifetimeMutex);
+        if (SameRetainedFeature(expected.feature,
+                gRetainedFrameGenerationFeature)
+            && !route->releaseObserved.load(std::memory_order_acquire))
+        {
+            // slFreeResources success is not itself proof that this exact NGX
+            // feature reached ReleaseFeature.  A matching post-call observer
+            // may already have retired it from inside the native call; absent
+            // that evidence, keep ownership and require a known recreation.
+            gRestartRequired.store(true, std::memory_order_release);
+            Log(L"Matching DLSS-G resources were freed without an exact "
+                L"ReleaseFeature boundary; retained feature %p remains "
+                L"restricted until restart/recreation",
+                reinterpret_cast<void*>(expected.feature.handle));
+        }
     }
     return result;
 }
@@ -4133,7 +5509,11 @@ uint32_t EnsureControlRoute(HMODULE wrapper, const std::wstring& path,
         ControlRouteRecord& route = gControlRoutes[slot];
         if (route.claimed.load(std::memory_order_acquire)
             && route.wrapper == wrapper && route.generation == generation)
+        {
+            route.compiledMaximumGeneratedFrames.store(compiledMaximumGeneratedFrames, std::memory_order_release);
+            route.wrapperPatched.store(wrapperPatched, std::memory_order_release);
             return slot;
+        }
     }
     for (uint32_t slot = 0; slot < gControlRoutes.size(); ++slot)
     {
@@ -4545,10 +5925,11 @@ sl::Result HookSlSetTag(const sl::ViewportHandle& viewport,
     auto* original = gOriginalSetTag.load(std::memory_order_acquire);
     if (!original)
         return sl::Result::eErrorNotInitialized;
+    const auto batch = PrepareUiResourceTags(viewport, tags, numTags, false, 0);
     const sl::Result result = original(viewport, tags, numTags, cmdBuffer);
     gSetTagCalls.fetch_add(1, std::memory_order_relaxed);
     if (result == sl::Result::eOk)
-        CaptureUiResourceTags(viewport, tags, numTags);
+        RecordUiResourceTags(batch);
     return result;
 }
 
@@ -4559,21 +5940,45 @@ sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
     auto* original = gOriginalSetTagForFrame.load(std::memory_order_acquire);
     if (!original)
         return sl::Result::eErrorNotInitialized;
+    const auto batch = PrepareUiResourceTags(viewport, tags, numTags, true,
+        static_cast<uint32_t>(frame));
     const sl::Result result = original(frame, viewport, tags, numTags, cmdBuffer);
     gSetTagForFrameCalls.fetch_add(1, std::memory_order_relaxed);
     if (result == sl::Result::eOk)
-        CaptureUiResourceTags(viewport, tags, numTags);
+        RecordUiResourceTags(batch);
     return result;
 }
+
+void InspectAlreadyLoadedModules();
 
 sl::Result HookSlSetD3DDevice(void* device)
 {
     auto* original = gOriginalSetD3DDevice.load(std::memory_order_acquire);
     if (!original)
         return sl::Result::eErrorNotInitialized;
-    if (midpoint_fix::ObserveD3D12Device(device))
+    InvalidateUiInputEvidence();
+    if (gpu_backend::ObserveD3D12Device(device))
+    {
         gModuleInventoryDirty.store(true, std::memory_order_release);
-    return original(device);
+        if (gpu_dispatch::IsAda())
+        {
+            dlssg_preset::Prepare();
+            temporal_interval_trace::SetEnabled(true);
+            InspectAlreadyLoadedModules();
+        }
+        else if (UseAmpere())
+        {
+            temporal_interval_trace::SetEnabled(true);
+        }
+    }
+    if (UseAmpere())
+    {
+        return InvokeAmpereDeviceSetup(original, device);
+    }
+    else
+    {
+        return original(device);
+    }
 }
 
 sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
@@ -4581,6 +5986,7 @@ sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
     auto* original = gOriginalSetVulkanInfo.load(std::memory_order_acquire);
     if (!original)
         return sl::Result::eErrorNotInitialized;
+    InvalidateUiInputEvidence();
     void* physicalDevice = nullptr;
     __try
     {
@@ -4593,16 +5999,24 @@ sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
         physicalDevice = nullptr;
     }
     const bool verified = physicalDevice
-        && midpoint_fix::ObserveVulkanPhysicalDevice(physicalDevice);
+        && gpu_backend::ObserveVulkanPhysicalDevice(physicalDevice);
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
+    {
+        if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
         gModuleInventoryDirty.store(true, std::memory_order_release);
+        InspectAlreadyLoadedModules();
+    }
     return original(info);
 }
 
 bool HookModuleImport(HMODULE module, const char* importedModule,
     const char* importedFunction, void* replacement, void*& original)
 {
+    // VirtualProtect applies to an entire page, including neighbouring IAT
+    // slots. Serialize discovery writers through protection restoration.
+    // No loader calls or external callbacks run while this mutex is held.
+    std::lock_guard publicationLock(gImportPublicationMutex);
     auto* base = reinterpret_cast<uint8_t*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -4639,21 +6053,25 @@ bool HookModuleImport(HMODULE module, const char* importedModule,
                 continue;
 
             auto** slot = reinterpret_cast<void**>(&thunk->u1.Function);
-            auto* current = *slot;
+            auto* current = protected_pointer::ReadPointer(
+                reinterpret_cast<uintptr_t>(slot));
             if (current == replacement)
                 return true;
 
-            DWORD oldProtection = 0;
-            if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProtection))
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(slot, &memory, sizeof(memory)) != sizeof(memory)
+                || memory.AllocationBase != module || memory.Type != MEM_IMAGE
+                || memory.State != MEM_COMMIT)
                 return false;
-            original = current;
-            InterlockedExchangePointer(
-                reinterpret_cast<void* volatile*>(slot), replacement);
-            DWORD ignoredProtection = 0;
-            const BOOL restored = VirtualProtect(
-                slot, sizeof(*slot), oldProtection, &ignoredProtection);
-            FlushInstructionCache(GetCurrentProcess(), slot, sizeof(*slot));
-            return restored != FALSE;
+            const auto published = protected_pointer::ReplaceProtectedPointer(
+                reinterpret_cast<uintptr_t>(slot),
+                reinterpret_cast<uintptr_t>(current),
+                reinterpret_cast<uintptr_t>(replacement),
+                &VirtualProtect, PAGE_READWRITE);
+            if (published.replacementWasPublished)
+                original = current;
+            return published.disposition
+                == protected_pointer::PublishDisposition::ePublishedRestored;
         }
     }
     return false;
@@ -4880,40 +6298,50 @@ bool InstallStreamlineLoaderDiscovery(
     bool installed = false;
     bool newlyHooked = false;
     void* original = nullptr;
-    if (HookModuleImport(module, "KERNEL32.dll", "LoadLibraryA",
-            reinterpret_cast<void*>(&HookStreamlineLoadLibraryA), original))
+    // A failed protection restoration can leave the hook visible. Retain its
+    // callable original independently of whether publication verified success.
+    bool published = HookModuleImport(module, "KERNEL32.dll", "LoadLibraryA",
+        reinterpret_cast<void*>(&HookStreamlineLoadLibraryA), original);
+    if (original || published)
     {
-        installed = PreserveLoaderImportOriginal(
+        const bool chainReady = PreserveLoaderImportOriginal(
             gOriginalStreamlineLoadLibraryA, original,
-            &HookStreamlineLoadLibraryA, L"LoadLibraryA", path) || installed;
-        newlyHooked = original != nullptr || newlyHooked;
+            &HookStreamlineLoadLibraryA, L"LoadLibraryA", path);
+        installed = (published && chainReady) || installed;
+        newlyHooked = (published && chainReady && original != nullptr) || newlyHooked;
     }
     original = nullptr;
-    if (HookModuleImport(module, "KERNEL32.dll", "LoadLibraryW",
-            reinterpret_cast<void*>(&HookStreamlineLoadLibraryW), original))
+    published = HookModuleImport(module, "KERNEL32.dll", "LoadLibraryW",
+        reinterpret_cast<void*>(&HookStreamlineLoadLibraryW), original);
+    if (original || published)
     {
-        installed = PreserveLoaderImportOriginal(
+        const bool chainReady = PreserveLoaderImportOriginal(
             gOriginalStreamlineLoadLibraryW, original,
-            &HookStreamlineLoadLibraryW, L"LoadLibraryW", path) || installed;
-        newlyHooked = original != nullptr || newlyHooked;
+            &HookStreamlineLoadLibraryW, L"LoadLibraryW", path);
+        installed = (published && chainReady) || installed;
+        newlyHooked = (published && chainReady && original != nullptr) || newlyHooked;
     }
     original = nullptr;
-    if (HookModuleImport(module, "KERNEL32.dll", "LoadLibraryExA",
-            reinterpret_cast<void*>(&HookStreamlineLoadLibraryExA), original))
+    published = HookModuleImport(module, "KERNEL32.dll", "LoadLibraryExA",
+        reinterpret_cast<void*>(&HookStreamlineLoadLibraryExA), original);
+    if (original || published)
     {
-        installed = PreserveLoaderImportOriginal(
+        const bool chainReady = PreserveLoaderImportOriginal(
             gOriginalStreamlineLoadLibraryExA, original,
-            &HookStreamlineLoadLibraryExA, L"LoadLibraryExA", path) || installed;
-        newlyHooked = original != nullptr || newlyHooked;
+            &HookStreamlineLoadLibraryExA, L"LoadLibraryExA", path);
+        installed = (published && chainReady) || installed;
+        newlyHooked = (published && chainReady && original != nullptr) || newlyHooked;
     }
     original = nullptr;
-    if (HookModuleImport(module, "KERNEL32.dll", "LoadLibraryExW",
-            reinterpret_cast<void*>(&HookStreamlineLoadLibraryExW), original))
+    published = HookModuleImport(module, "KERNEL32.dll", "LoadLibraryExW",
+        reinterpret_cast<void*>(&HookStreamlineLoadLibraryExW), original);
+    if (original || published)
     {
-        installed = PreserveLoaderImportOriginal(
+        const bool chainReady = PreserveLoaderImportOriginal(
             gOriginalStreamlineLoadLibraryExW, original,
-            &HookStreamlineLoadLibraryExW, L"LoadLibraryExW", path) || installed;
-        newlyHooked = original != nullptr || newlyHooked;
+            &HookStreamlineLoadLibraryExW, L"LoadLibraryExW", path);
+        installed = (published && chainReady) || installed;
+        newlyHooked = (published && chainReady && original != nullptr) || newlyHooked;
     }
     if (installed)
         gStreamlineLoaderDiscoveryInstalled.store(true,
@@ -4932,6 +6360,17 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
     auto* original = EntryOriginal(gOriginalSlInit, gSlInitEntryHandle);
     if (!original || original == &HookSlInit)
         return sl::Result::eErrorNotInitialized;
+    const auto maskInitEntry = entry_detour::ReadSnapshot(gSlInitEntryHandle);
+    {
+        std::lock_guard lock(gOutputPullMaskInitMutex);
+        gOutputPullMaskSlInit = {};
+        gOutputPullMaskVulkanInit = {};
+    }
+
+    InvalidateUiInputEvidence();
+    gAppliedUiRecompositionEnabled.store(false, std::memory_order_release);
+    gAppliedUiRecompositionForced.store(false, std::memory_order_release);
+    ampere_backend::ObserveEarlyInit();
 
     sl::Preferences adjusted = preferences;
     const uint64_t before = static_cast<uint64_t>(adjusted.flags);
@@ -4983,7 +6422,7 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         providerPreflight, loaderDiscovery);
     const streamline_ota_policy::Result policy =
         streamline_ota_policy::Apply(
-            before, officialSixX, coherentHost, loaderDiscovery);
+            before, gpu_dispatch::IsAda() && officialSixX, coherentHost, loaderDiscovery);
     const uint64_t after = policy.flags;
     adjusted.flags = static_cast<sl::PreferenceFlags>(after);
     gSlInitFlagsBefore.store(before, std::memory_order_release);
@@ -5023,7 +6462,8 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         gNvidiaProfileName.c_str(), nvidia_mfg_policy::TierName(tier),
         hostVersion.major, hostVersion.minor, hostVersion.build,
         hostVersion.privatePart, providerPreflight);
-    const sl::Result result = original(adjusted, sdkVersion);
+    const sl::Result result = InvokeAmpereInit(original, adjusted, sdkVersion);
+    ObserveOutputPullMaskSlInitResult(maskInitEntry, result == sl::Result::eOk);
     if (result == sl::Result::eOk)
     {
         // Streamline may load feature or NGX provider modules before returning.
@@ -5079,12 +6519,26 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
     if (!original)
         return nullptr;
     FARPROC resolved = original(module, functionName);
+    if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
+        && ngx_initialization::IsEntry(functionName))
+        InspectLoadedModule(module, LoadedModulePath(module));
+    if (resolved && gpu_dispatch::IsAda()) dlssg_preset::PrepareForExport(module, functionName);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    resolved = single_overlay::ResolveProc(module, functionName, resolved);
+#endif
     if (!resolved || !functionName
         || reinterpret_cast<uintptr_t>(functionName) <= 0xFFFFu
         || !ModuleFileNameEquals(LoadedModulePath(module),
             L"sl.interposer.dll"))
     {
         return resolved;
+    }
+
+    if (std::strcmp(functionName, "slSetD3DDevice") == 0)
+    {
+        auto* candidate = reinterpret_cast<PFun_slSetD3DDevice*>(resolved);
+        if (candidate != &HookSlSetD3DDevice) gOriginalSetD3DDevice.store(candidate);
+        return reinterpret_cast<FARPROC>(&HookSlSetD3DDevice);
     }
 
     if (std::strcmp(functionName, "slSetVulkanInfo") == 0)
@@ -5170,6 +6624,10 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
     if (!original)
         return nullptr;
     FARPROC resolved = original(module, functionName);
+    if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
+        && ngx_initialization::IsEntry(functionName))
+        InspectLoadedModule(module, LoadedModulePath(module));
+    if (resolved && gpu_dispatch::IsAda()) dlssg_preset::PrepareForExport(module, functionName);
     if (!resolved || !functionName
         || reinterpret_cast<uintptr_t>(functionName) <= 0xFFFFu)
         return resolved;
@@ -5177,6 +6635,9 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
         "NVSDK_NGX_D3D12_CreateFeature") == 0;
     const bool evaluate = std::strcmp(functionName,
         "NVSDK_NGX_D3D12_EvaluateFeature") == 0;
+    const bool ampereStartup = true
+        && (std::strcmp(functionName, "NVSDK_NGX_D3D12_GetFeatureRequirements") == 0
+            || std::strcmp(functionName, "NVSDK_NGX_D3D12_GetCapabilityParameters") == 0);
     const bool vulkan = std::strcmp(functionName,
             "NVSDK_NGX_VULKAN_CreateFeature") == 0
         || std::strcmp(functionName,
@@ -5195,7 +6656,7 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
             "NVSDK_NGX_VULKAN_Init_ProjectID") == 0
         || std::strcmp(functionName,
             "NVSDK_NGX_VULKAN_Init_ProjectID_Ext") == 0;
-    if (!create && !evaluate && !vulkan)
+    if (!create && !evaluate && !vulkan && !ampereStartup)
         return resolved;
 
     // This resolver interception is discovery only. The raw function pointer
@@ -5573,6 +7034,11 @@ PatternPatchResult PatchUniqueWrapperMaximumPattern(
         return {true, false, match};
     }
 
+    if (!gpu_dispatch::IsAda())
+    {
+        return {true, UseAmpere() && memcmp(match + universal_wrapper_profile::kPatchOffset,
+            kWrapperOriginal.data(), kWrapperOriginal.size()) == 0, match, compiledMaximum};
+    }
     uint8_t* address = match + universal_wrapper_profile::kPatchOffset;
     if (memcmp(address, kWrapperReplacement.data(),
             kWrapperReplacement.size()) == 0)
@@ -5640,6 +7106,176 @@ uint64_t ModuleGeneration(HMODULE module) noexcept
             return candidate.module == module;
         });
     return record == gModuleRecords.end() ? 0 : record->generation;
+}
+
+ampere_gpu::PreparationBoundary ResolveAmperePreparationBoundary(HMODULE provider, uint64_t generation) noexcept
+{
+    if (!provider || !generation || !UseAmpere()
+        || !gDllNotificationRegistered.load(std::memory_order_acquire)
+        || !ampere_backend::BeforeFirstFeatureCreate()
+        || gFrameGenerationCreateAttemptEpoch.load(std::memory_order_acquire)) return {};
+    uint64_t loadToken = 0;
+    bool nativeOwnerCurrent = false;
+    const auto native = gAmpereNativeInitBoundary;
+    if (native.current && (!gAmpereNativeInitTicket
+        || ngx_initialization::PreparationTicket() != gAmpereNativeInitTicket)) return {};
+    {
+        std::lock_guard lock(gModuleMutex);
+        for (const auto& record : gModuleRecords)
+        {
+            if (record.module == provider && record.generation == generation && record.ngxExport)
+                loadToken = record.freshLoadToken;
+            if (native.current && record.module == native.owner && record.generation == native.generation
+                && (record.ngxExport || record.ngxRuntimeD3D12Export)
+                && gOutputPullMaskLoads.Matches(reinterpret_cast<uintptr_t>(record.module), record.freshLoadToken))
+                nativeOwnerCurrent = true;
+        }
+    }
+    const auto module = reinterpret_cast<uintptr_t>(provider);
+    if (!gOutputPullMaskLoads.Matches(module, loadToken)) return {};
+    bool proven = false;
+    if (nativeOwnerCurrent)
+    {
+        const auto current = entry_detour::ReadSnapshot(native.handle);
+        proven = current.current && current.owner == native.owner && current.generation == native.generation
+            && current.target == native.target && current.original == native.original
+            && (current.kind == entry_detour::Kind::eNgxD3D12Init
+                || current.kind == entry_detour::Kind::eNgxD3D12InitProject);
+    }
+    if (!proven)
+    {
+        OutputPullMaskInitEvidence init;
+        { std::lock_guard lock(gOutputPullMaskInitMutex); init = gOutputPullMaskSlInit; }
+        const auto current = entry_detour::ReadSnapshot(init.handle);
+        proven = init.owner && current.current && current.kind == entry_detour::Kind::eSlInit
+            && current.owner == init.owner && current.generation == init.generation;
+    }
+    // Positive initialization evidence is paired with an actual map event and
+    // the current inventory generation; counters alone never authorize a write.
+    if (!proven || !gOutputPullMaskLoads.Matches(module, loadToken)) return {};
+    return {generation, loadToken, true, true, &AmperePreparationStillCurrent};
+}
+
+bool AmperePreparationStillCurrent(HMODULE provider, const ampere_gpu::PreparationBoundary& before) noexcept
+{
+    if (!before.Proven()) return false;
+    const auto current = ResolveAmperePreparationBoundary(provider, before.providerGeneration);
+    return current.Proven() && current.providerGeneration == before.providerGeneration
+        && current.freshLoadToken == before.freshLoadToken;
+}
+
+void PrepareNgxInitialization(void* device, const entry_detour::Snapshot& entry,
+    const void*, bool firstInit) noexcept
+{
+    if (gpu_dispatch::IsAda() || gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return;
+    const auto ticket = ngx_initialization::PreparationTicket();
+    if (!firstInit || !ticket || !entry.current || !device
+        || ModuleGeneration(entry.owner) != entry.generation
+        || !gOutputPullMaskLoads.Current(reinterpret_cast<uintptr_t>(entry.owner))) return;
+    if (!ampere_backend::BeginNativePreparation()) return;
+    __try
+    {
+        // Reserve the nonblocking lifecycle scope before taking GPU selection
+        // or adapter locks. These observations never publish a provider program.
+        if (adapter_discovery::IsAmpereD3D12Device(device)
+            && gpu_backend::ObserveD3D12Device(device) && UseAmpere()
+            && ngx_initialization::PreparationTicket() == ticket)
+        {
+            gAmpereNativeInitBoundary = entry;
+            gAmpereNativeInitTicket = ticket;
+            gModuleInventoryDirty.store(true, std::memory_order_release);
+            InspectAlreadyLoadedModules();
+        }
+    }
+    __finally
+    {
+        gAmpereNativeInitBoundary = {};
+        gAmpereNativeInitTicket = 0;
+        ampere_backend::EndNativePreparation();
+    }
+}
+
+void ObserveOutputPullMaskSlInitResult(
+    const entry_detour::Snapshot& before, bool succeeded) noexcept
+{
+    const auto current = entry_detour::ReadSnapshot(before.handle);
+    const bool valid = succeeded && before.current && before.owner
+        && before.kind == entry_detour::Kind::eSlInit && current.current
+        && current.handle == before.handle && current.owner == before.owner
+        && current.generation == before.generation && current.original == before.original;
+    std::lock_guard lock(gOutputPullMaskInitMutex);
+    gOutputPullMaskSlInit = valid
+        ? OutputPullMaskInitEvidence{before.handle, before.owner, before.generation}
+        : OutputPullMaskInitEvidence{};
+}
+
+void ObserveOutputPullMaskVulkanInit(entry_detour::Handle handle) noexcept
+{
+    const auto entry = entry_detour::ReadSnapshot(handle);
+    const bool valid = entry.current && entry.owner && entry.generation
+        && entry.kind == entry_detour::Kind::eNgxVulkanAdapterInit
+        && ModuleGeneration(entry.owner) == entry.generation;
+    std::lock_guard lock(gOutputPullMaskInitMutex);
+    gOutputPullMaskVulkanInit = valid
+        ? OutputPullMaskInitEvidence{handle, entry.owner, entry.generation}
+        : OutputPullMaskInitEvidence{};
+}
+
+bool OutputPullMaskEarlyInitProven(HMODULE provider, NgxGraphicsApi api) noexcept
+{
+    if (!provider || !gpu_dispatch::IsAda()
+        || (api != NgxGraphicsApi::eD3D12 && api != NgxGraphicsApi::eVulkan)
+        || !gDllNotificationRegistered.load(std::memory_order_acquire))
+        return false;
+    uint64_t generation = 0;
+    uint64_t loadToken = 0;
+    {
+        std::lock_guard lock(gModuleMutex);
+        const auto record = std::find_if(gModuleRecords.begin(), gModuleRecords.end(),
+            [&](const ModuleRecord& candidate) { return candidate.module == provider; });
+        if (record == gModuleRecords.end() || !record->ngxExport)
+            return false;
+        generation = record->generation;
+        loadToken = record->freshLoadToken;
+    }
+    const uintptr_t module = reinterpret_cast<uintptr_t>(provider);
+    if (!generation || generation != gActiveNgxProviderGeneration.load(std::memory_order_acquire)
+        || !gOutputPullMaskLoads.Matches(module, loadToken))
+        return false;
+    OutputPullMaskInitEvidence slInit;
+    OutputPullMaskInitEvidence vulkanInit;
+    {
+        std::lock_guard lock(gOutputPullMaskInitMutex);
+        slInit = gOutputPullMaskSlInit;
+        vulkanInit = gOutputPullMaskVulkanInit;
+    }
+    const auto proofCurrent = [](const OutputPullMaskInitEvidence& proof,
+        entry_detour::Kind kind) noexcept {
+        const auto current = entry_detour::ReadSnapshot(proof.handle);
+        return proof.owner && current.current && current.kind == kind
+            && current.handle == proof.handle && current.owner == proof.owner
+            && current.generation == proof.generation;
+    };
+    // An observed call counter is insufficient: only successful slInit with
+    // the same retained entry grants evidence. Nested in-progress calls skip.
+    if (proofCurrent(slInit, entry_detour::Kind::eSlInit))
+        return gOutputPullMaskLoads.Matches(module, loadToken);
+    if (api != NgxGraphicsApi::eVulkan
+        || !proofCurrent(vulkanInit, entry_detour::Kind::eNgxVulkanAdapterInit))
+        return false;
+    if (vulkanInit.owner == provider)
+        return vulkanInit.generation == generation
+            && gOutputPullMaskLoads.Matches(module, loadToken);
+    // Shared runtime Init is useful only for the exact current runtime Create
+    // route. An unrelated runtime or provider cannot donate init evidence.
+    const auto create = entry_detour::ReadSnapshot(UnpackEntryHandle(
+        gActiveNgxCreateHandle.load(std::memory_order_acquire)));
+    return create.current && create.owner == vulkanInit.owner
+        && create.generation == vulkanInit.generation
+        && (create.kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature
+            || create.kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1)
+        && ModuleGeneration(vulkanInit.owner) == vulkanInit.generation
+        && gOutputPullMaskLoads.Matches(module, loadToken);
 }
 
 bool UsesNvidiaOtaCache(const std::wstring& path)
@@ -6114,14 +7750,20 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
                 existing->wrapperPatched = result.patched;
                 existing->wrapperCompiledMaximumGeneratedFrames =
                     result.profileMaximum;
-                if (existing->wrapperCandidate
-                    && existing->controlRouteSlot == UINT32_MAX)
+                if (existing->wrapperCandidate)
                 {
                     existing->controlRouteSlot = EnsureControlRoute(
                         existing->module, existing->path,
                         existing->generation, existing->wrapperPatched,
                         existing->wrapperCompiledMaximumGeneratedFrames);
                 }
+                RecomputeModuleStateLocked();
+            }
+            if (gpu_dispatch::IsAda() && existing->ngxExport && !existing->ngxPatched)
+            {
+                const auto result = PatchUniqueExecutablePattern(module, path, kNgxPatch);
+                existing->ngxCandidate = result.candidate;
+                existing->ngxPatched = result.patched;
                 RecomputeModuleStateLocked();
             }
             if (gLogReady.load(std::memory_order_acquire) && !existing->inventoryLogged)
@@ -6138,6 +7780,8 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             record.path = path;
             record.generation = gNextModuleGeneration.fetch_add(
                 1, std::memory_order_relaxed);
+            record.freshLoadToken = gOutputPullMaskLoads.Current(
+                reinterpret_cast<uintptr_t>(module));
             record.wrapperExport = ModuleExportsFunction(module, "slGetPluginFunction");
             record.ngxD3D12Export = ExportsNgxD3D12Route(module);
             record.ngxVulkanExport = ExportsNgxVulkanRoute(module);
@@ -6177,8 +7821,9 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             }
             if (record.ngxExport)
             {
-                const PatternPatchResult result =
-                    PatchUniqueExecutablePattern(module, path, kNgxPatch);
+                const PatternPatchResult result = gpu_dispatch::IsAda()
+                    ? PatchUniqueExecutablePattern(module, path, kNgxPatch)
+                    : PatternPatchResult{true, false, nullptr};
                 record.ngxCandidate = result.candidate;
                 record.ngxPatched = result.patched;
             }
@@ -6194,6 +7839,11 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
     // is safe to pin and detour during passive discovery. The generic
     // slGetPluginFunction export is shared by inactive feature modules and is
     // not proof that their returned DLSS-G entry belongs to the active route.
+    ngx_initialization::ObserveModule(snapshot.module, snapshot.generation, &PrepareNgxInitialization);
+    ampere_backend::SetPreparationBoundaryResolver(&ResolveAmperePreparationBoundary);
+    ampere_backend::ObserveModule(snapshot.module, snapshot.path.c_str(), snapshot.generation,
+        snapshot.wrapperCandidate, snapshot.ngxExport, snapshot.ngxRuntimeExport);
+
     if (snapshot.wrapperExport)
     {
         // NVIDIA OTA plugins keep their Streamline identity but use opaque
@@ -6219,9 +7869,40 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxVulkanAdapterEntryDetours(
             snapshot.module, snapshot.path, snapshot.generation);
+        if (gpu_dispatch::IsAda()) dlssg_preset::ObserveProvider(snapshot.module, snapshot.generation);
+        if (logInventory)
+        {
+            const auto preset = dlssg_preset::ReadSnapshot(snapshot.module);
+            Log(L"DLSS-G cached preset reader: installed=%d failure=%u "
+                L"targetRva=0x%X path=%s", preset.cachedReaderInstalled,
+                preset.cachedReaderFailure, preset.cachedReaderRva, snapshot.path.c_str());
+        }
     }
     if (snapshot.ngxRuntimeExport)
     {
+        // Embedded NGX hosts load providers themselves. Cover their loader
+        // return and resolver boundary before they cache provider functions.
+        InstallStreamlineLoaderDiscovery(snapshot.module, snapshot.path);
+        InstallSlCommonResolverDiscovery(snapshot.module, snapshot.path);
+        if (ngx_runtime_policy::IsRemixRuntime(snapshot.module))
+        {
+            HMODULE pinned = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    reinterpret_cast<LPCWSTR>(snapshot.module), &pinned)
+                && pinned == snapshot.module)
+            {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(pinned);
+                uintptr_t previous = 0;
+                if (gRemixRuntimeBase.compare_exchange_strong(previous, base,
+                        std::memory_order_acq_rel))
+                    Log(L"RTX Remix embedded Vulkan NGX runtime detected; "
+                        L"FG controls and resource capacity remain game-managed: %s",
+                        snapshot.path.c_str());
+                else if (previous != base)
+                    gRemixRuntimeBase.store(UINTPTR_MAX, std::memory_order_release);
+            }
+        }
         TryInstallNgxRuntimeCreateEntryDetour(
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxRuntimeEvaluateEntryDetour(
@@ -6256,27 +7937,44 @@ void FlushModuleInventoryToLog()
         LogModuleInventory(record);
 }
 
-void RemoveLoadedModule(HMODULE module)
+void RemoveLoadedModule(const ModuleRecord& expected)
 {
-    if (!module)
+    const HMODULE module = expected.module;
+    if (!module || !expected.generation)
+        return;
+    // Toolhelp is a point-in-time inventory. Inspection can load and register
+    // more modules, so absence from that inventory is not unload evidence.
+    // Take the loader reference outside gModuleMutex to avoid lock inversion.
+    ScopedModuleReference retained(module);
+    if (retained && _wcsicmp(LoadedModulePath(module).c_str(),
+            expected.path.c_str()) == 0)
         return;
     {
         std::lock_guard lock(gModuleMutex);
-        gModuleRecords.erase(std::remove_if(gModuleRecords.begin(), gModuleRecords.end(),
-            [&](const ModuleRecord& record) { return record.module == module; }),
-            gModuleRecords.end());
+        const auto found = std::find_if(gModuleRecords.begin(), gModuleRecords.end(),
+            [&](const ModuleRecord& record) {
+                return record.module == module
+                    && record.generation == expected.generation
+                    && _wcsicmp(record.path.c_str(), expected.path.c_str()) == 0;
+            });
+        if (found == gModuleRecords.end())
+            return;
+        gModuleRecords.erase(found);
         RecomputeModuleStateLocked();
+        // A newer observation at the same address owns its own route state.
+        if (std::any_of(gModuleRecords.begin(), gModuleRecords.end(),
+                [&](const ModuleRecord& record) { return record.module == module; }))
+            return;
     }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+    // A route may be selected after inventory retirement releases gModuleMutex.
+    // Retire its slot and metadata as one transaction only for this generation.
+    std::lock_guard publicationLock(gActiveControlRouteMutex);
     if (ControlRouteRecord* route = ActiveControlRoute();
-        route && route->wrapper == module)
+        route && route->wrapper == module && route->generation == expected.generation)
     {
         gActiveControlRouteSlot.store(UINT32_MAX,
             std::memory_order_release);
         SetUniversalRouteFailure(UniversalRouteFailure::eNoActiveRoute);
-    }
-    if (gActiveWrapperBase.load(std::memory_order_acquire) == base)
-    {
         gActiveWrapperPatched.store(false, std::memory_order_release);
         gActiveWrapperObserved.store(false, std::memory_order_release);
         gActiveWrapperBase.store(0, std::memory_order_release);
@@ -6290,6 +7988,12 @@ void RemoveLoadedModule(HMODULE module)
 
 void InspectAlreadyLoadedModules()
 {
+    // Only consider observations which predate the snapshot for retirement.
+    std::vector<ModuleRecord> previousRecords;
+    {
+        std::lock_guard lock(gModuleMutex);
+        previousRecords = gModuleRecords;
+    }
     HANDLE snapshot = CreateToolhelp32Snapshot(
         TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     if (snapshot == INVALID_HANDLE_VALUE)
@@ -6313,18 +8017,12 @@ void InspectAlreadyLoadedModules()
     }
     CloseHandle(snapshot);
 
-    std::vector<HMODULE> removedModules;
+    for (const ModuleRecord& record : previousRecords)
     {
-        std::lock_guard lock(gModuleMutex);
-        for (const ModuleRecord& record : gModuleRecords)
-        {
-            if (std::find(loadedModules.begin(), loadedModules.end(),
-                    record.module) == loadedModules.end())
-                removedModules.push_back(record.module);
-        }
+        if (std::find(loadedModules.begin(), loadedModules.end(),
+                record.module) == loadedModules.end())
+            RemoveLoadedModule(record);
     }
-    for (HMODULE module : removedModules)
-        RemoveLoadedModule(module);
 }
 
 struct MfgLdrDllLoadedNotificationData
@@ -6353,7 +8051,17 @@ void CALLBACK OnDllNotification(
     static constexpr ULONG kDllLoaded = 1;
     static constexpr ULONG kDllUnloaded = 2;
     if (data && (reason == kDllLoaded || reason == kDllUnloaded))
+    {
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY || MFG_UNLOCK_RUNTIME_GPU_SELECTION || MFG_UNLOCK_AMPERE_MFG
+        const uintptr_t module = reinterpret_cast<uintptr_t>(
+            reason == kDllLoaded ? data->loaded.dllBase : data->unloaded.dllBase);
+        if (reason == kDllLoaded)
+            gOutputPullMaskLoads.Loaded(module);
+        else
+            gOutputPullMaskLoads.Unloaded(module);
+#endif
         gModuleInventoryDirty.store(true, std::memory_order_release);
+    }
 }
 
 bool RegisterDllNotification()
@@ -6373,6 +8081,7 @@ bool RegisterDllNotification()
 
 DWORD WINAPI PatchWorker(void* context)
 {
+    EnsureAmpereFeatureLifetimeObserver();
     const DWORD pid = GetCurrentProcessId();
     wchar_t tempDirectory[MAX_PATH]{};
     DWORD tempLength = GetTempPathW(_countof(tempDirectory), tempDirectory);
@@ -6380,7 +8089,7 @@ DWORD WINAPI PatchWorker(void* context)
     if (tempLength > 0 && tempLength < _countof(tempDirectory))
     {
         wchar_t logName[64]{};
-        swprintf_s(logName, L"MfgUnlock-%lu.log", static_cast<unsigned long>(pid));
+        swprintf_s(logName, MFG_LOG_PREFIX_W L"-%lu.log", static_cast<unsigned long>(pid));
         logPath = JoinPath(tempDirectory, logName);
         gLog = _wfsopen(logPath.c_str(), L"w, ccs=UTF-8", _SH_DENYWR);
     }
@@ -6411,6 +8120,9 @@ DWORD WINAPI PatchWorker(void* context)
     gStatusPath = ResolveStatusPath(gConfigPath, executableDirectory);
     DeleteFileW(gStatusPath.c_str());
     temporal_interval_trace::Initialize(tempDirectory, pid);
+#if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
+    output_pull_telemetry::Initialize(tempDirectory, pid);
+#endif
     const ControlConfig initialControl = ReadInitialControl();
     StoreControl(initialControl);
     FILETIME configWriteTime{};
@@ -6432,6 +8144,29 @@ DWORD WINAPI PatchWorker(void* context)
     }
 
     Log(L"Patch worker started for PID %lu", static_cast<unsigned long>(pid));
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    Log(L"RTXMFG build=1.3.2 outputPullMask=%d occupancyHint=%d "
+        L"uiInputs=framed-observations uiRecomposition=game-managed",
+        MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,
+        MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY);
+#endif
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
+    // Publication can precede worker/log startup. Preserve the one-time result
+    // here as well as at Create so early failures remain locally diagnosable.
+    const auto maskStartup = midpoint_fix::ReadOutputPullMaskSnapshot();
+    Log(L"OUTPUT_PULL_MASK startup attempted=%d ready=%d published=%d "
+        L"failure=%u publicationAttempted=%d replacementWasVisible=%d "
+        L"unsafePublication=%d requiresRestart=%d firstCreate=%d "
+        L"mayPredate=%d earlyInit=%d sourceSha256=%hs "
+        L"selectedSha256=%hs",
+        maskStartup.attempted, maskStartup.ready, maskStartup.published,
+        static_cast<unsigned>(maskStartup.failure),
+        maskStartup.publicationAttempted, maskStartup.replacementWasVisible,
+        maskStartup.unsafePublication, maskStartup.requiresRestart,
+        maskStartup.firstPipelineCreate, maskStartup.pipelineMayPredateDetour,
+        maskStartup.earlyInitObserved,
+        maskStartup.sourceSha256, maskStartup.selectedSha256);
+#endif
     Log(L"NVIDIA compatibility profile: resolved=%d status=%d profile=%hs "
         L"tier=%hs manifestEntries=%u fetched=%hs sha256=%hs",
         gNvidiaCompatibilityResolved.load(std::memory_order_acquire),
@@ -6496,6 +8231,10 @@ DWORD WINAPI PatchWorker(void* context)
     PublishPatchRoute();
     PublishLiveBridge(initialControl);
     ControlConfig activeControl = initialControl;
+    reflex_control::SetRuntimeValidator(&ReflexRuntimeCurrent);
+    vsync_control::SetRuntimeValidator(&VsyncRuntimeCurrent);
+    DiscoverReflexModule();
+    UpdatePresentationPolicy(activeControl);
     if (!WriteBridgeStatus(activeControl, pid))
         Log(L"Could not publish CET bridge status file: %s", gStatusPath.c_str());
 
@@ -6514,6 +8253,7 @@ DWORD WINAPI PatchWorker(void* context)
         {
             inventoryTicks = 0;
             InspectAlreadyLoadedModules();
+            DiscoverReflexModule();
         }
         FILETIME latestWriteTime{};
         if (ReadLastWriteTime(gConfigPath, latestWriteTime)
@@ -6532,7 +8272,8 @@ DWORD WINAPI PatchWorker(void* context)
                 if (mfgChanged)
                     StoreControl(activeControl);
                 else
-                    temporal_interval_trace::SetEnabled(true);
+                    temporal_interval_trace::SetEnabled(gpu_dispatch::IsAda() || UseAmpere()
+                        || activeControl.intervalLogging);
                 PublishLiveBridge(activeControl);
                 WriteBridgeStatus(activeControl, pid);
                 Log(L"Live control requested: mode=%s multiplier=%ux dynamicTarget=%u FPS "
@@ -6548,7 +8289,11 @@ DWORD WINAPI PatchWorker(void* context)
             }
         }
 
+        UpdatePresentationPolicy(activeControl);
         temporal_interval_trace::Flush();
+#if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
+        output_pull_telemetry::Flush();
+#endif
 
         const bool ready = BridgeReady();
         const std::string route = PatchRouteName();
@@ -6575,16 +8320,17 @@ DWORD WINAPI PatchWorker(void* context)
 }
 }
 
-extern "C" __declspec(dllexport) BOOL WINAPI
-MfgUnlockSampleFrameTelemetry()
+BOOL SampleFrameTelemetry(uint64_t owner, uint32_t presentCount,
+    bool outputAvailable, bool cumulative)
 {
     gFpsOutputPresentTick.store(GetTickCount64(), std::memory_order_release);
     std::lock_guard telemetryLock(gFpsTelemetryMutex);
-    if (!gGameFrameGenerationOn.load(std::memory_order_acquire))
+    if (!gAppliedFrameGenerationOn.load(std::memory_order_acquire))
     {
         if (gFpsTelemetryActive)
             ResetFpsTelemetry();
         gFpsTelemetryActive = false;
+        gFpsPresentCounter = {};
         return FALSE;
     }
 
@@ -6595,17 +8341,43 @@ MfgUnlockSampleFrameTelemetry()
         if (gFpsTelemetryActive)
             ResetFpsTelemetry();
         gFpsTelemetryActive = false;
+        gFpsPresentCounter = {};
         return FALSE;
     }
 
     if (!gFpsTelemetryActive)
     {
         ResetFpsTelemetry();
+        gFpsPresentCounter = {};
         gFpsTelemetryActive = true;
     }
 
-    UpdateFpsTelemetryForOutputPresent();
+    if (cumulative)
+    {
+        const auto delta = gFpsPresentCounter.Sample(owner, presentCount,
+            GetTickCount64(), outputAvailable);
+        if (delta.resetWindow) ResetFpsTelemetry();
+        UpdateFpsTelemetryForOutputPresent(delta.frames, delta.available, 2u);
+    }
+    else
+        UpdateFpsTelemetryForOutputPresent(1u, outputAvailable, 1u);
     return TRUE;
+}
+
+void frame_telemetry::SamplePresentCounter(
+    uint64_t owner, uint32_t count, bool available)
+{
+    SampleFrameTelemetry(owner, count, available, true);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockSampleFrameTelemetry()
+{
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    // A Vulkan/application callback alone does not count generated presents.
+    return SampleFrameTelemetry(0, 0, false, true);
+#else
+    return SampleFrameTelemetry(0, 0, true, false);
+#endif
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockCoreLoaded()
@@ -6613,7 +8385,11 @@ extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockCoreLoaded()
     return TRUE;
 }
 
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+extern "C" BOOL WINAPI MfgUnlockCoreEntry(HINSTANCE instance, DWORD reason, LPVOID)
+#else
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+#endif
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
@@ -6626,7 +8402,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         // loader states can still reject this optimization; DllMain's frame is
         // deliberately kept small so an unexpected notification remains safe.
         DisableThreadLibraryCalls(instance);
-        midpoint_fix::SetLogCallback(&MidpointLog);
+        gpu_backend::SetLogCallback(&MidpointLog);
         gExecutablePathBuffer.fill(L'\0');
         GetModuleFileNameW(nullptr, gExecutablePathBuffer.data(),
             static_cast<DWORD>(gExecutablePathBuffer.size()));
@@ -6637,6 +8413,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         // Resolve the startup-only wrapper policy now so HookSlInit can read
         // the same control file before Streamline selects its plugins.
         gConfigPath = ResolveConfigPath(instance, gExecutableDirectory);
+        dlssg_preset::SetInitialSelectionLoader(&ReadInitialDlssgPreset);
         if (HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll"))
         {
             const std::wstring path = LoadedModulePath(interposer);

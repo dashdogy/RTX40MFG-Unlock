@@ -28,6 +28,20 @@ enum class Kind : uint32_t
     eNgxRuntimeVulkanCreateFeature1 = 14,
     eNgxRuntimeVulkanEvaluateFeature = 15,
     eNgxVulkanAdapterInit = 16,
+    eDlssgPresetBootstrap = 17,
+    eDlssgPresetRead = 18,
+    eDlssgCachedPresetRead = 19,
+    eAmpereRelease = 20,
+    eAmpereRequirements = 21,
+    eAmpereParameters = 22,
+    eAmperePreset = 23,
+    eAmpereD3DDevice = 24,
+    eReflexSetOptions = 25,
+    eReflexSetData = 26,
+    eReflexSleep = 27,
+    eReflexGetState = 28,
+    eNgxD3D12Init = 29,
+    eNgxD3D12InitProject = 30,
     eCount,
 };
 
@@ -137,9 +151,13 @@ using ForwardPreCall = void (WINAPI*)(void* arg1, uintptr_t arg2,
     Handle handle,
     const void* originalCaller) noexcept;
 
+using ForwardGate = bool (WINAPI*)(void*, uintptr_t, const void*, void*,
+    uintptr_t, uintptr_t, Handle, const void*) noexcept;
+
 bool InstallForwarding(Kind kind, HMODULE owner, void* target,
     ForwardPreCall preCall, void*& originalTrampoline,
-    const InstallOptions& options, Handle* installedHandle = nullptr) noexcept;
+    const InstallOptions& options, Handle* installedHandle = nullptr,
+    ForwardGate gate = nullptr, void* rejectedTarget = nullptr) noexcept;
 
 Snapshot ReadSnapshot(Handle handle) noexcept;
 

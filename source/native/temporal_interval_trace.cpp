@@ -1,3 +1,5 @@
+#include "build_variant.h"
+#include "gpu_dispatch.h"
 #include "temporal_interval_trace.h"
 
 #include <nvsdk_ngx.h>
@@ -88,12 +90,26 @@ void ReadParameters(const NVSDK_NGX_Parameter* parameters,
             parameters->Get("DLSSG.MultiFrameIndex", &event.index));
         event.maximumResult = static_cast<uint32_t>(
             parameters->Get("DLSSG.MultiFrameCountMax", &event.maximum));
-        event.frameIdResult = static_cast<uint32_t>(
-            parameters->Get("DLSSG.BackbufferFrameID", &event.frameId));
-        ID3D12Resource* output = nullptr;
-        event.outputResult = static_cast<uint32_t>(
-            parameters->Get("DLSSG.OutputInterpolated", &output));
-        event.output = reinterpret_cast<uintptr_t>(output);
+        if (gpu_dispatch::IsAmpere())
+        {
+            void* frame = nullptr;
+            void* output = nullptr;
+            event.frameIdResult = static_cast<uint32_t>(
+                parameters->Get("DLSSG.BackbufferFrameID", &frame));
+            event.frameId = reinterpret_cast<uintptr_t>(frame);
+            event.outputResult = static_cast<uint32_t>(
+                parameters->Get("DLSSG.OutputInterpolated", &output));
+            event.output = reinterpret_cast<uintptr_t>(output);
+        }
+        else
+        {
+            event.frameIdResult = static_cast<uint32_t>(
+                parameters->Get("DLSSG.BackbufferFrameID", &event.frameId));
+            ID3D12Resource* output = nullptr;
+            event.outputResult = static_cast<uint32_t>(
+                parameters->Get("DLSSG.OutputInterpolated", &output));
+            event.output = reinterpret_cast<uintptr_t>(output);
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -240,7 +256,7 @@ void Initialize(const wchar_t* tempDirectory, DWORD pid) noexcept
         InterlockedPushEntrySList(&gFreeEvents, &node.link);
     QueryPerformanceFrequency(&gQpcFrequency);
 
-    swprintf_s(gFileName, L"MfgUnlock-intervals-%lu.csv",
+    swprintf_s(gFileName, MFG_LOG_PREFIX_W L"-intervals-%lu.csv",
         static_cast<unsigned long>(pid));
     if (tempDirectory && *tempDirectory)
     {

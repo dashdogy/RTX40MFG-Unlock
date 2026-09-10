@@ -1,4 +1,5 @@
 #pragma once
+#include "build_variant.h"
 
 #include <Windows.h>
 
@@ -15,6 +16,7 @@ struct MfgUnlockReShadeSnapshot
     BOOL workerIdentityCertified = FALSE;
     BOOL bridgeReady = FALSE;
     BOOL gameFrameGenerationOn = FALSE;
+    BOOL appliedFrameGenerationOn = FALSE;
     BOOL streamlineRebuildRequired = FALSE;
     BOOL dynamicMode = FALSE;
     BOOL appliedDynamicMode = FALSE;
@@ -149,6 +151,72 @@ struct MfgUnlockReShadeSnapshot
     BOOL releaseEntryCurrent = FALSE;
     BOOL frameGenerationOffAccepted = FALSE;
     BOOL releaseObserved = FALSE;
+    uint32_t dlssgPresetRequested = 2;
+    BOOL dlssgPresetOverrideInstalled = FALSE;
+    uint32_t dlssgPresetOverrideFailure = 0;
+    uint64_t dlssgPresetReadCount = 0;
+    BOOL ampereProgramReadyMfg = FALSE;
+    uint32_t ampereKernelImage = 0;
+    uint32_t ampereNativeCacheStatus = 0;
+    uint32_t ampereCertifiedMaximum = 0;
+    uint32_t ampereFailure = 0;
+    uint64_t presetQueries = 0;
+
+    uint32_t ampereFirstFailure = 0;
+    uint32_t ampereFirstNgxResult = 0;
+    uint32_t amperePrimaryFailure = 0;
+    uint32_t amperePrimaryNgxResult = 0;
+    uint32_t ampereLastFailure = 0;
+    uint32_t ampereLastNgxResult = 0;
+    uint64_t ampereCreateAttempts = 0;
+    uint64_t ampereCreateBlockedBeforeProvider = 0;
+    uint64_t ampereEvaluateAttempts = 0;
+    uint32_t amperePreparationStage = 0;
+    uint32_t ampereStartupFailureMask = 0;
+    uint32_t ampereCandidateVersionMajor = 0;
+    uint32_t ampereCandidateVersionMinor = 0;
+    uint32_t ampereCandidateVersionBuild = 0;
+    uint64_t ampereCreatedFeatures = 0;
+    uint64_t ampereEvaluations = 0;
+    uint32_t gpuFamily = 0;
+    uint64_t gpuAdapterLuid = 0;
+    uint32_t gpuSelectionFailure = 0;
+
+    uint32_t dlssgPresetLatched = 2;
+    BOOL dlssgPresetSelectionFrozen = FALSE;
+    BOOL dlssgPresetRestartRequired = FALSE;
+    uint32_t dlssgPresetObserved = 0;
+    BOOL dlssgPresetObservedValid = FALSE;
+    uint64_t dlssgPresetOverrideReadCount = 0;
+    float appliedDynamicTargetFrameRate = 0.0f;
+    BOOL appliedDynamicTargetValid = FALSE;
+    BOOL fgVsyncSupportKnown = FALSE;
+    BOOL fgVsyncSupported = FALSE;
+
+    uint32_t vsyncMode = 0; // 0 game, 1 off, 2 on; application request only.
+    uint32_t reflexFrameLimitFps = 0; // 0 preserves the game's limiter.
+    BOOL dynamicVsyncAvailable = FALSE;
+    BOOL vsyncControlAvailable = FALSE;
+    BOOL vsyncOverrideApplied = FALSE;
+    BOOL vsyncPresentationObserved = FALSE;
+    uint32_t vsyncOriginalInterval = 0;
+    uint32_t vsyncSubmittedInterval = 0;
+    uint32_t vsyncFailure = 0;
+    BOOL reflexControlAvailable = FALSE;
+    BOOL reflexAppliedKnown = FALSE;
+    uint32_t reflexAppliedFrameLimitUs = 0;
+    BOOL reflexLimitPending = FALSE;
+    BOOL reflexRestorePending = FALSE;
+    uint32_t reflexStatus = 0;
+    int32_t reflexLastResult = 0;
+    uint32_t reflexHookMask = 0;
+    uint32_t reflexModuleVersionMajor = 0;
+    uint32_t reflexModuleVersionMinor = 0;
+    uint32_t reflexModuleVersionPatch = 0;
+    uint64_t reflexModuleGeneration = 0;
+
+    BOOL ampereLegacySinglePreset = FALSE;
+
 };
 
 #if defined(MFG_UNLOCK_RESHADE_ADDON) || defined(MFG_UNLOCK_BACKEND_BRIDGE)

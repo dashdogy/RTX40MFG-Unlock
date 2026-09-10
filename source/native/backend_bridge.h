@@ -1,4 +1,5 @@
 #pragma once
+#include "build_variant.h"
 
 #include "reshade_bridge.h"
 
@@ -13,7 +14,7 @@ struct IUnknown;
 
 // V3 is an exact fail-closed contract. Change the version whenever this table
 // or the snapshot contract changes; clients must reject unknown versions.
-constexpr uint32_t MFG_UNLOCK_BACKEND_ABI_V3 = 0x00030000u;
+constexpr uint32_t MFG_UNLOCK_BACKEND_ABI_V3 = MFG_BACKEND_ABI;
 
 using MfgUnlockGetSnapshotFn = BOOL (WINAPI*)(MfgUnlockReShadeSnapshot*);
 using MfgUnlockApplyControlFn = BOOL (WINAPI*)(uint32_t, BOOL, uint32_t,

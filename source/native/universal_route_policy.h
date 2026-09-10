@@ -67,6 +67,7 @@ enum class Failure : uint32_t
     eAdapterNotVerified = 12,
     eMidpointNotReady = 13,
     eWrapperChangedAfterCreate = 14,
+    eAwaitingOptionsRequest = 15,
 };
 
 struct Identity
@@ -279,6 +280,7 @@ struct Readiness
     bool evaluateCovered = false;
     bool adapterVerified = false;
     bool midpointReadyAtCreate = false;
+    bool awaitingOptionsRequest = false;
 };
 
 constexpr Failure EvaluateReadiness(const Readiness& state) noexcept
@@ -293,6 +295,8 @@ constexpr Failure EvaluateReadiness(const Readiness& state) noexcept
         return Failure::eSetterNotCovered;
     if (!state.stateEntryCovered)
         return Failure::eStateNotCovered;
+    if (state.awaitingOptionsRequest)
+        return Failure::eAwaitingOptionsRequest;
     if (!state.providerSelected)
         return Failure::eProviderNotSelected;
     if (state.providerChanged)
@@ -327,6 +331,7 @@ constexpr const char* FailureName(Failure failure) noexcept
     case Failure::eAdapterNotVerified: return "adapter not verified";
     case Failure::eMidpointNotReady: return "midpoint not ready at first Create";
     case Failure::eWrapperChangedAfterCreate: return "wrapper changed before release";
+    case Failure::eAwaitingOptionsRequest: return "awaiting first game FG options request";
     default: return "unknown";
     }
 }

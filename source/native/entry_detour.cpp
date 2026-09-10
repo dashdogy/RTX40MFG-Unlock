@@ -61,6 +61,8 @@ struct Slot
     std::atomic<void*> forwardRelay{nullptr};
     std::atomic<HMODULE> retainedOwner{nullptr};
     std::atomic<ForwardPreCall> preCall{nullptr};
+    std::atomic<ForwardGate> forwardGate{nullptr};
+    std::atomic<void*> rejectedForwardTarget{nullptr};
     std::atomic<bool> filterForwardArg2{false};
     std::atomic<uintptr_t> requiredForwardArg2{0};
     std::array<uint8_t, kVerificationBytes> relocatedBytes{};
@@ -486,7 +488,22 @@ bool Current(const Slot& slot) noexcept
     return false;
 }
 
-bool PinOwner(Slot& slot) noexcept
+// Declare this before the install lock so its destructor runs after unlocking.
+// FreeLibrary can run a final DLL detach under the loader lock; releasing an
+// unsuccessful attempt's reference while holding gInstallMutex would invert
+// the order used by synchronous entry installation from a DLL callback.
+struct DeferredOwnerRelease
+{
+    HMODULE owner = nullptr;
+
+    ~DeferredOwnerRelease() noexcept
+    {
+        if (owner)
+            FreeLibrary(owner);
+    }
+};
+
+bool PinOwner(Slot& slot, DeferredOwnerRelease& release) noexcept
 {
     if (slot.retainedOwner.load(std::memory_order_acquire))
         return true;
@@ -497,20 +514,18 @@ bool PinOwner(Slot& slot) noexcept
             reinterpret_cast<LPCWSTR>(target), &retained)
         || retained != owner)
     {
-        if (retained)
-            FreeLibrary(retained);
+        release.owner = retained;
         return false;
     }
     slot.retainedOwner.store(retained, std::memory_order_release);
     return true;
 }
 
-void ReleaseOwnerAfterFailure(Slot& slot) noexcept
+void ReleaseOwnerAfterFailure(Slot& slot,
+    DeferredOwnerRelease& release) noexcept
 {
-    HMODULE retained = slot.retainedOwner.exchange(
+    release.owner = slot.retainedOwner.exchange(
         nullptr, std::memory_order_acq_rel);
-    if (retained)
-        FreeLibrary(retained);
 }
 
 bool TryInstallHotpatchLocked(Slot& slot) noexcept
@@ -695,7 +710,7 @@ bool TryInstallRelocatedLocked(Slot& slot) noexcept
     return true;
 }
 
-bool ValidateTarget(Slot& slot) noexcept
+bool ValidateTarget(Slot& slot, DeferredOwnerRelease& release) noexcept
 {
     HMODULE owner = slot.owner.load(std::memory_order_acquire);
     void* target = slot.target.load(std::memory_order_acquire);
@@ -715,7 +730,7 @@ bool ValidateTarget(Slot& slot) noexcept
         SetFailure(slot, Failure::eUnsupportedMitigation);
         return false;
     }
-    if (!PinOwner(slot))
+    if (!PinOwner(slot, release))
     {
         SetFailure(slot, Failure::eTargetPinFailed);
         return false;
@@ -724,7 +739,7 @@ bool ValidateTarget(Slot& slot) noexcept
 }
 
 bool InstallPreparedLocked(Slot& slot, const InstallOptions& options,
-    void*& originalTrampoline) noexcept
+    void*& originalTrampoline, DeferredOwnerRelease& release) noexcept
 {
     originalTrampoline = nullptr;
     if (slot.installed.load(std::memory_order_acquire))
@@ -752,7 +767,7 @@ bool InstallPreparedLocked(Slot& slot, const InstallOptions& options,
         SetFailure(slot, Failure::eHookConflict);
         return false;
     }
-    if (!ValidateTarget(slot))
+    if (!ValidateTarget(slot, release))
         return false;
 
     const bool hotpatchInstalled = TryInstallHotpatchLocked(slot);
@@ -797,7 +812,7 @@ bool InstallPreparedLocked(Slot& slot, const InstallOptions& options,
         originalTrampoline = slot.original.load(std::memory_order_acquire);
         return false;
     }
-    ReleaseOwnerAfterFailure(slot);
+    ReleaseOwnerAfterFailure(slot, release);
     return false;
 }
 
@@ -842,6 +857,7 @@ bool Install(Kind kind, HMODULE owner, void* target, void* hook,
     if (!IsKindValid(kind) || !owner || !target || !hook)
         return false;
 
+    DeferredOwnerRelease release;
     std::lock_guard lock(gInstallMutex);
     size_t index = 0;
     Slot* slot = ReserveLocked(kind, owner, target, options.generation, index);
@@ -857,7 +873,7 @@ bool Install(Kind kind, HMODULE owner, void* target, void* hook,
         return false;
     }
     slot->hook.store(hook, std::memory_order_release);
-    return InstallPreparedLocked(*slot, options, originalTrampoline);
+    return InstallPreparedLocked(*slot, options, originalTrampoline, release);
 }
 
 bool Install(Kind kind, HMODULE owner, void* target, void* hook,
@@ -869,14 +885,18 @@ bool Install(Kind kind, HMODULE owner, void* target, void* hook,
 
 bool InstallForwarding(Kind kind, HMODULE owner, void* target,
     ForwardPreCall preCall, void*& originalTrampoline,
-    const InstallOptions& options, Handle* installedHandle) noexcept
+    const InstallOptions& options, Handle* installedHandle,
+    ForwardGate gate, void* rejectedTarget) noexcept
 {
     originalTrampoline = nullptr;
     if (installedHandle)
         *installedHandle = {};
-    if (!IsKindValid(kind) || !owner || !target || !preCall)
+    if (!IsKindValid(kind) || !owner || !target || (!preCall && !gate)
+        || (gate != nullptr) != (rejectedTarget != nullptr)
+        || (gate && options.filterForwardArg2))
         return false;
 
+    DeferredOwnerRelease release;
     std::lock_guard lock(gInstallMutex);
     size_t index = 0;
     Slot* slot = ReserveLocked(kind, owner, target, options.generation, index);
@@ -886,12 +906,19 @@ bool InstallForwarding(Kind kind, HMODULE owner, void* target,
         *installedHandle = HandleFor(index, *slot);
 
     ForwardPreCall existing = slot->preCall.load(std::memory_order_acquire);
+    if (slot->installed.load(std::memory_order_acquire)
+        && (slot->forwardGate.load(std::memory_order_acquire) != gate
+            || slot->rejectedForwardTarget.load(std::memory_order_acquire) != rejectedTarget))
+    {
+        SetFailure(*slot, Failure::eHookConflict);
+        return false;
+    }
     if (existing && existing != preCall)
     {
         SetFailure(*slot, Failure::eHookConflict);
         return false;
     }
-    if (existing
+    if ((existing || slot->installed.load(std::memory_order_acquire))
         && (slot->filterForwardArg2.load(std::memory_order_acquire)
                 != options.filterForwardArg2
             || slot->requiredForwardArg2.load(std::memory_order_acquire)
@@ -901,6 +928,8 @@ bool InstallForwarding(Kind kind, HMODULE owner, void* target,
         return false;
     }
     slot->preCall.store(preCall, std::memory_order_release);
+    slot->rejectedForwardTarget.store(rejectedTarget, std::memory_order_release);
+    slot->forwardGate.store(gate, std::memory_order_release);
     slot->requiredForwardArg2.store(options.requiredForwardArg2,
         std::memory_order_release);
     slot->filterForwardArg2.store(options.filterForwardArg2,
@@ -924,7 +953,7 @@ bool InstallForwarding(Kind kind, HMODULE owner, void* target,
     }
     slot->hook.store(relay, std::memory_order_release);
     const bool installed = InstallPreparedLocked(
-        *slot, options, originalTrampoline);
+        *slot, options, originalTrampoline, release);
     if (!installed && !slot->installed.load(std::memory_order_acquire))
     {
         void* stale = slot->forwardRelay.exchange(
@@ -1074,9 +1103,14 @@ extern "C" void* WINAPI MfgUnlockDispatchForwarding(
         && arg2 != slot->requiredForwardArg2.load(std::memory_order_acquire))
         return original;
     ForwardPreCall callback = slot->preCall.load(std::memory_order_acquire);
+    const size_t index = static_cast<size_t>(slot - gSlots.data());
+    if (ForwardGate gate = slot->forwardGate.load(std::memory_order_acquire))
+    {
+        if (!gate(arg1, arg2, arg3, arg4, arg5, arg6, HandleFor(index, *slot), originalCaller))
+            return slot->rejectedForwardTarget.load(std::memory_order_acquire);
+    }
     if (callback)
     {
-        const size_t index = static_cast<size_t>(slot - gSlots.data());
         callback(arg1, arg2, arg3, arg4, arg5, arg6,
             HandleFor(index, *slot), originalCaller);
     }

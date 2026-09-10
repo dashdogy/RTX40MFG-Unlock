@@ -1,4 +1,5 @@
 #pragma once
+#include "build_variant.h"
 
 #include <Windows.h>
 
@@ -21,6 +22,6 @@ struct MfgUnlockStatus
 inline std::wstring MfgUnlockObjectName(const wchar_t* kind, DWORD pid)
 {
     wchar_t buffer[96]{};
-    swprintf_s(buffer, L"Local\\MfgUnlock%s-%lu", kind, static_cast<unsigned long>(pid));
+    swprintf_s(buffer, L"Local\\" MFG_LOG_PREFIX_W L"%s-%lu", kind, static_cast<unsigned long>(pid));
     return buffer;
 }

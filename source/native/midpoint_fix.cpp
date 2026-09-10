@@ -1,5 +1,7 @@
 #include "midpoint_fix.h"
 #include "dlssg_provider_policy.h"
+#include "output_pull_experiment.h"
+#include "prev2curr_experiment.h"
 
 #include <bcrypt.h>
 #include <d3d12.h>
@@ -184,8 +186,8 @@ constexpr const TemporalProviderProfile* ProfileForVersion(
         return &kLegacySlot11TemporalProfile;
     if (version.major == 310 && version.minor == 6 && version.build == 0)
         return &kLegacySlot10TemporalProfile;
-    // 310.9.1 retains the exact named table and temporal payload contract.
-    // Structural discovery follows the relocated table; no RVA is reused.
+    // 310.9.1 keeps the exact named table and temporal payload contract.
+    // Structural discovery follows the relocated registration table.
     if (version.major == 310 && version.minor == 9
         && (version.build == 0 || version.build == 1))
         return &k3109TemporalProfile;
@@ -198,15 +200,13 @@ constexpr const TemporalProviderProfile* ProfileForVersion(
     return nullptr;
 }
 
-constexpr bool SupportedVersionsHaveProfiles() noexcept
-{
+static_assert([] {
     for (const auto version : dlssg_provider_policy::kSupportedVersions)
         if (!ProfileForVersion(version)) return false;
-    return ProfileForVersion({310, 9, 2}) == nullptr
-        && ProfileForVersion({311, 9, 1}) == nullptr;
-}
+    return ProfileForVersion({0, 0, 0}) == nullptr
+        && ProfileForVersion({310, 9, 2}) == nullptr;
+}(), "Every eligible DLSS-G version needs an explicit Ada temporal profile");
 
-static_assert(SupportedVersionsHaveProfiles());
 static_assert(kEarlyTemporalProfile.temporalSlot == 12);
 static_assert(kLegacySlot11TemporalProfile.temporalSlot == 11);
 static_assert(kLegacySlot10TemporalProfile.temporalSlot == 10);
@@ -241,6 +241,7 @@ struct PublishResult
 std::atomic<LogCallback> gLogCallback{nullptr};
 std::atomic<bool> gAdapterVerified{false};
 std::atomic<bool> gReady{false};
+std::atomic<bool> gOutputPullMaskUnsafe{false};
 std::atomic<uint32_t> gFailure{
     static_cast<uint32_t>(Failure::eAdapterUnavailable)};
 std::atomic<uint64_t> gAdapterLuid{0};
@@ -608,10 +609,16 @@ size_t FindUniqueBytes(const uint8_t* bytes, size_t count,
     return match;
 }
 
+#include "interm_scatter_experiment.inl"
+
 bool BuildTemporalFatbin(uint8_t* fatbin, uint8_t* scratch,
     const TemporalProviderProfile& profile, uint32_t& outputBytes,
     Failure& failure) noexcept
 {
+    if (const auto* scatter = SelectedIntermScatterProfile(profile))
+        return BuildIntermScatterFatbin(fatbin, kOutputCapacity, scratch,
+            kScratchCapacity, *scatter, outputBytes, failure);
+
     constexpr size_t kOuterHeaderBytes = 16;
     constexpr size_t kSm120EntryOffset = kOuterHeaderBytes;
     constexpr size_t kSm89HeaderBytes = 104;
@@ -1081,9 +1088,21 @@ bool ObserveVulkanPhysicalDevice(void* physicalDevice) noexcept
 
 bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
 {
+    if (gOutputPullMaskUnsafe.load(std::memory_order_acquire))
+    {
+        gReady.store(false, std::memory_order_release);
+        SetFailure(Failure::ePublication);
+        return false;
+    }
     if (!module || !gAdapterVerified.load(std::memory_order_acquire))
         return false;
     std::lock_guard lock(gMutex);
+    if (gOutputPullMaskUnsafe.load(std::memory_order_acquire))
+    {
+        gReady.store(false, std::memory_order_release);
+        SetFailure(Failure::ePublication);
+        return false;
+    }
     const uint64_t adapterLuid = gAdapterLuid.load(std::memory_order_acquire);
     if (!gAdapterVerified.load(std::memory_order_acquire) || !adapterLuid)
         return false;
@@ -1133,6 +1152,9 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
         ProfileForVersion(providerVersion);
     if (!profile)
         return fail(Failure::eProviderVersion);
+    const auto* scatterProfile = SelectedIntermScatterProfile(*profile);
+    const char* const outputSha256 = scatterProfile
+        ? scatterProfile->outputSha256 : profile->outputFatbinSha256;
     uint32_t imageSize = 0;
     if (!ImageSize(module, imageSize))
         return fail(Failure::eProviderLayout);
@@ -1151,6 +1173,10 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
         || originalDescriptor < base || originalDescriptor > end - kDescriptorBytes
         || !SafeCopy(descriptor.data(),
             reinterpret_cast<const void*>(originalDescriptor), descriptor.size()))
+        return fail(Failure::eProviderLayout);
+    if (scatterProfile && (ReadU32(descriptor.data() + 32) != 324
+        || ReadU32(descriptor.data() + 36) != 1
+        || ReadU32(descriptor.data() + 40) != 1))
         return fail(Failure::eProviderLayout);
     uintptr_t originalFatbin = 0;
     uint32_t suppliedSize = 0;
@@ -1195,7 +1221,7 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
         return fail(transformFailure);
     }
     if (!Sha256Equals(clonedFatbin, outputBytes,
-            profile->outputFatbinSha256))
+            outputSha256))
     {
         VirtualFree(allocation, 0, MEM_RELEASE);
         return fail(Failure::eOutputIdentity);
@@ -1248,10 +1274,28 @@ bool PatchProvider(HMODULE module, const wchar_t* suppliedPath) noexcept
     gAllocation = allocation;
     gReady.store(true, std::memory_order_release);
     SetFailure(Failure::eNone);
+#if MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT
+    if (scatterProfile)
+        Log(L"INTERM_SCATTER variant=candidate ready=1 published=1 slot=9 "
+            L"entryRva=0x%zX sourceSha256=%hs selectedSha256=%hs "
+            L"block=324,1,1 temporalOffset=32 provider=%s",
+            descriptorEntry - base, scatterProfile->sourceSha256,
+            outputSha256, path);
+    else
+        Log(L"INTERM_SCATTER variant=baseline ready=0 temporalReady=1 "
+            L"reason=profile-not-covered slot=%zu provider=%s",
+            profile->temporalSlot, path);
+#endif
     Log(L"D157 midpoint fix published at provider RVA 0x%zX: %s",
         static_cast<size_t>(descriptorEntry - base), path);
     return true;
 }
+
+#include "output_pull_experiment.inl"
+#include "prev2curr_experiment.inl"
+#include "output_pull_mask.inl"
+
+uint64_t AdapterLuid() noexcept { return gAdapterLuid.load(std::memory_order_acquire); }
 
 bool AdapterVerified() noexcept
 {
