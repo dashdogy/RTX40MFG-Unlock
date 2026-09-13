@@ -16,22 +16,12 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 
 ## Changes in v1.3.3
 
-- Clean installs default to **Follow game** and open the full menu on first
-  launch. Saved fixed/Dynamic choices are preserved when upgrading.
-- Rebuilds menu startup and DirectX 12 swapchain handling to avoid patching
-  shared Streamline methods.
-- Corrects active Frame Generation detection, pending multiplier reporting,
-  and NVIDIA per-game override limits.
-- Shows Dynamic as unavailable for older runtimes and incompatible ranges,
-  instead of leaving the option on "checking" after a limit is established.
-- Restores the verified DLSS-G count/index gate on RTX 40, addressing the
-  reported 2x lock, freezing and black-screen regression.
-- Restores Vulkan menu interception through direct imports, dynamic resolvers
-  and Streamline's internal loader path, including mixed semaphore ownership.
+**The mod UI has been rebuilt to resolve game crashes caused by the previous UI.**
 
-The latest Vulkan correction passed local rendering regression tests. An
-Indiana Jones in-game retest is still pending; this is not a compatibility
-guarantee for that game or every Vulkan title.
+- Fixed MFG getting stuck at 2x and related freezing, flickering and black screens.
+- Improved Frame Generation detection, multiplier limits and Vulkan menu support.
+- New installs default to **Follow game** and open the menu on first launch.
+- Dynamic now correctly shows **Unavailable** when unsupported.
 
 ## Install
 
@@ -120,6 +110,8 @@ RTX 40 has DirectX 12 and experimental Vulkan paths. RTX 30 support is
 may not work at all. Dynamic MFG is unavailable on Vulkan.
 Compatibility varies by game; artifacts, freezes, black screens and crashes
 remain possible.
+
+The latest Indiana Jones Vulkan fix is still awaiting an in-game retest.
 
 If the menu does not appear, check the executable folder, chosen proxy name,
 and any leftover split components. Fully close the game before changing files.
