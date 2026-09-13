@@ -35,6 +35,7 @@ def main():
               ('loader-winmm', 'ReleaseLoadCheck', 'loader', 'winmm.dll'),
               ('control', 'ControlResolverTests', 'control', 'winmm.dll'),
               ('policy', 'NvidiaPolicyTests', '', 'winmm.dll'),
+              ('dynamic-availability', 'DynamicAvailabilityTests', '', 'winmm.dll'),
               ('first-launch', 'WarpPresentHarness', 'first-launch-menu', 'winmm.dll'),
               ('startup-menu', 'WarpPresentHarness', 'startup-menu', 'winmm.dll'),
               ('layered-menu', 'WarpPresentHarness', 'layered-slinit-menu', 'winmm.dll')]

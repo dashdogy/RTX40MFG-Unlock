@@ -30,7 +30,8 @@ games or replace installed files. WARP menu cases briefly use a foreground test
 window; Vulkan cases require a compatible NVIDIA Vulkan device. Missing debug
 or validation layers are reported in the individual logs.
 
-Coverage includes clean/default and saved controls, renamed loader forwarding
+Coverage includes Dynamic availability for legacy runtimes and range limits,
+clean/default and saved controls, renamed loader forwarding
 and duplicate ownership, observed wrapper controls, NVIDIA policy limits,
 first-launch menu pixels and persistence across relaunch, WARP presentation and
 layered swapchains, and Vulkan direct/dynamic/internal-Streamline/mixed routes.

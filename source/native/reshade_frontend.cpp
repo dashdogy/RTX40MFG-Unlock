@@ -2,6 +2,7 @@
 #include "unified_control_paths.h"
 #include "ampere_policy.h"
 #include "nvidia_mfg_policy.h"
+#include "ui_dynamic_mfg.h"
 #include "universal_route_policy.h"
 #include "reshade_frontend.h"
 
@@ -2082,14 +2083,10 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
     const int safeMaximumMultiplier = std::clamp(
         static_cast<int>(snapshot.safeMaximumMultiplier), 2, 6);
-    const bool dynamicCapabilityKnown =
-        snapshot.dynamicMfgSupportKnown != FALSE;
-    const bool dynamicSupported = dynamicCapabilityKnown
-        && snapshot.dynamicMfgSupported != FALSE
-        && nvidia_mfg_policy::DynamicRangeFits(snapshot.numFramesToGenerateMax, safeMaximumMultiplier)
-        && (!UiAmpere() || safeMaximumMultiplier == 6);
-    const bool dynamicUnsupported = dynamicCapabilityKnown && !dynamicSupported
-        && snapshot.activeWrapperObserved && snapshot.bridgeReady;
+    const auto dynamicAvailability = ui_dynamic_mfg::Classify(snapshot);
+    const bool dynamicCapabilityKnown = dynamicAvailability != ui_dynamic_mfg::Availability::Checking;
+    const bool dynamicSupported = dynamicAvailability == ui_dynamic_mfg::Availability::Supported;
+    const bool dynamicUnsupported = dynamicAvailability == ui_dynamic_mfg::Availability::Unavailable;
     if (snapshot.nvidiaCompatibilityResolved)
     {
         if (snapshot.nvidiaCompatibilityTier == 4
@@ -2203,8 +2200,7 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
         gGeneratedOnlyDebug = false;
         static const char* ampereModes[]{"Off", "2x FG", "3x MFG", "4x MFG",
             "5x MFG (experimental)", "6x MFG (experimental)"};
-        const char* dynamicLabel = dynamicSupported ? "Dynamic"
-            : dynamicCapabilityKnown ? "Dynamic (unavailable)" : "Dynamic (checking...)";
+        const char* dynamicLabel = ui_dynamic_mfg::Label(dynamicAvailability);
         const char* selectedMode = gFollowGameMode ? "Follow game"
             : gDynamicMode ? dynamicLabel : ampereModes[std::clamp(gMultiplier, 1, 6) - 1];
         if (ImGui::BeginCombo("Frame Generation", selectedMode))
@@ -2228,11 +2224,7 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
     else
     {
-        const char* dynamicLabel = dynamicSupported
-            ? "Dynamic"
-            : dynamicUnsupported
-                ? "Dynamic (unavailable)"
-                : "Dynamic (checking...)";
+        const char* dynamicLabel = ui_dynamic_mfg::Label(dynamicAvailability);
         const char* currentMode = !snapshot.bridgeReady
             ? "Unavailable"
             : gFollowGameMode
@@ -2613,7 +2605,7 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
 
         ImGui::Separator();
         ImGui::TextUnformatted("Control and lifecycle");
-    ImGui::Text("Dynamic capability: %s",
+    ImGui::Text("Dynamic availability: %s",
         !dynamicCapabilityKnown ? "checking"
             : dynamicSupported ? "supported" : "unsupported");
     ImGui::Text("Runtime FG V-Sync capability: %s", !snapshot.fgVsyncSupportKnown

@@ -22,6 +22,8 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
   shared Streamline methods.
 - Corrects active Frame Generation detection, pending multiplier reporting,
   and NVIDIA per-game override limits.
+- Shows Dynamic as unavailable for older runtimes and incompatible ranges,
+  instead of leaving the option on "checking" after a limit is established.
 - Restores the verified DLSS-G count/index gate on RTX 40, addressing the
   reported 2x lock, freezing and black-screen regression.
 - Restores Vulkan menu interception through direct imports, dynamic resolvers
