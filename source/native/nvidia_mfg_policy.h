@@ -9,6 +9,8 @@ namespace nvidia_mfg_policy
 enum class Tier : uint32_t
 {
     eUnknown = 0,
+    // Native FG is listed, but NVIDIA publishes no MFG override for this title.
+    eNoMfgOverride = 2,
     eFourX = 4,
     eSixX = 6,
 };
@@ -20,6 +22,7 @@ enum class CapacityReason : uint32_t
     eOfficialSixX = 2,
     eOfficialSixXWrapperFallback = 3,
     eWrapperPatchUnavailable = 4,
+    eNoListedMfgOverride = 5,
 };
 
 struct CapacityDecision
@@ -55,10 +58,38 @@ constexpr uint32_t NativeMaximumMultiplier(
         ? compiledMaximumGeneratedFrames + 1u : 2u;
 }
 
-// NVIDIA's published title maximum is the policy ceiling. A structurally verified wrapper
-// can lift a 2X/4X integration to the official 4X ceiling. A 6X title reaches
-// 6X only with a wrapper natively laid out for five generated frames; otherwise
-// it falls back to 4X before SetOptions or feature creation.
+constexpr uint32_t PolicyCeiling(Tier tier) noexcept
+{
+    switch (tier)
+    {
+    case Tier::eNoMfgOverride: return 2u; // Conservative mod fallback, not an NVIDIA 2x listing.
+    case Tier::eFourX: return 4u;
+    case Tier::eSixX: return 6u;
+    default: return 0u; // Unknown must not invent an NVIDIA maximum.
+    }
+}
+
+constexpr uint32_t LimitToPolicy(Tier tier, uint32_t runtimeMaximum) noexcept
+{
+    const uint32_t ceiling = PolicyCeiling(tier);
+    return ceiling != 0u && ceiling < runtimeMaximum ? ceiling : runtimeMaximum;
+}
+
+// Streamline Dynamic ignores numFramesToGenerate. Only offer it when the
+// reported runtime range already fits the policy/capacity bound. This does
+// not turn the reported maximum into allocation or lifetime evidence.
+constexpr bool DynamicRangeFits(uint32_t maximumGeneratedFrames,
+    uint32_t allowedMultiplier) noexcept
+{
+    return allowedMultiplier >= 2u && allowedMultiplier <= 6u
+        && maximumGeneratedFrames != 0u
+        && maximumGeneratedFrames < allowedMultiplier;
+}
+
+// The published per-title limit and the wrapper limit are independent bounds.
+// Patching a clamp does not establish larger allocation/ring capacity. This
+// decision never lifts the compiled limit; BridgeReady and lifetime checks
+// still govern whether an override can be applied to a particular session.
 constexpr CapacityDecision DecideCapacity(Tier tier, bool wrapperPatched,
     uint32_t compiledMaximumGeneratedFrames) noexcept
 {
@@ -66,45 +97,42 @@ constexpr CapacityDecision DecideCapacity(Tier tier, bool wrapperPatched,
         compiledMaximumGeneratedFrames);
     CapacityDecision decision{};
     decision.wrapperNativeMaximumMultiplier = nativeMaximum;
+    decision.nvidiaCeilingMultiplier = PolicyCeiling(tier);
+    const uint32_t runtimeMaximum = wrapperPatched ? nativeMaximum : 2u;
+    decision.effectiveMaximumMultiplier = LimitToPolicy(tier, runtimeMaximum);
+    decision.fallback = decision.nvidiaCeilingMultiplier > decision.effectiveMaximumMultiplier;
+
+    if (tier == Tier::eNoMfgOverride)
+    {
+        decision.reason = CapacityReason::eNoListedMfgOverride;
+        return decision;
+    }
 
     if (tier == Tier::eFourX)
     {
-        const bool reachesOfficialCeiling = wrapperPatched
-            || nativeMaximum >= 4u;
-        decision.nvidiaCeilingMultiplier = 4u;
-        decision.effectiveMaximumMultiplier = reachesOfficialCeiling
-            ? 4u : nativeMaximum;
-        decision.reason = reachesOfficialCeiling
+        decision.reason = !decision.fallback
             ? CapacityReason::eOfficialFourX
             : CapacityReason::eWrapperPatchUnavailable;
-        decision.fallback = !reachesOfficialCeiling;
         return decision;
     }
 
     if (tier == Tier::eSixX)
     {
-        decision.nvidiaCeilingMultiplier = 6u;
-        if (nativeMaximum >= 6u)
+        if (!decision.fallback)
         {
-            decision.effectiveMaximumMultiplier = 6u;
             decision.reason = CapacityReason::eOfficialSixX;
         }
-        else if (wrapperPatched)
+        else if (decision.effectiveMaximumMultiplier == 4u)
         {
-            decision.effectiveMaximumMultiplier = 4u;
             decision.reason = CapacityReason::eOfficialSixXWrapperFallback;
-            decision.fallback = true;
         }
         else
         {
-            decision.effectiveMaximumMultiplier = nativeMaximum;
             decision.reason = CapacityReason::eWrapperPatchUnavailable;
-            decision.fallback = true;
         }
         return decision;
     }
 
-    decision.effectiveMaximumMultiplier = nativeMaximum;
     decision.reason = CapacityReason::eUnknownTitleNativeCapacity;
     return decision;
 }

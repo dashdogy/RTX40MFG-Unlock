@@ -117,6 +117,7 @@ struct Snapshot
     bool installed = false;
     bool current = false;
     bool cachedPointersCovered = false;
+    bool forwarding = false;
     Failure failure = Failure::eNone;
     Method method = Method::eUnavailable;
     Kind kind = Kind::eCount;

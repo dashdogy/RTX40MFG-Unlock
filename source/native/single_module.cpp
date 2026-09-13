@@ -1,6 +1,9 @@
 #include "single_module.h"
 #include "build_variant.h"
+#include "overlay_build.h"
+#include "overlay_install.h"
 #include "single_overlay.h"
+#include "overlay_dxgi_proxy.h"
 #include "proxy_generated/proxy_export_names.h"
 #include "proxy_generated/renamable_names.h"
 
@@ -373,16 +376,6 @@ FARPROC WINAPI DelayImportHook(unsigned event, PDelayLoadInfo info)
     return nullptr;
 }
 
-DWORD WINAPI OverlayDiscoveryWorker(void*)
-{
-    // This thread cannot run until the loading thread has left the loader
-    // lock. It only discovers later graphics modules; UI work stays in Present.
-    for (;;)
-    {
-        single_overlay::InstallKnownModules();
-        Sleep(250);
-    }
-}
 }
 
 extern "C" const PfnDliHook __pfnDliNotifyHook2 = &DelayImportHook;
@@ -440,8 +433,25 @@ HMODULE LoadSystemModule(const wchar_t* basename) noexcept
     return module;
 }
 
+namespace {
+struct UiLogLine { std::atomic<bool> ready{false}; wchar_t text[512]{}; };
+UiLogLine gUiLog[64];
+std::atomic<uint32_t> gUiLogNext{0};
+uint32_t gUiLogRead = 0; // Only the existing backend worker drains this queue.
+}
+void DrainLog(void (*sink)(const wchar_t*)) noexcept
+{
+    while (gUiLogRead < std::size(gUiLog) && gUiLog[gUiLogRead].ready.load(std::memory_order_acquire))
+        sink(gUiLog[gUiLogRead++].text);
+}
 void Log(const wchar_t* text) noexcept
 {
+    const auto index = gUiLogNext.fetch_add(1, std::memory_order_relaxed);
+    if (index < std::size(gUiLog))
+    {
+        wcsncpy_s(gUiLog[index].text, text ? text : L"(null)", _TRUNCATE);
+        gUiLog[index].ready.store(true, std::memory_order_release);
+    }
     OutputDebugStringW(L"[" MFG_PRODUCT_W L" single] ");
     OutputDebugStringW(text ? text : L"(null)");
     OutputDebugStringW(L"\n");
@@ -510,15 +520,28 @@ extern "C" FARPROC WINAPI MfgProxyResolveRenamed(uint32_t kind, uint32_t key) no
 extern "C" __declspec(dllexport) BOOL WINAPI
 MfgUnlockSingleModuleQuery(MfgSingleModuleStatus* status)
 {
-    if (!status || status->size != sizeof(*status))
+    // Version-1 consumers pass the 64-byte layout and receive populated
+    // version-1 fields; version-2 consumers also receive the bounded
+    // coordinator state. Any other size is rejected as before.
+    if (!status || (status->size != sizeof(*status)
+            && status->size != kMfgSingleModuleStatusSizeV1
+            && status->size != kMfgSingleModuleStatusSizeV2))
         return FALSE;
+    const uint32_t requested = status->size;
     MfgSingleModuleStatus value{};
-    value.size = sizeof(value);
-    value.version = 1;
+    value.size = requested;
+    value.version = requested == kMfgSingleModuleStatusSizeV2 ? 2 : 3;
     value.backendOwner = gOwnsBackend;
     value.duplicateSuppressed = gDuplicate;
     single_overlay::ReadStatus(value);
-    *status = value;
+    single_overlay::proxy::ReadStatus(value);
+    value.overlayInstallState = static_cast<uint32_t>(single_overlay::install::Current());
+    value.overlayInstallReason = static_cast<uint32_t>(single_overlay::install::UnavailableReason());
+    value.overlayActivatedTargets = single_overlay::install::ActivatedTargetCount();
+    value.overlaySuspendedThreads = single_overlay::install::SuspendedThreadCount();
+    memcpy(status, &value, requested);
+    if (requested == kMfgSingleModuleStatusSizeV1)
+        status->version = 1;
     return TRUE;
 }
 
@@ -574,8 +597,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         gOwnsBackend = false;
         return FALSE;
     }
+    // Bounded application import publication only; no UI discovery worker.
     single_overlay::InstallKnownModules();
-    HANDLE thread = CreateThread(nullptr, 0, &OverlayDiscoveryWorker, nullptr, 0, nullptr);
-    if (thread) CloseHandle(thread);
     return TRUE;
 }

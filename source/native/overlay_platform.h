@@ -5,6 +5,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
+#include "overlay_slots.h"
 
 namespace single_overlay
 {
@@ -53,6 +55,11 @@ struct PlatformState
     void Draw();
 };
 
-void InstallInputHooks() noexcept;
 void RecordFailure(const wchar_t* reason) noexcept;
+
+// Bounded-installation support for the input exports (menu-enabled builds
+// only): prepare without enabling, then publish after the verified batch.
+bool PrepareBoundedInput(HMODULE pinnedUser32, slots::Batch& batch) noexcept;
+FARPROC ResolveBoundedInput(HMODULE module, LPCSTR name, FARPROC original) noexcept;
+void OnBoundedInputActivated() noexcept;
 }

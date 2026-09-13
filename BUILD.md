@@ -1,4 +1,4 @@
-# Building v1.3.2
+# Building v1.3.3
 
 The release target is `RTXMFGUnified`, producing `Release/RTXMFG.dll`.
 Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK
@@ -6,7 +6,7 @@ Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK
 
 Required external inputs:
 
-- Streamline SDK **2.14.1**, as used by the font-kernel candidate.
+- Streamline SDK **2.14.1**, as used by this release.
 - Dear ImGui revision `3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c`
   from ReShade 6.8.0, including its backends.
 - Vulkan SDK 1.2.176.1 headers and `glslangValidator.exe`.
@@ -37,8 +37,14 @@ actual paths and a fresh build directory:
     -StreamlineRoot 'C:/SDKs/streamline-sdk-v2.14.1' `
     -ImGuiRoot 'C:/SDKs/reshade-6.8.0/deps/imgui' `
     -NativeCacheRoot 'C:/BuildInputs/rtxmfg-sm86' `
-    -BuildDirectory "$PWD/build/v1.3.2"
+    -BuildDirectory "$PWD/build/v1.3.3" `
+    -EnableNgxCreateResultDiagnostics
 ```
+
+This reproduces the release configuration: the built-in menu and bounded hook
+installation are enabled, with the existing bounded NGX Create result log.
+GPU fault capture, menu suppression, skipped GPU work and test fault injection
+remain disabled. Do not enable those diagnostic switches for a release build.
 
 The proxy dispatchers, Vulkan shader arrays and adapted ImGui DX12 backend are
 generated in the build directory. Their normalized SHA-256 values must match
@@ -52,3 +58,9 @@ provider and `MFG_FONT_PROVIDER_LIST` pointing to a text list of audited provide
 paths, then build Release and run CTest. These checks use data-only provider
 images and mock CUDA calls. They do not establish live provider execution or
 correct final presentation in a game.
+
+Menu, loader, control, NVIDIA policy and provider gate regression harnesses are
+in [tests/release_regression](tests/release_regression/README.md). They must load
+the freshly built DLL. The Vulkan cases use a real Vulkan device; DirectX 12
+presentation cases use WARP. They exercise synthetic presentation and control
+paths, not a game's Frame Generation output.

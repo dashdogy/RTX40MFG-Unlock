@@ -1,30 +1,49 @@
-# Universal RTXMFG — v1.3.2
+# Universal RTXMFG — v1.3.3
 
 DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
-with experimental RTX 30 support. v1.3.2 combines the backend and menu into one
+with experimental RTX 30 support. The backend and menu are combined in one
 DLL, with fixed multipliers up to 6x and Dynamic MFG where supported.
 
 **RTX 30 series support is very early and experimental. It may not work in some
 games or configurations, even when the menu loads.**
 
 The game must already have a Streamline DLSS Frame Generation integration.
-Available modes depend on the GPU and game.
+Available modes depend on the GPU, active runtime and NVIDIA's per-game
+MFG override maximum. A listed maximum does not guarantee that the active
+Frame Generation pipeline can apply it.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
 
+## Changes in v1.3.3
+
+- Clean installs default to **Follow game** and open the full menu on first
+  launch. Saved fixed/Dynamic choices are preserved when upgrading.
+- Rebuilds menu startup and DirectX 12 swapchain handling to avoid patching
+  shared Streamline methods.
+- Corrects active Frame Generation detection, pending multiplier reporting,
+  and NVIDIA per-game override limits.
+- Restores the verified DLSS-G count/index gate on RTX 40, addressing the
+  reported 2x lock, freezing and black-screen regression.
+- Restores Vulkan menu interception through direct imports, dynamic resolvers
+  and Streamline's internal loader path, including mixed semaphore ownership.
+
+The latest Vulkan correction passed local rendering regression tests. An
+Indiana Jones in-game retest is still pending; this is not a compatibility
+guarantee for that game or every Vulkan title.
+
 ## Install
 
-The v1.3.2 download contains **`RTXMFG.dll`**. The menu is built in; no separate
+The v1.3.3 download contains **`RTXMFG.dll`**. The menu is built in; no separate
 ReShade or external loader installation is needed.
 
 1. Close the game. If upgrading from a split release, remove the old mod
    components as described below first.
-2. Download `RTXMFG-v1.3.2.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+2. Download `RTXMFG-v1.3.3.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
    and extract it.
 3. Rename `RTXMFG.dll` to **one** supported filename below that the game loads
    early. Place it beside the **actual game executable**, not the launcher.
 4. Launch the game, enable DLSS Frame Generation where available, and press
-   **Backspace** to open the menu.
+   **Backspace** to open the menu. On first launch it opens automatically.
 
 Install only one copy. Do not overwrite a DLL belonging to the game or another
 mod; choose another suitable name if it is already occupied. Leaving the file
@@ -69,7 +88,7 @@ When upgrading from v1.2, move `RTX40MFGCore.dll`, `RTX40MFG.asi`, and
 Also remove older Universal/Bridge mod components or corresponding RTX 30 split
 files, if installed. Preserve unrelated mods and their loaders.
 
-v1.3.2 saves settings in `RTXMFG-Universal.json`. Older RTX40MFG/RTX30MFG settings
+v1.3.3 saves settings in `RTXMFG-Universal.json`. Older RTX40MFG/RTX30MFG settings
 are not imported automatically; reselect your preferences in the menu.
 
 For later single-DLL updates, replace only the installed RTXMFG DLL, keeping
@@ -78,6 +97,9 @@ its chosen filename and your settings.
 ## Usage
 
 Press **Backspace** to open or close the menu. The hotkey can be changed there.
+The default **Follow game** mode keeps the game's requested multiplier. The
+first-launch menu opens when the game window is foreground and does not reopen
+automatically after it has been shown and saved.
 
 - Choose **Follow game**, a fixed multiplier, or **Dynamic** when available.
 - Dynamic can target the display refresh rate or a custom FPS value.

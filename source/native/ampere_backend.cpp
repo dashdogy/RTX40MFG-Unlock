@@ -1,4 +1,5 @@
 #include "ampere_backend.h"
+#include "fault_capture.h"
 #include "ngx_runtime_dispatch.h"
 #if MFG_UNLOCK_RUNTIME_GPU_SELECTION
 #include "gpu_dispatch.h"
@@ -1087,7 +1088,11 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList*
 #endif
             // Native NGX may wait for a provider callback on another thread.
             // Ada/unmodified calls must not inherit Ampere's TLS lifecycle lock.
-            return original(command, feature, parameters, output);
+            fault_capture::NgxCall call(entry, _ReturnAddress(), command,
+                static_cast<uintptr_t>(feature), parameters);
+            const auto result = original(command, feature, parameters, output);
+            call.Complete(static_cast<uint32_t>(result), reinterpret_cast<void* const*>(output));
+            return result;
         }
         // During pre-device startup, retain non-FG handles for Ampere's later
         // independent SR/RR pass-through. No parameter keys are used as identity.
@@ -1257,7 +1262,11 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandLis
         lock.unlock();
         if (before) before(command, reinterpret_cast<uintptr_t>(handle), parameters,
             reinterpret_cast<void*>(callback), 0, 0, entry, _ReturnAddress());
-        return original(command, handle, parameters, callback);
+        fault_capture::NgxCall call(entry, _ReturnAddress(), command,
+            reinterpret_cast<uintptr_t>(handle), parameters);
+        const auto result = original(command, handle, parameters, callback);
+        call.Complete(static_cast<uint32_t>(result));
+        return result;
     }
 #endif
     const uintptr_t handleValue = reinterpret_cast<uintptr_t>(handle);
@@ -1367,6 +1376,7 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
     if (!gpu_dispatch::IsAmpere())
     {
         OtherFeatureLease lease{};
+        const auto entry = gRoutes[I].release;
         {
             auto& route = gRoutes[I];
             const size_t slot = FindActiveOtherFeature(route, handleValue);
@@ -1377,7 +1387,9 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
             }
         }
         lock.unlock();
+        fault_capture::NgxCall call(entry, _ReturnAddress(), nullptr, handleValue, nullptr);
         const auto result = original(handle);
+        call.Complete(static_cast<uint32_t>(result));
         if (lease.slot != SIZE_MAX)
         {
             lock.lock();
@@ -1478,6 +1490,7 @@ bool WINAPI ProviderGate(void* arg1, uintptr_t arg2, const void* arg3, void* arg
             || selectedEntry.kind == entry_detour::Kind::eNgxD3D12EvaluateFeature)
             && midpoint_fix::OutputPullMaskRequiresRestart()) return false;
 #endif
+        fault_capture::ProviderForward(entry, caller, arg1, arg2, arg3);
         return true;
     }
 #endif

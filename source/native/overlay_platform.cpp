@@ -9,6 +9,7 @@
 #include <Windowsx.h>
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <unordered_map>
@@ -40,6 +41,9 @@ std::unordered_map<HWND, WindowInput> gWindows;
 std::atomic<HWND> gActiveWindow{nullptr};
 MenuHotkey gMenuKey;
 bool gShortcutSaveFailed = false; // Render-thread state, protected by gUiMutex.
+bool gFirstLaunchChecked = false; // Shared across swapchain/context recreation.
+bool gFirstLaunchPending = false;
+bool gFirstLaunchSavePending = false;
 std::atomic<bool> gWantMouse{false};
 std::atomic<bool> gWantKeyboard{false};
 RECT gPreviousClip{};
@@ -566,6 +570,12 @@ bool PlatformState::Initialize(HWND hwnd)
     standalone_ui::Initialize(single_module::Self());
     wchar_t savedScale[32]{};
     const auto preferences = standalone_ui::SettingsPath("RTX40MFG-UI.ini");
+    if (!gFirstLaunchChecked)
+    {
+        gFirstLaunchChecked = true;
+        gFirstLaunchPending = !preferences.empty() && !GetPrivateProfileIntW(
+            L"Overlay", L"FirstLaunchMenuShown", 0, preferences.c_str());
+    }
     GetPrivateProfileStringW(L"Overlay", L"LayoutScale", L"", savedScale,
         static_cast<DWORD>(std::size(savedScale)), preferences.c_str());
     wchar_t* scaleEnd = nullptr;
@@ -615,6 +625,15 @@ bool PlatformState::WantsFrame() const noexcept
     if (context && inputAttached && Foreground(window))
     {
         InternalScope internal;
+        if (gFirstLaunchPending)
+        {
+            SetVisible(true, window);
+            if (gVisible.load(std::memory_order_acquire))
+            {
+                gFirstLaunchPending = false;
+                gFirstLaunchSavePending = true;
+            }
+        }
         if (gMenuKey.Binding())
         {
             for (int key = VK_BACK; key < 255 && gMenuKey.Binding(); ++key)
@@ -741,6 +760,16 @@ void PlatformState::Draw()
             standalone_ui::Draw();
         }
         ImGui::End();
+        if (gFirstLaunchSavePending)
+        {
+            // Persist only after the full menu has reached Draw, never merely
+            // on DLL load or a background/splash swapchain attachment. A failed
+            // write leaves the next launch eligible, without per-frame I/O.
+            gFirstLaunchSavePending = false;
+            const auto preferences = standalone_ui::SettingsPath("RTX40MFG-UI.ini");
+            if (!preferences.empty()) WritePrivateProfileStringW(
+                L"Overlay", L"FirstLaunchMenuShown", L"1", preferences.c_str());
+        }
         if (rescaleLayout)
         {
             layoutScale = uiScale;
@@ -774,16 +803,47 @@ void PlatformState::Draw()
     gWantKeyboard.store(open, std::memory_order_release);
 }
 
-void InstallInputHooks() noexcept
+FARPROC ResolveBoundedInput(HMODULE module, LPCSTR name, FARPROC original) noexcept
 {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    if (!user32) return;
-    auto proc = [&](const char* name) { return reinterpret_cast<void*>(GetProcAddress(user32, name)); };
-    HookFamily<AsyncKeyTag, SHORT, int>::Bind(proc("GetAsyncKeyState"), true);
-    HookFamily<KeyTag, SHORT, int>::Bind(proc("GetKeyState"), true);
-    HookFamily<KeyboardTag, BOOL, PBYTE>::Bind(proc("GetKeyboardState"), true);
-    HookFamily<CursorPositionTag, BOOL, int, int>::Bind(proc("SetCursorPos"), true);
-    HookFamily<ClipTag, BOOL, const RECT*>::Bind(proc("ClipCursor"), true);
+    if (!name || !original || reinterpret_cast<uintptr_t>(name) <= 0xFFFFu) return original;
+    // Only wrap the public entry from the actual pinned System32 user32 image.
+    wchar_t path[MAX_PATH]{};
+    wchar_t system[MAX_PATH]{};
+    if (!GetModuleFileNameW(module, path, MAX_PATH) || !GetSystemDirectoryW(system, MAX_PATH)) return original;
+    wcscat_s(system, L"\\user32.dll");
+    if (_wcsicmp(path, system) || !slots::ImageEntry(module, reinterpret_cast<void*>(original))) return original;
+    void* thunk = nullptr;
+    if (!strcmp(name, "GetAsyncKeyState")) thunk = HookFamily<AsyncKeyTag, SHORT, int>::Forwarder(reinterpret_cast<void*>(original));
+    else if (!strcmp(name, "GetKeyState")) thunk = HookFamily<KeyTag, SHORT, int>::Forwarder(reinterpret_cast<void*>(original));
+    else if (!strcmp(name, "GetKeyboardState")) thunk = HookFamily<KeyboardTag, BOOL, PBYTE>::Forwarder(reinterpret_cast<void*>(original));
+    else if (!strcmp(name, "SetCursorPos")) thunk = HookFamily<CursorPositionTag, BOOL, int, int>::Forwarder(reinterpret_cast<void*>(original));
+    else if (!strcmp(name, "ClipCursor")) thunk = HookFamily<ClipTag, BOOL, const RECT*>::Forwarder(reinterpret_cast<void*>(original));
+    return thunk ? reinterpret_cast<FARPROC>(thunk) : original;
+}
+
+bool PrepareBoundedInput(HMODULE user32, slots::Batch& batch) noexcept
+{
+    HMODULE executable = GetModuleHandleW(nullptr);
+    return slots::VisitImports(executable, [&](const char* name, void** address) {
+        FARPROC original = GetProcAddress(user32, name);
+        FARPROC replacement = ResolveBoundedInput(user32, name, original);
+        if (replacement == original) return true;
+        if (*address != reinterpret_cast<void*>(original))
+        {
+            single_module::Log(L"D3D12 UI: foreign input IAT slot retained; window messages remain available");
+            return true;
+        }
+        return batch.Add(executable, address, reinterpret_cast<void*>(original), reinterpret_cast<void*>(replacement));
+    });
+}
+
+void OnBoundedInputActivated() noexcept
+{
+    HookFamily<AsyncKeyTag, SHORT, int>::MarkAllPreparedActivated();
+    HookFamily<KeyTag, SHORT, int>::MarkAllPreparedActivated();
+    HookFamily<KeyboardTag, BOOL, PBYTE>::MarkAllPreparedActivated();
+    HookFamily<CursorPositionTag, BOOL, int, int>::MarkAllPreparedActivated();
+    HookFamily<ClipTag, BOOL, const RECT*>::MarkAllPreparedActivated();
 }
 
 void RecordFailure(const wchar_t* reason) noexcept

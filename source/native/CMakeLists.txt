@@ -1,5 +1,31 @@
 cmake_minimum_required(VERSION 3.24)
-project(RTX40MFGNative VERSION 1.3.2 LANGUAGES C CXX ASM_MASM)
+project(RTX40MFGNative VERSION 1.3.3 LANGUAGES C CXX ASM_MASM)
+option(MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK "Isolated comparison: keep proxies/input but skip UI GPU work" OFF)
+option(MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS "Bounded NGX runtime Create results without DRED or new hooks" OFF)
+option(MFG_UNLOCK_GPU_FAULT_CAPTURE "Isolated local DRED and NGX result diagnostics" OFF)
+option(MFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY "Isolated comparison without integrated overlay interception" OFF)
+if(MFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY AND NOT MFG_UNLOCK_GPU_FAULT_CAPTURE)
+    message(FATAL_ERROR "The overlay isolation requires the local GPU fault recorder")
+endif()
+
+option(MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN
+    "Built-in UI using owned DXGI proxies and bounded application import gateways" ON)
+option(MFG_UNLOCK_OVERLAY_MENU_DRAW
+    "Enable menu drawing on owned swapchain proxies" ON)
+option(MFG_UNLOCK_OVERLAY_TEST_FAULTS
+    "Deterministic coordinator and patch fault points for the regression harness" OFF)
+if(MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN AND MFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY)
+    message(FATAL_ERROR "The bounded redesign and the no-overlay diagnostic are exclusive")
+endif()
+if(MFG_UNLOCK_OVERLAY_MENU_DRAW AND NOT MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN)
+    message(FATAL_ERROR "The restored menu requires the bounded installation")
+endif()
+if(MFG_UNLOCK_OVERLAY_TEST_FAULTS AND NOT MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN)
+    message(FATAL_ERROR "Coordinator fault points require the bounded installation")
+endif()
+if(MFG_UNLOCK_OVERLAY_TEST_FAULTS AND NOT MFG_UNLOCK_GPU_FAULT_CAPTURE)
+    message(FATAL_ERROR "Test-fault builds are diagnostic candidates and require the fault recorder")
+endif()
 
 set(STREAMLINE_ROOT "" CACHE PATH "Path to the NVIDIA Streamline SDK directory")
 if(NOT EXISTS "${STREAMLINE_ROOT}/include/sl_dlss_g.h")
@@ -66,6 +92,7 @@ set(MFG_UNLOCK_CORE_SOURCES
     entry_detour.asm
     nvidia_mfg_policy.cpp
     temporal_interval_trace.cpp
+    fault_capture.cpp
     output_pull_telemetry.cpp
 )
 
@@ -101,6 +128,9 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
         third_party/minhook/src/hde/hde64.c)
     target_include_directories(MfgSingleMinHook PUBLIC third_party/minhook/include)
     target_compile_definitions(MfgSingleMinHook PRIVATE WIN32_LEAN_AND_MEAN)
+    if(MFG_UNLOCK_OVERLAY_TEST_FAULTS)
+        target_compile_definitions(MfgSingleMinHook PRIVATE MFG_UNLOCK_TEST_FAULTS=1)
+    endif()
     set_target_properties(MfgSingleMinHook PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
     add_library(MfgSingleImGui STATIC
@@ -122,12 +152,19 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
     set(MFG_SINGLE_CORE_SOURCES ${MFG_UNLOCK_CORE_SOURCES})
     add_library(MfgSingleObjects OBJECT ${MFG_SINGLE_CORE_SOURCES}
         single_module.cpp single_overlay.cpp overlay_platform.cpp
-        overlay_dx12.cpp overlay_vulkan.cpp reshade_frontend.cpp
+        overlay_dx12.cpp overlay_dxgi_proxy.cpp overlay_vulkan.cpp overlay_install.cpp reshade_frontend.cpp
         "${MFG_GENERATED}/proxy_generated/renamable_exports.asm")
     target_compile_features(MfgSingleObjects PRIVATE cxx_std_20)
     target_compile_options(MfgSingleObjects PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
     target_compile_options(MfgSingleObjects PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/Zi>)
     target_compile_definitions(MfgSingleObjects PRIVATE
+        MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK=$<BOOL:${MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK}>
+        MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS=$<BOOL:${MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS}>
+        MFG_UNLOCK_GPU_FAULT_CAPTURE=$<BOOL:${MFG_UNLOCK_GPU_FAULT_CAPTURE}>
+        MFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY=$<BOOL:${MFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY}>
+        MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN=$<BOOL:${MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN}>
+        MFG_UNLOCK_OVERLAY_MENU_DRAW=$<BOOL:${MFG_UNLOCK_OVERLAY_MENU_DRAW}>
+        MFG_UNLOCK_OVERLAY_TEST_FAULTS=$<BOOL:${MFG_UNLOCK_OVERLAY_TEST_FAULTS}>
         UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN ImTextureID=ImU64
         MFG_UNLOCK_SINGLE_MODULE_UI=1 MFG_UNLOCK_UNIVERSAL_CONFIG=1
         MFG_UNLOCK_RESHADE_UI_CLIENT=1 MFG_UNLOCK_V12_UNIVERSAL_UI=1

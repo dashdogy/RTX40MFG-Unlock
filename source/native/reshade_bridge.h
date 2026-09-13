@@ -113,8 +113,10 @@ struct MfgUnlockReShadeSnapshot
     BOOL nvidiaCompatibilityResolved = FALSE;
     int32_t nvidiaProfileStatus = -1;
     char nvidiaProfileName[128]{};
+    // Protocol 40: 0 unknown, 2 native FG listed without MFG override, 4/6 listed MFG maximum.
     uint32_t nvidiaCompatibilityTier = 0;
     uint32_t nvidiaCompatibilityManifestEntries = 0;
+    // Tier 2 uses the mod's conservative 2x bound; NVIDIA's MFG cell is blank.
     uint32_t nvidiaPolicyCeilingMultiplier = 0;
     uint32_t wrapperNativeMaximumMultiplier = 2;
     BOOL compatibilityFallback = FALSE;

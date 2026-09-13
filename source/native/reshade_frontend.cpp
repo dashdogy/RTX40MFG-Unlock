@@ -1,6 +1,7 @@
 #include "build_variant.h"
 #include "unified_control_paths.h"
 #include "ampere_policy.h"
+#include "nvidia_mfg_policy.h"
 #include "universal_route_policy.h"
 #include "reshade_frontend.h"
 
@@ -1025,12 +1026,13 @@ BOOL WINAPI NativeFileApplyControl(uint32_t multiplier, BOOL dynamicMode,
     if (current.gpuFamily != 1u && current.gpuFamily != 2u) return FALSE;
     if (UiAmpere())
     {
-        if (!ampere_policy::ControlValid(multiplier, dynamicMode != FALSE,
+        if (!ampere_policy::ControlValid(followGame ? 2u : multiplier, dynamicMode != FALSE,
                 dynamicExperimental56 != FALSE, generatedOnlyDebug != FALSE)) return FALSE;
     }
     const uint32_t safeMaximumMultiplier = current.safeMaximumMultiplier;
     if ((!followGame && multiplier > safeMaximumMultiplier)
         || (dynamicMode && (!current.dynamicMfgSupportKnown || !current.dynamicMfgSupported
+            || !nvidia_mfg_policy::DynamicRangeFits(current.numFramesToGenerateMax, safeMaximumMultiplier)
             || (UiAmpere() && safeMaximumMultiplier < 6)))
         || current.dlssgPresetRequested > 2)
         return FALSE;
@@ -1644,7 +1646,6 @@ void PersistSettings(reshade::api::effect_runtime* runtime)
 
 void ApplySettings(reshade::api::effect_runtime* runtime, bool persist)
 {
-    int safeMaximumMultiplier = 6;
 #if defined(MFG_UNLOCK_V12_UNIVERSAL_UI)
     MfgUnlockReShadeSnapshot capacity{};
     if (!BackendGetSnapshot(&capacity))
@@ -1657,8 +1658,6 @@ void ApplySettings(reshade::api::effect_runtime* runtime, bool persist)
         }
         return;
     }
-    safeMaximumMultiplier = std::clamp(
-        static_cast<int>(capacity.safeMaximumMultiplier), 2, 6);
 #endif
     if (UiAmpere())
     {
@@ -1666,7 +1665,7 @@ void ApplySettings(reshade::api::effect_runtime* runtime, bool persist)
     }
     else
     {
-        gMultiplier = std::clamp(gMultiplier, 2, safeMaximumMultiplier);
+        gMultiplier = std::clamp(gMultiplier, 2, 6);
     }
     gDynamicExperimental56 = false;
     gDynamicCustomTargetFrameRate = std::clamp(
@@ -2087,6 +2086,7 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
         snapshot.dynamicMfgSupportKnown != FALSE;
     const bool dynamicSupported = dynamicCapabilityKnown
         && snapshot.dynamicMfgSupported != FALSE
+        && nvidia_mfg_policy::DynamicRangeFits(snapshot.numFramesToGenerateMax, safeMaximumMultiplier)
         && (!UiAmpere() || safeMaximumMultiplier == 6);
     const bool dynamicUnsupported = dynamicCapabilityKnown && !dynamicSupported
         && snapshot.activeWrapperObserved && snapshot.bridgeReady;
@@ -2095,31 +2095,48 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
         if (snapshot.nvidiaCompatibilityTier == 4
             || snapshot.nvidiaCompatibilityTier == 6)
         {
-            ImGui::Text("NVIDIA-listed maximum: %uX",
+            ImGui::Text("NVIDIA MFG override ceiling: %uX",
                 snapshot.nvidiaCompatibilityTier);
+        }
+        else if (snapshot.nvidiaCompatibilityTier == 2)
+        {
+            ImGui::TextUnformatted("NVIDIA MFG override: not listed for this game");
         }
         else
         {
-            ImGui::TextUnformatted(
-                "NVIDIA-listed maximum: not listed");
+            ImGui::TextUnformatted("NVIDIA MFG override ceiling: unknown title");
         }
     }
     else
     {
-        ImGui::TextUnformatted("NVIDIA-listed maximum: unavailable");
+        ImGui::TextUnformatted("NVIDIA MFG override ceiling: unavailable");
     }
-    if (snapshot.activeWrapperObserved)
+    const bool wrapperControlUnavailable = snapshot.activeWrapperObserved
+        && snapshot.universalRouteFailure
+            == static_cast<uint32_t>(universal_route_policy::Failure::eActiveWrapperUnpatched);
+    if (wrapperControlUnavailable)
     {
-        ImGui::Text("Available maximum: %uX%s", safeMaximumMultiplier,
+        ImGui::TextUnformatted("MFG controls: unavailable with the current wrapper");
+    }
+    else if (snapshot.activeWrapperObserved)
+    {
+        ImGui::Text("Runtime limit: %uX%s", safeMaximumMultiplier,
             snapshot.compatibilityFallback ? " (safe fallback)" : "");
     }
     else
     {
-        ImGui::TextUnformatted("Available maximum: detecting active wrapper");
+        ImGui::TextUnformatted("Runtime limit: waiting for an active wrapper");
     }
+    if (snapshot.nvidiaCompatibilityTier == 2)
+        ImGui::TextWrapped("NVIDIA lists ordinary Frame Generation only. The mod keeps its override limit at 2x.");
+    else if (snapshot.nvidiaPolicyCeilingMultiplier > static_cast<uint32_t>(safeMaximumMultiplier))
+        ImGui::TextWrapped("The listed %ux ceiling requires a compatible runtime. The current limit is %dx.",
+            snapshot.nvidiaPolicyCeilingMultiplier, safeMaximumMultiplier);
     ImGui::Text("Frame Generation: %s (game intent: %s)",
-        snapshot.appliedFrameGenerationOn ? "On" : "Off",
-        snapshot.gameFrameGenerationOn ? "On" : "Off");
+        !snapshot.setOptionsSeen || !snapshot.setOptionsAccepted ? "Unknown"
+            : snapshot.appliedFrameGenerationOn ? "On" : "Off",
+        !snapshot.setOptionsSeen ? "Unknown"
+            : snapshot.gameFrameGenerationOn ? "On" : "Off");
     DrawPresetControls(snapshot, statusStale);
     DrawPresentationControls(snapshot, statusStale);
     const bool fpsSampleCurrent = snapshot.realFpsMilli > 0
@@ -2152,7 +2169,12 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     }
     else if (!snapshot.bridgeReady)
     {
-        ImGui::TextUnformatted(snapshot.universalRouteFailure
+        if (wrapperControlUnavailable)
+            ImGui::TextWrapped("Frame Generation remains controlled by the game. "
+                "This wrapper has no verified MFG override support.");
+        else if (snapshot.intervalValidSamples && !snapshot.setOptionsSeen)
+            ImGui::TextWrapped("DLSS-G activity observed; waiting for the game's FG control calls.");
+        else ImGui::TextUnformatted(snapshot.universalRouteFailure
             == static_cast<uint32_t>(universal_route_policy::Failure::eAwaitingOptionsRequest)
             ? "Waiting for the game to request Frame Generation."
             : "Waiting for an active DLSS-G pipeline.");
@@ -2177,27 +2199,29 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
     // that state must not overwrite the user's persisted Dynamic request.
     if (UiAmpere())
     {
-        gFollowGameMode = false;
         gDynamicExperimental56 = false;
         gGeneratedOnlyDebug = false;
         static const char* ampereModes[]{"Off", "2x FG", "3x MFG", "4x MFG",
             "5x MFG (experimental)", "6x MFG (experimental)"};
         const char* dynamicLabel = dynamicSupported ? "Dynamic"
             : dynamicCapabilityKnown ? "Dynamic (unavailable)" : "Dynamic (checking...)";
-        const char* selectedMode = gDynamicMode ? dynamicLabel : ampereModes[std::clamp(gMultiplier, 1, 6) - 1];
+        const char* selectedMode = gFollowGameMode ? "Follow game"
+            : gDynamicMode ? dynamicLabel : ampereModes[std::clamp(gMultiplier, 1, 6) - 1];
         if (ImGui::BeginCombo("Frame Generation", selectedMode))
         {
+            if (ImGui::Selectable("Follow game", gFollowGameMode))
+            { gFollowGameMode = true; gDynamicMode = false; settingsChanged = true; }
             for (int value = 1; value <= 6; ++value)
             {
                 ImGui::BeginDisabled(value > safeMaximumMultiplier);
-                if (ImGui::Selectable(ampereModes[value - 1], !gDynamicMode && gMultiplier == value)
+                if (ImGui::Selectable(ampereModes[value - 1], !gFollowGameMode && !gDynamicMode && gMultiplier == value)
                     && value <= safeMaximumMultiplier)
-                { gMultiplier = value; gDynamicMode = false; settingsChanged = true; }
+                { gFollowGameMode = false; gMultiplier = value; gDynamicMode = false; settingsChanged = true; }
                 ImGui::EndDisabled();
             }
             ImGui::BeginDisabled(!dynamicSupported);
             if (ImGui::Selectable(dynamicLabel, gDynamicMode) && dynamicSupported)
-            { gMultiplier = std::max(gMultiplier, 2); gDynamicMode = true; settingsChanged = true; }
+            { gFollowGameMode = false; gMultiplier = std::max(gMultiplier, 2); gDynamicMode = true; settingsChanged = true; }
             ImGui::EndDisabled();
             ImGui::EndCombo();
         }
@@ -2207,14 +2231,17 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
         const char* dynamicLabel = dynamicSupported
             ? "Dynamic"
             : dynamicUnsupported
-                ? "Dynamic (not supported)"
+                ? "Dynamic (unavailable)"
                 : "Dynamic (checking...)";
-        const char* currentMode = gFollowGameMode
+        const char* currentMode = !snapshot.bridgeReady
+            ? "Unavailable"
+            : gFollowGameMode
             ? "Follow game"
             : gDynamicMode
                 ? dynamicLabel
                 : fixedModes[
-                    std::clamp(gMultiplier, 2, safeMaximumMultiplier) - 2];
+                    std::clamp(gMultiplier, 2, 6) - 2];
+        ImGui::BeginDisabled(!snapshot.bridgeReady);
         if (ImGui::BeginCombo("MFG mode", currentMode))
         {
             if (ImGui::Selectable("Follow game", gFollowGameMode))
@@ -2223,18 +2250,24 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
                 gDynamicMode = false;
                 settingsChanged = true;
             }
-            for (int multiplier = 2; multiplier <= safeMaximumMultiplier;
+            const int listedMaximum = snapshot.nvidiaPolicyCeilingMultiplier >= 2
+                && snapshot.nvidiaPolicyCeilingMultiplier <= 6
+                ? static_cast<int>(snapshot.nvidiaPolicyCeilingMultiplier) : safeMaximumMultiplier;
+            for (int multiplier = 2; multiplier <= listedMaximum;
                  ++multiplier)
             {
                 const bool selected = !gFollowGameMode && !gDynamicMode
                     && gMultiplier == multiplier;
-                if (ImGui::Selectable(fixedModes[multiplier - 2], selected))
+                ImGui::BeginDisabled(multiplier > safeMaximumMultiplier);
+                if (ImGui::Selectable(fixedModes[multiplier - 2], selected)
+                    && multiplier <= safeMaximumMultiplier)
                 {
                     gFollowGameMode = false;
                     gDynamicMode = false;
                     gMultiplier = multiplier;
                     settingsChanged = true;
                 }
+                ImGui::EndDisabled();
             }
             ImGui::BeginDisabled(!dynamicSupported);
             if (ImGui::Selectable(dynamicLabel, gDynamicMode)
@@ -2247,28 +2280,19 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
             ImGui::EndDisabled();
             ImGui::EndCombo();
         }
+        ImGui::EndDisabled();
         if (dynamicUnsupported)
         {
-            ImGui::TextWrapped("This game does not support Dynamic MFG.");
+            ImGui::TextWrapped("Dynamic MFG is unavailable with the current limit or runtime. Its full frame-generation range must fit the limit.");
         }
         else if (!gFollowGameMode && gDynamicMode && !dynamicSupported)
         {
             ImGui::TextUnformatted(
                 "Dynamic selection is saved; waiting for runtime support.");
         }
-        if (snapshot.activeWrapperObserved && safeMaximumMultiplier < 6)
-        {
-            const char* modes = safeMaximumMultiplier < 5 ? "5x or 6x MFG" : "6x MFG";
-            if (snapshot.nvidiaCompatibilityResolved && snapshot.nvidiaPolicyCeilingMultiplier > 0
-                && snapshot.nvidiaPolicyCeilingMultiplier < 6)
-                ImGui::TextWrapped("This game does not support %s.", modes);
-            else if (!snapshot.compatibilityFallback && snapshot.wrapperNativeMaximumMultiplier > 0
-                && snapshot.wrapperNativeMaximumMultiplier < 6)
-                ImGui::TextWrapped("This game does not support %s with its current Frame Generation integration.", modes);
-            else
-                ImGui::TextWrapped("%s is unavailable with the current Frame Generation setup (limited to %dx).",
-                    safeMaximumMultiplier < 5 ? "5x/6x MFG" : "6x MFG", safeMaximumMultiplier);
-        }
+        if (!gFollowGameMode && !gDynamicMode
+            && (!snapshot.bridgeReady || gMultiplier > safeMaximumMultiplier))
+            ImGui::Text("Saved MFG request: %dx (unavailable in this session)", gMultiplier);
     }
     if (!gFollowGameMode && gDynamicMode)
     {
@@ -2448,7 +2472,7 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
             snapshot.nvidiaCompatibilityTier == 4
                     || snapshot.nvidiaCompatibilityTier == 6
                 ? (snapshot.nvidiaCompatibilityTier == 6 ? "6X" : "4X")
-                : "not listed",
+                : snapshot.nvidiaCompatibilityTier == 2 ? "no MFG override listed" : "unknown",
             snapshot.activeWrapperObserved
                 ? (safeMaximumMultiplier == 6 ? "6X"
                     : safeMaximumMultiplier == 5 ? "5X"
@@ -2549,13 +2573,16 @@ void DrawSettings(reshade::api::effect_runtime* runtime)
         if (snapshot.nvidiaCompatibilityTier == 4
             || snapshot.nvidiaCompatibilityTier == 6)
         {
-            ImGui::Text("NVIDIA-listed maximum: %uX",
+            ImGui::Text("NVIDIA MFG override ceiling: %uX",
                 snapshot.nvidiaCompatibilityTier);
+        }
+        else if (snapshot.nvidiaCompatibilityTier == 2)
+        {
+            ImGui::TextUnformatted("NVIDIA MFG override: not listed for this game");
         }
         else
         {
-            ImGui::TextUnformatted(
-                "NVIDIA-listed maximum: not listed");
+            ImGui::TextUnformatted("NVIDIA MFG override ceiling: unknown title");
         }
         ImGui::Text("Manifest entries: %u | Policy maximum: %uX",
             snapshot.nvidiaCompatibilityManifestEntries,

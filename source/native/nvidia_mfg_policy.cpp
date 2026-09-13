@@ -200,6 +200,7 @@ const char* TierName(Tier tier) noexcept
 {
     switch (tier)
     {
+    case Tier::eNoMfgOverride: return "no MFG override listed";
     case Tier::eFourX: return "4X";
     case Tier::eSixX: return "6X";
     default: return "unknown";

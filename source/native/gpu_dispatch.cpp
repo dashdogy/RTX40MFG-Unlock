@@ -1,4 +1,5 @@
 #include "gpu_dispatch.h"
+#include "fault_capture.h"
 #include "gpu_selection_policy.h"
 #include "ampere_backend.h"
 #include <d3d12.h>
@@ -62,6 +63,7 @@ void SetLogCallback(midpoint_fix::LogCallback callback) noexcept
 }
 bool ObserveD3D12Device(void* source) noexcept
 {
+    fault_capture::ObserveDevice(source);
     std::lock_guard lock(gSelectionMutex);
     ID3D12Device* device = nullptr;
     uint64_t luid = 0;

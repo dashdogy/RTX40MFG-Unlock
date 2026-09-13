@@ -3,8 +3,9 @@
 
 namespace single_overlay
 {
-// Entry interception only: these never create graphics objects or an ImGui
-// context. Graphics initialization happens on a real presentation callback.
+void ArmFactoryGateway() noexcept;
+// The existing backend boundary rechecks application imports only.
+void BeforeStreamlineInit() noexcept;
 void InstallKnownModules() noexcept;
 FARPROC ResolveProc(HMODULE module, LPCSTR name, FARPROC original) noexcept;
 void ReadStatus(MfgSingleModuleStatus& status) noexcept;

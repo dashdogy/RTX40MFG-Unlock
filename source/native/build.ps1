@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$NativeCacheRoot,
     [Parameter(Mandatory = $true)][string]$StreamlineRoot,
     [Parameter(Mandatory = $true)][string]$ImGuiRoot,
@@ -7,7 +7,14 @@ param(
     [string]$VisualStudioInstance = 'C:/Program Files/Microsoft Visual Studio/2022/Professional',
     [string]$MsvcToolsVersion = '14.38.33130',
     [string]$WindowsSdkVersion = '10.0.22621.0',
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot '../../build/native')
+    [string]$BuildDirectory = (Join-Path $PSScriptRoot '../../build/native'),
+    [switch]$EnableGpuFaultCapture,
+    [switch]$SkipOverlayGpuWork,
+    [switch]$EnableNgxCreateResultDiagnostics,
+    [switch]$DisableSingleOverlay,
+    [switch]$EnableBoundedOverlayRedesign = $true,
+    [switch]$EnableOverlayMenuDraw = $true,
+    [switch]$EnableOverlayTestFaults
 )
 
 $ErrorActionPreference = 'Stop'
@@ -121,6 +128,13 @@ $arguments = @(
     "-DGLSLANG_VALIDATOR=$(Join-Path $VulkanIncludeDirectory ../Bin/glslangValidator.exe)",
     '-DMFG_UNLOCK_RUNTIME_GPU_SELECTION=ON',
     '-DMFG_UNLOCK_BUILD_SINGLE_MODULE=ON',
+    "-DMFG_UNLOCK_OVERLAY_SKIP_GPU_WORK=$($SkipOverlayGpuWork.IsPresent.ToString().ToUpperInvariant())",
+    "-DMFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS=$($EnableNgxCreateResultDiagnostics.IsPresent.ToString().ToUpperInvariant())",
+    "-DMFG_UNLOCK_GPU_FAULT_CAPTURE=$($EnableGpuFaultCapture.IsPresent.ToString().ToUpperInvariant())",
+    "-DMFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY=$($DisableSingleOverlay.IsPresent.ToString().ToUpperInvariant())",
+    "-DMFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN=$($EnableBoundedOverlayRedesign.IsPresent.ToString().ToUpperInvariant())",
+    "-DMFG_UNLOCK_OVERLAY_MENU_DRAW=$($EnableOverlayMenuDraw.IsPresent.ToString().ToUpperInvariant())",
+    "-DMFG_UNLOCK_OVERLAY_TEST_FAULTS=$($EnableOverlayTestFaults.IsPresent.ToString().ToUpperInvariant())",
     '-DMFG_UNLOCK_OUTPUT_PULL_MASK_ONLY=ON',
     '-DMFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY=OFF',
     '-DMFG_UNLOCK_OUTPUT_PULL_EXPERIMENT=OFF',
@@ -172,8 +186,22 @@ Assert-CachePath 'CMAKE_ASM_MASM_COMPILER' $assembler
 Assert-CachePath 'MFG_AMPERE_NATIVE_MANIFEST_ADDITIONAL' (Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc')
 Assert-CachePath 'MFG_AMPERE_NATIVE_RESOURCES_ADDITIONAL' (Join-Path $nativeCacheAdditional 'additional-resources.json')
 Assert-CachePath 'MFG_AMPERE_KERNEL_DIRECTORY_ADDITIONAL' (Join-Path $nativeCacheAdditional 'RTX30MFG-Kernels')
+Assert-CacheValue 'MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK' $SkipOverlayGpuWork.IsPresent.ToString().ToUpperInvariant()
+Assert-CacheValue 'MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS' $EnableNgxCreateResultDiagnostics.IsPresent.ToString().ToUpperInvariant()
 Assert-CacheValue 'MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY' 'ON'
 Assert-CacheValue 'MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY' 'OFF'
+Assert-CacheValue 'MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN' $EnableBoundedOverlayRedesign.IsPresent.ToString().ToUpperInvariant()
+Assert-CacheValue 'MFG_UNLOCK_OVERLAY_MENU_DRAW' $EnableOverlayMenuDraw.IsPresent.ToString().ToUpperInvariant()
+Assert-CacheValue 'MFG_UNLOCK_OVERLAY_TEST_FAULTS' $EnableOverlayTestFaults.IsPresent.ToString().ToUpperInvariant()
+if ($EnableOverlayMenuDraw.IsPresent -and -not $EnableBoundedOverlayRedesign.IsPresent) {
+    throw 'The restored menu requires -EnableBoundedOverlayRedesign'
+}
+if ($EnableOverlayTestFaults.IsPresent -and -not ($EnableBoundedOverlayRedesign.IsPresent -and $EnableGpuFaultCapture.IsPresent)) {
+    throw 'Test-fault builds require the bounded redesign and the fault recorder'
+}
+if ($EnableBoundedOverlayRedesign.IsPresent -and $DisableSingleOverlay.IsPresent) {
+    throw 'The bounded redesign and the no-overlay diagnostic are exclusive'
+}
 foreach ($legacyExperiment in @('MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT', 'MFG_UNLOCK_OUTPUT_PULL_TELEMETRY',
     'MFG_UNLOCK_PREV2CURR_EXPERIMENT', 'MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT')) {
     Assert-CacheValue $legacyExperiment 'OFF'

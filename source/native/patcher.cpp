@@ -24,6 +24,7 @@ namespace gpu_backend = gpu_dispatch;
 inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
 
 #include "dlssg_provider_policy.h"
+#include "ngx_mfg_gate.h"
 #include "reflex_control.h"
 #include "vsync_control.h"
 #include "ngx_runtime_policy.h"
@@ -35,6 +36,7 @@ inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
 #include "selective_ota_wrapper_policy.h"
 #include "streamline_ota_policy.h"
 #include "temporal_interval_trace.h"
+#include "fault_capture.h"
 #include "universal_route_policy.h"
 #include "universal_wrapper_profile.h"
 #include "vulkan_capability.h"
@@ -86,7 +88,7 @@ static_assert(offsetof(VulkanInfoPrefix, device) == 32);
 static_assert(offsetof(VulkanInfoPrefix, physicalDevice) == 48);
 
 FILE* gLog = nullptr;
-std::atomic<bool> gDesiredFollowGame{false};
+std::atomic<bool> gDesiredFollowGame{true};
 std::atomic<uint32_t> gDesiredMultiplier{2u};
 std::atomic<bool> gDesiredDynamicMode{false};
 std::atomic<uint32_t> gDynamicTargetFrameRate{0};
@@ -319,7 +321,7 @@ enum class SelectiveOtaDlssgWrapperFailure : uint32_t
 
 struct ControlConfig
 {
-    bool followGame = false;
+    bool followGame = true;
     uint32_t multiplier = 2u;
     bool dynamic = false;
     uint32_t dynamicTargetFrameRate = 0;
@@ -649,7 +651,7 @@ nvidia_mfg_policy::CapacityDecision CurrentCapacityDecision() noexcept
 
 uint32_t SafeMaximumMultiplier() noexcept
 {
-    const uint32_t maximum = UseAmpere()
+    const uint32_t runtimeMaximum = UseAmpere()
         ? (ampere_backend::Ready()
             && ampere_backend::StartupMaximumGeneratedFrames() == ampere_policy::kMaximumGeneratedFrames
             && ampere_backend::CertifiedMaximumGeneratedFrames() == ampere_policy::kMaximumGeneratedFrames
@@ -657,6 +659,9 @@ uint32_t SafeMaximumMultiplier() noexcept
         : gpu_dispatch::IsAda() ? std::clamp(
             CurrentCapacityDecision().effectiveMaximumMultiplier,
             kMinimumMultiplier, kMaximumMultiplier) : 2u;
+    const uint32_t maximum = nvidia_mfg_policy::LimitToPolicy(
+        static_cast<nvidia_mfg_policy::Tier>(
+            gNvidiaCompatibilityTier.load(std::memory_order_acquire)), runtimeMaximum);
     gSafeMaximumMultiplier.store(maximum, std::memory_order_release);
     return maximum;
 }
@@ -1118,6 +1123,8 @@ bool DynamicMfgCapabilityKnown() noexcept
 bool DynamicMfgSupported() noexcept
 {
     return DynamicMfgCapabilityKnown()
+        && nvidia_mfg_policy::DynamicRangeFits(
+            gNumFramesToGenerateMax.load(std::memory_order_acquire), SafeMaximumMultiplier())
         && gActiveNgxGraphicsApi.load(std::memory_order_acquire)
             != static_cast<uint32_t>(NgxGraphicsApi::eVulkan)
         && (!UseAmpere() || SafeMaximumMultiplier() == ampere_policy::kMaximumGeneratedFrames + 1u)
@@ -1265,6 +1272,8 @@ bool BridgeReady()
         AdapterVerifiedForApi(static_cast<NgxGraphicsApi>(
             gActiveNgxGraphicsApi.load(std::memory_order_acquire))),
         gpu_backend::Ready()
+            && (!gpu_dispatch::IsAda() || ngx_mfg_gate::Ready(reinterpret_cast<HMODULE>(
+                gActiveNgxProviderBase.load(std::memory_order_acquire))))
             && gFirstCreateMidpointReady.load(std::memory_order_acquire),
         awaitingOptions,
     };
@@ -1446,7 +1455,6 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
     {
         if (!ampere_policy::ControlValid(parsed.multiplier, parsed.dynamic,
                 parsed.dynamicExperimental56, parsed.generatedOnlyDebug)) return false;
-        parsed.followGame = false;
     }
     parsed.dynamicExperimental56 = false;
     control = parsed;
@@ -1484,7 +1492,10 @@ ControlConfig ReadInitialControl()
     const DWORD length = GetEnvironmentVariableW(
         MFG_ENV_PREFIX_W L"ACTIVE_MULTIPLIER", value, _countof(value));
     if (length == 1 && value[0] >= L'2' && value[0] <= L'6')
+    {
         control.multiplier = static_cast<uint32_t>(value[0] - L'0');
+        control.followGame = false; // Preserve an explicit environment override.
+    }
 
     ControlConfig fileControl{};
     if (ReadControlFile(gConfigPath, fileControl))
@@ -2165,7 +2176,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         static_cast<unsigned long>(pid),
         static_cast<unsigned long long>(UnixTimeSeconds()), route,
         bridgeReady ? "true" : "false",
-        gLiveHookInstalled.load(std::memory_order_relaxed) ? "true" : "false",
+        (gLiveHookInstalled.load(std::memory_order_relaxed)
+            || gOriginalGetFeatureFunction.load(std::memory_order_acquire)) ? "true" : "false",
         gNvidiaCompatibilityResolved.load(
             std::memory_order_acquire) ? "true" : "false",
         gNvidiaProfileStatus.load(std::memory_order_relaxed),
@@ -3197,13 +3209,16 @@ bool ActivateControlRoute(uint32_t slot, ControlEntryPath path,
             route->version.major, route->version.minor, route->version.build,
             route->version.privatePart, route->path.c_str());
     }
-    InstallControlRouteLifecycleEntry(slot);
     if (!route->wrapperPatched)
     {
         SetUniversalRouteFailure(
             UniversalRouteFailure::eActiveWrapperUnpatched);
-        return false;
+        // A real public call still establishes game intent and accepted FG
+        // state. BridgeReady keeps every override disabled for this route.
+        // Do not patch generic lifecycle entries merely to observe it.
+        return route->structureCompatible.load(std::memory_order_acquire);
     }
+    InstallControlRouteLifecycleEntry(slot);
     return route->structureCompatible.load(std::memory_order_acquire);
 }
 
@@ -3421,7 +3436,7 @@ void RecordAppliedControl(const ControlSnapshot& snapshot, sl::Result result,
     const bool desiredApplied = snapshot.control.followGame
         || (snapshot.control.dynamic
             ? dynamicOverrideApplied && effectiveDynamicMode
-            : !UseAmpere() || effectiveMultiplier == snapshot.control.multiplier);
+            : effectiveMultiplier == snapshot.control.multiplier);
     gAppliedRevision.store(desiredApplied ? snapshot.revision : 0, std::memory_order_release);
     if (!desiredApplied) gAttemptedRevision.store(0, std::memory_order_release);
     if (liveReapply)
@@ -3623,7 +3638,7 @@ sl::Result SubmitAdjustedOptionsImpl(
             return preserveGameControl
         ? std::clamp(std::min(source.numFramesToGenerate,
                 kMaximumMultiplier - 1u) + 1u,
-            kMinimumMultiplier, SafeMaximumMultiplier())
+            kMinimumMultiplier, kMaximumMultiplier)
         : EffectiveMultiplier(snapshot.control);
         }();
     const bool effectiveDynamicMode =
@@ -3740,12 +3755,11 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
     if (!snapshot.control.followGame && snapshot.control.dynamic
         && !DynamicMfgSupported())
         return;
-    if (UseAmpere())
-    {
-        if ((snapshot.control.dynamic && !DynamicMfgSupported())
-            || (!snapshot.control.dynamic && snapshot.control.multiplier > SafeMaximumMultiplier()))
-            return;
-    }
+    // Keep an unavailable fixed request pending without repeatedly submitting
+    // a lower fallback or labelling that fallback as the requested revision.
+    if (!snapshot.control.followGame && !snapshot.control.dynamic
+        && snapshot.control.multiplier > SafeMaximumMultiplier())
+        return;
 
     const uint64_t attemptedRevision =
         gAttemptedRevision.load(std::memory_order_acquire);
@@ -4102,11 +4116,11 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
                 L"providerAccepted=0 "
                 L"routeCommitted=0 adapterVerified=%d "
                 L"backportReadyAtCreate=0 targetRva=0x%X "
-                L"callerPreserved=1",
+                L"callerPreserved=%d",
                 static_cast<unsigned long long>(call),
                 NgxDispatchRouteName(route), NgxGraphicsApiName(api),
                 AdapterVerifiedForApi(api),
-                detour.targetRva);
+                detour.targetRva, detour.forwarding);
         }
         return;
     }
@@ -4216,7 +4230,10 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
         InspectLoadedModule(provider, path);
     }
     const bool adapterVerified = AdapterVerifiedForApi(api);
-    bool ready = adapterVerified
+    // Temporal publication alone is insufficient: the provider must also
+    // accept the multi-frame count/index before the first feature compiles.
+    const bool deviceGateReady = !gpu_dispatch::IsAda() || ngx_mfg_gate::Ready(provider);
+    bool ready = adapterVerified && deviceGateReady
         && gpu_backend::PatchProvider(provider, path.c_str());
 #if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
     if (ready && gpu_dispatch::IsAda())
@@ -4269,11 +4286,11 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
         Log(L"MFG_CREATE pre-call=%llu dispatch=%s api=%s "
             L"providerAccepted=%d "
             L"routeCommitted=1 adapterVerified=%d backportReadyAtCreate=%d "
-            L"targetRva=0x%X callerPreserved=1",
+            L"targetRva=0x%X callerPreserved=%d",
             static_cast<unsigned long long>(call),
             NgxDispatchRouteName(route), NgxGraphicsApiName(api),
             providerAccepted,
-            adapterVerified, ready, detour.targetRva);
+            adapterVerified, ready, detour.targetRva, detour.forwarding);
     }
 }
 
@@ -5003,7 +5020,7 @@ sl::Result HandlePublicSetOptions(uint32_t routeSlot,
         gLastSetOptionsResult.store(static_cast<int32_t>(result),
             std::memory_order_relaxed);
         RecordSetOptionsLifecycle(*route, viewport, true, result);
-        if (IsAcceptedControlResult(result)
+        if (route->wrapperPatched && IsAcceptedControlResult(result)
             && !gFrameGenerationCreateObserved.load(
                 std::memory_order_acquire)
             && (!UseAmpere() || !ampere_backend::EarlyInitObserved())
@@ -5536,7 +5553,7 @@ uint32_t EnsureControlRoute(HMODULE wrapper, const std::wstring& path,
 bool InstallControlRouteEntries(uint32_t routeSlot)
 {
     ControlRouteRecord* route = ControlRouteAt(routeSlot);
-    if (!route)
+    if (!route || !route->wrapperPatched)
         return false;
     using GetPluginFunctionFn = void* (*)(const char*);
     auto* resolver = reinterpret_cast<GetPluginFunctionFn>(
@@ -5834,6 +5851,38 @@ sl::Result HookSlDLSSGGetState(const sl::ViewportHandle& viewport,
         : sl::Result::eErrorNotInitialized;
 }
 
+uint32_t ResolvedDlssgControlRoute(void* resolved)
+{
+    HMODULE owner = ModuleFromAddress(resolved);
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!owner || !VirtualQuery(resolved, &memory, sizeof(memory))
+        || memory.AllocationBase != owner || memory.State != MEM_COMMIT
+        || memory.Type != MEM_IMAGE || (memory.Protect & PAGE_GUARD)
+        || !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        || !GetProcAddress(owner, "slGetPluginFunction"))
+        return UINT32_MAX;
+    const uint32_t slot = FindControlRouteForTarget(resolved);
+    if (slot != UINT32_MAX)
+        return slot;
+
+    // The successful, feature-specific lookup proves callable identity. Its
+    // owner must remain loaded for every published typed forwarding pointer.
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+            | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(resolved), &pinned) || pinned != owner)
+        return UINT32_MAX;
+    const ModuleRecord discovered = InspectLoadedModule(owner, LoadedModulePath(owner));
+    if (discovered.controlRouteSlot != UINT32_MAX)
+        return discovered.controlRouteSlot;
+    if (!discovered.wrapperExport || !discovered.generation)
+        return UINT32_MAX;
+    // Unknown wrapper layouts get resolver forwarding only: no executable
+    // entry patch, maximum claim, lifecycle patch, or MFG authorization.
+    return EnsureControlRoute(owner, discovered.path, discovered.generation, false, 0);
+}
+
 sl::Result HookSlGetFeatureFunction(
     sl::Feature feature, const char* functionName, void*& function)
 {
@@ -5842,17 +5891,12 @@ sl::Result HookSlGetFeatureFunction(
         return sl::Result::eErrorNotInitialized;
 
     const sl::Result result = original(feature, functionName, function);
+    if (result != sl::Result::eOk || feature != sl::kFeatureDLSS_G)
+        return result;
     if (function && functionName && strcmp(functionName, "slDLSSGSetOptions") == 0)
     {
         void* const resolved = function;
-        uint32_t routeSlot = FindControlRouteForTarget(resolved);
-        if (routeSlot == UINT32_MAX)
-        {
-            HMODULE owner = ModuleFromAddress(resolved);
-            const ModuleRecord discovered = InspectLoadedModule(
-                owner, LoadedModulePath(owner));
-            routeSlot = discovered.controlRouteSlot;
-        }
+        const uint32_t routeSlot = ResolvedDlssgControlRoute(resolved);
         ControlRouteRecord* route = ControlRouteAt(routeSlot);
         if (route)
         {
@@ -5865,9 +5909,11 @@ sl::Result HookSlGetFeatureFunction(
                 && resolved != reinterpret_cast<void*>(
                     gPublicSetThunks[routeSlot]))
             {
-                route->publicSetOriginal.store(
-                    reinterpret_cast<PFun_slDLSSGSetOptions*>(resolved),
-                    std::memory_order_release);
+                auto* candidate = reinterpret_cast<PFun_slDLSSGSetOptions*>(resolved);
+                auto* expected = static_cast<PFun_slDLSSGSetOptions*>(nullptr);
+                if (!route->publicSetOriginal.compare_exchange_strong(expected, candidate,
+                        std::memory_order_acq_rel) && expected != candidate)
+                    return result;
                 route->publicSetResolverFallback.store(
                     true, std::memory_order_release);
                 function = reinterpret_cast<void*>(
@@ -5882,14 +5928,7 @@ sl::Result HookSlGetFeatureFunction(
     else if (function && functionName && strcmp(functionName, "slDLSSGGetState") == 0)
     {
         void* const resolved = function;
-        uint32_t routeSlot = FindControlRouteForTarget(resolved);
-        if (routeSlot == UINT32_MAX)
-        {
-            HMODULE owner = ModuleFromAddress(resolved);
-            const ModuleRecord discovered = InspectLoadedModule(
-                owner, LoadedModulePath(owner));
-            routeSlot = discovered.controlRouteSlot;
-        }
+        const uint32_t routeSlot = ResolvedDlssgControlRoute(resolved);
         ControlRouteRecord* route = ControlRouteAt(routeSlot);
         if (route)
         {
@@ -5902,9 +5941,11 @@ sl::Result HookSlGetFeatureFunction(
                 && resolved != reinterpret_cast<void*>(
                     gPublicGetThunks[routeSlot]))
             {
-                route->publicGetOriginal.store(
-                    reinterpret_cast<PFun_slDLSSGGetState*>(resolved),
-                    std::memory_order_release);
+                auto* candidate = reinterpret_cast<PFun_slDLSSGGetState*>(resolved);
+                auto* expected = static_cast<PFun_slDLSSGGetState*>(nullptr);
+                if (!route->publicGetOriginal.compare_exchange_strong(expected, candidate,
+                        std::memory_order_acq_rel) && expected != candidate)
+                    return result;
                 route->publicGetResolverFallback.store(
                     true, std::memory_order_release);
                 function = reinterpret_cast<void*>(
@@ -6357,9 +6398,15 @@ bool InstallStreamlineLoaderDiscovery(
 sl::Result HookSlInit(const sl::Preferences& preferences,
     uint64_t sdkVersion)
 {
+    fault_capture::BeforeSlInit();
     auto* original = EntryOriginal(gOriginalSlInit, gSlInitEntryHandle);
     if (!original || original == &HookSlInit)
         return sl::Result::eErrorNotInitialized;
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    // Recheck application factory imports at the existing early boundary.
+    // The UI creates no graphics objects and modifies no native/Streamline tables.
+    single_overlay::BeforeStreamlineInit();
+#endif
     const auto maskInitEntry = entry_detour::ReadSnapshot(gSlInitEntryHandle);
     {
         std::lock_guard lock(gOutputPullMaskInitMutex);
@@ -6387,6 +6434,12 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
     HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
     const std::wstring interposerPath = interposer
         ? LoadedModulePath(interposer) : std::wstring{};
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    // Publish the existing resolver gateway before slInit can cache Vulkan
+    // entry points inside the interposer. The worker may not have seen it yet.
+    if (interposer)
+        InstallSlCommonResolverDiscovery(interposer, interposerPath);
+#endif
     if (interposer
         && !gStreamlineLoaderDiscoveryInstalled.load(
             std::memory_order_acquire))
@@ -6463,6 +6516,8 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         hostVersion.major, hostVersion.minor, hostVersion.build,
         hostVersion.privatePart, providerPreflight);
     const sl::Result result = InvokeAmpereInit(original, adjusted, sdkVersion);
+    Log(L"Streamline slInit original result=%u call=%llu", static_cast<unsigned>(result),
+        static_cast<unsigned long long>(call));
     ObserveOutputPullMaskSlInitResult(maskInitEntry, result == sl::Result::eOk);
     if (result == sl::Result::eOk)
     {
@@ -6519,6 +6574,7 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
     if (!original)
         return nullptr;
     FARPROC resolved = original(module, functionName);
+    resolved = fault_capture::ResolveProc(module, functionName, resolved);
     if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
         && ngx_initialization::IsEntry(functionName))
         InspectLoadedModule(module, LoadedModulePath(module));
@@ -6532,6 +6588,28 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
             L"sl.interposer.dll"))
     {
         return resolved;
+    }
+
+    if (std::strcmp(functionName, "slGetFeatureFunction") == 0)
+    {
+        auto* candidate = reinterpret_cast<PFun_slGetFeatureFunction*>(resolved);
+        if (candidate == &HookSlGetFeatureFunction)
+            return resolved;
+        if (ModuleFromAddress(reinterpret_cast<void*>(resolved)) != module)
+            return resolved;
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                reinterpret_cast<LPCWSTR>(resolved), &pinned) || pinned != module)
+            return resolved;
+        auto* expected = static_cast<PFun_slGetFeatureFunction*>(nullptr);
+        if (!gOriginalGetFeatureFunction.compare_exchange_strong(expected, candidate,
+                std::memory_order_acq_rel) && expected != candidate)
+            return resolved;
+        if (!expected)
+            Log(L"Streamline feature-function dynamic gateway installed: path=%s",
+                LoadedModulePath(module).c_str());
+        return reinterpret_cast<FARPROC>(&HookSlGetFeatureFunction);
     }
 
     if (std::strcmp(functionName, "slSetD3DDevice") == 0)
@@ -6624,6 +6702,14 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
     if (!original)
         return nullptr;
     FARPROC resolved = original(module, functionName);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    // Vulkan is often resolved inside Streamline rather than the executable.
+    // Reuse its established resolver boundary without wrapping internal DXGI
+    // factories or changing shared Streamline/native method implementations.
+    if (functionName && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
+        && functionName[0] == 'v' && functionName[1] == 'k')
+        resolved = single_overlay::ResolveProc(module, functionName, resolved);
+#endif
     if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
         && ngx_initialization::IsEntry(functionName))
         InspectLoadedModule(module, LoadedModulePath(module));
@@ -6802,29 +6888,8 @@ bool InstallUiTagHooks()
     return installed;
 }
 
-struct PatternPatch
-{
-    const wchar_t* label;
-    const uint8_t* pattern;
-    size_t patternSize;
-    size_t patchOffset;
-    const uint8_t* original;
-    const uint8_t* replacement;
-    size_t patchSize;
-};
-
 static constexpr std::array<uint8_t, 3> kWrapperOriginal{ 0x0F, 0x42, 0xD1 };
 static constexpr std::array<uint8_t, 3> kWrapperReplacement{ 0x90, 0x90, 0x90 };
-
-static constexpr std::array<uint8_t, 13> kNgxPattern{
-    0x84, 0xD2, 0x0F, 0x84, 0x03, 0x01, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00
-};
-static constexpr std::array<uint8_t, 6> kNgxOriginal{ 0x0F, 0x84, 0x03, 0x01, 0x00, 0x00 };
-static constexpr std::array<uint8_t, 6> kNgxReplacement{ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-static const PatternPatch kNgxPatch{
-    L"NGX device support", kNgxPattern.data(), kNgxPattern.size(), 2,
-    kNgxOriginal.data(), kNgxReplacement.data(), kNgxOriginal.size()
-};
 
 struct PatternPatchResult
 {
@@ -6890,88 +6955,15 @@ bool ModuleExportsFunction(HMODULE module, const char* expected)
     return false;
 }
 
-PatternPatchResult PatchUniqueExecutablePattern(
-    HMODULE module, const std::wstring& path, const PatternPatch& patch)
+PatternPatchResult PatchNgxMfgGate(HMODULE module, const std::wstring& path)
 {
-    const auto* base = reinterpret_cast<const uint8_t*>(module);
-    const auto* nt = ImageHeaders(module);
-    if (!nt)
-        return {};
-
-    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-    uint8_t* match = nullptr;
-    size_t matchCount = 0;
-    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section)
-    {
-        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
-            continue;
-        auto* begin = const_cast<uint8_t*>(base + section->VirtualAddress);
-        if (section->VirtualAddress >= nt->OptionalHeader.SizeOfImage)
-            continue;
-        const size_t available = nt->OptionalHeader.SizeOfImage - section->VirtualAddress;
-        const size_t size = std::min<size_t>(available,
-            std::max<size_t>(section->Misc.VirtualSize, section->SizeOfRawData));
-        if (size < patch.patternSize)
-            continue;
-        const size_t suffixOffset = patch.patchOffset + patch.patchSize;
-        for (size_t offset = 0; offset + patch.patternSize <= size; ++offset)
-        {
-            const bool prefixMatches = patch.patchOffset == 0
-                || memcmp(begin + offset, patch.pattern, patch.patchOffset) == 0;
-            const bool suffixMatches = suffixOffset == patch.patternSize
-                || memcmp(begin + offset + suffixOffset, patch.pattern + suffixOffset,
-                    patch.patternSize - suffixOffset) == 0;
-            const auto* candidate = begin + offset + patch.patchOffset;
-            const bool patchBytesMatch = memcmp(candidate, patch.original, patch.patchSize) == 0
-                || memcmp(candidate, patch.replacement, patch.patchSize) == 0;
-            if (prefixMatches && suffixMatches && patchBytesMatch)
-            {
-                match = begin + offset;
-                ++matchCount;
-            }
-        }
-    }
-
-    if (matchCount == 0)
-        return {};
-    if (matchCount != 1 || !match)
-    {
-        Log(L"%s: expected one code pattern, found %zu: %s", patch.label, matchCount, path.c_str());
-        return {true, false, nullptr};
-    }
-
-    uint8_t* address = match + patch.patchOffset;
-    if (memcmp(address, patch.replacement, patch.patchSize) == 0)
-    {
-        Log(L"%s: already patched at RVA 0x%zX: %s", patch.label,
-            static_cast<size_t>(address - const_cast<uint8_t*>(base)), path.c_str());
-        return {true, true, match};
-    }
-    if (memcmp(address, patch.original, patch.patchSize) != 0)
-    {
-        Log(L"%s: matched context but original bytes differ: %s", patch.label, path.c_str());
-        return {true, false, match};
-    }
-
-    DWORD oldProtection = 0;
-    if (!VirtualProtect(address, patch.patchSize, PAGE_EXECUTE_READWRITE, &oldProtection))
-    {
-        Log(L"%s: VirtualProtect failed (%lu): %s", patch.label, GetLastError(), path.c_str());
-        return {true, false, match};
-    }
-    memcpy(address, patch.replacement, patch.patchSize);
-    FlushInstructionCache(GetCurrentProcess(), address, patch.patchSize);
-    DWORD ignoredProtection = 0;
-    const BOOL restored = VirtualProtect(address, patch.patchSize, oldProtection, &ignoredProtection);
-    if (!restored)
-    {
-        Log(L"%s: protection restore failed (%lu): %s", patch.label, GetLastError(), path.c_str());
-        return {true, false, match};
-    }
-
-    Log(L"%s: patched RVA 0x%zX: %s", patch.label,
-        static_cast<size_t>(address - const_cast<uint8_t*>(base)), path.c_str());
-    return {true, true, match};
+    const bool wasReady = ngx_mfg_gate::Ready(module);
+    const auto result = ngx_mfg_gate::Patch(module, gpu_dispatch::IsAda()
+        && (gpu_backend::AdapterVerified() || gVulkanAdapterVerified.load(std::memory_order_acquire)));
+    if (result.patched && !wasReady)
+        Log(L"NGX MFG count/index gate restored with verified atomic publication at RVA 0x%zX: %s",
+            static_cast<size_t>(result.match + 2 - reinterpret_cast<uint8_t*>(module)), path.c_str());
+    return {result.candidate, result.patched, result.match};
 }
 
 PatternPatchResult PatchUniqueWrapperMaximumPattern(
@@ -7761,7 +7753,7 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             }
             if (gpu_dispatch::IsAda() && existing->ngxExport && !existing->ngxPatched)
             {
-                const auto result = PatchUniqueExecutablePattern(module, path, kNgxPatch);
+                const auto result = PatchNgxMfgGate(module, path);
                 existing->ngxCandidate = result.candidate;
                 existing->ngxPatched = result.patched;
                 RecomputeModuleStateLocked();
@@ -7822,7 +7814,7 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             if (record.ngxExport)
             {
                 const PatternPatchResult result = gpu_dispatch::IsAda()
-                    ? PatchUniqueExecutablePattern(module, path, kNgxPatch)
+                    ? PatchNgxMfgGate(module, path)
                     : PatternPatchResult{true, false, nullptr};
                 record.ngxCandidate = result.candidate;
                 record.ngxPatched = result.patched;
@@ -8094,6 +8086,10 @@ DWORD WINAPI PatchWorker(void* context)
         gLog = _wfsopen(logPath.c_str(), L"w, ccs=UTF-8", _SH_DENYWR);
     }
     gLogReady.store(gLog != nullptr, std::memory_order_release);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    single_module::DrainLog(&MidpointLog);
+#endif
+    fault_capture::Initialize(&MidpointLog);
 
     const std::wstring mappingName = MfgUnlockObjectName(L"Status", pid);
     HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mappingName.c_str());
@@ -8145,7 +8141,7 @@ DWORD WINAPI PatchWorker(void* context)
 
     Log(L"Patch worker started for PID %lu", static_cast<unsigned long>(pid));
 #if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
-    Log(L"RTXMFG build=1.3.2 outputPullMask=%d occupancyHint=%d "
+    Log(L"RTXMFG build=1.3.3 outputPullMask=%d occupancyHint=%d "
         L"uiInputs=framed-observations uiRecomposition=game-managed",
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,
         MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY);
@@ -8248,6 +8244,9 @@ DWORD WINAPI PatchWorker(void* context)
     for (;;)
     {
         Sleep(100);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+        single_module::DrainLog(&MidpointLog);
+#endif
         ++inventoryTicks;
         if (gModuleInventoryDirty.exchange(false, std::memory_order_acq_rel))
         {

@@ -836,6 +836,7 @@ Snapshot SnapshotFor(size_t index, const Slot& slot) noexcept
     snapshot.current = snapshot.installed
         && snapshot.failure == Failure::eNone && Current(slot);
     snapshot.cachedPointersCovered = snapshot.current;
+    snapshot.forwarding = snapshot.current && slot.forwardRelay.load(std::memory_order_acquire) != nullptr;
     if (snapshot.owner && snapshot.target)
     {
         const uintptr_t base = reinterpret_cast<uintptr_t>(snapshot.owner);

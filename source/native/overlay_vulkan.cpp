@@ -1,6 +1,7 @@
 #include "overlay_vulkan.h"
 #include "overlay_platform.h"
 #include "overlay_hook.h"
+#include "overlay_install.h"
 #include "overlay_color_spv.h"
 #include "ui_input_coherence.h"
 #include <backends/imgui_impl_vulkan.h>
@@ -588,6 +589,10 @@ struct CreateSwapchainTag
         }
         if (result == VK_SUCCESS && output && device)
         {
+            // Match the rebuilt DXGI path's bounded input setup. No graphics
+            // work or waits occur here, and no Vulkan executable is patched.
+            if (!install::PrepareInput()) return result;
+            install::VulkanReady();
             ui_input_coherence::InvalidateResources();
             auto state = std::make_shared<State>();
             state->device = device;
@@ -795,54 +800,32 @@ PFN_vkVoidFunction Wrap(const char* name, PFN_vkVoidFunction original)
 }
 }
 
-FARPROC Resolve(HMODULE, LPCSTR name, FARPROC original) noexcept
+FARPROC Resolve(HMODULE module, LPCSTR name, FARPROC original) noexcept
 {
-    if (!name || reinterpret_cast<uintptr_t>(name) <= 0xFFFFu || !original) return original;
-    if (strcmp(name, "vkGetInstanceProcAddr") == 0)
-    {
-        const auto target = reinterpret_cast<PFN_vkGetInstanceProcAddr>(original);
-        gLoaderGipa.store(target, std::memory_order_release);
-        return reinterpret_cast<FARPROC>(HookFamily<GipaTag, PFN_vkVoidFunction, VkInstance, const char*>::Bind(reinterpret_cast<void*>(original), true));
-    }
-    if (strcmp(name, "vkGetDeviceProcAddr") == 0)
-        return reinterpret_cast<FARPROC>(HookFamily<GdpaTag, PFN_vkVoidFunction, VkDevice, const char*>::Bind(reinterpret_cast<void*>(original), true));
-    return reinterpret_cast<FARPROC>(Wrap(name, reinterpret_cast<PFN_vkVoidFunction>(original)));
-}
-
-void Install(HMODULE module) noexcept
-{
-    if (!module) return;
-    const auto gipa = GetProcAddress(module, "vkGetInstanceProcAddr");
-    if (!gipa) return;
-    Resolve(module, "vkGetInstanceProcAddr", gipa);
-    if (auto gdpa = GetProcAddress(module, "vkGetDeviceProcAddr")) Resolve(module, "vkGetDeviceProcAddr", gdpa);
-    // Direct imports do not pass through a resolver. Cover the loader's own
-    // public entries as well as every pointer returned by GIPA/GDPA.
-#define MFG_VK_INSTALL(name, Tag, Result, ...) \
-    HookFamily<Tag, Result, __VA_ARGS__>::Bind(reinterpret_cast<void*>(GetProcAddress(module, name)), true);
-    MFG_VK_INSTALL("vkCreateInstance", CreateInstanceTag, VkResult, const VkInstanceCreateInfo*, const VkAllocationCallbacks*, VkInstance*)
-    MFG_VK_INSTALL("vkEnumeratePhysicalDevices", EnumeratePhysicalTag, VkResult, VkInstance, uint32_t*, VkPhysicalDevice*)
-    MFG_VK_INSTALL("vkCreateDevice", CreateDeviceTag, VkResult, VkPhysicalDevice, const VkDeviceCreateInfo*, const VkAllocationCallbacks*, VkDevice*)
-    MFG_VK_INSTALL("vkGetDeviceQueue", GetQueueTag, void, VkDevice, uint32_t, uint32_t, VkQueue*)
-    MFG_VK_INSTALL("vkGetDeviceQueue2", GetQueue2Tag, void, VkDevice, const VkDeviceQueueInfo2*, VkQueue*)
-    MFG_VK_INSTALL("vkCreateSemaphore", CreateSemaphoreTag, VkResult, VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*, VkSemaphore*)
-    MFG_VK_INSTALL("vkDestroySemaphore", DestroySemaphoreTag, void, VkDevice, VkSemaphore, const VkAllocationCallbacks*)
-    MFG_VK_INSTALL("vkImportSemaphoreWin32HandleKHR", ImportSemaphoreTag, VkResult, VkDevice, const VkImportSemaphoreWin32HandleInfoKHR*)
-    MFG_VK_INSTALL("vkCreateWin32SurfaceKHR", CreateSurfaceTag, VkResult, VkInstance, const VkWin32SurfaceCreateInfoKHR*, const VkAllocationCallbacks*, VkSurfaceKHR*)
-    MFG_VK_INSTALL("vkCreateSwapchainKHR", CreateSwapchainTag, VkResult, VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*)
-    MFG_VK_INSTALL("vkQueuePresentKHR", PresentTag, VkResult, VkQueue, const VkPresentInfoKHR*)
-    MFG_VK_INSTALL("vkDestroySwapchainKHR", DestroySwapchainTag, void, VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*)
-    MFG_VK_INSTALL("vkDestroyDevice", DestroyDeviceTag, void, VkDevice, const VkAllocationCallbacks*)
-    MFG_VK_INSTALL("vkDestroySurfaceKHR", DestroySurfaceTag, void, VkInstance, VkSurfaceKHR, const VkAllocationCallbacks*)
-    MFG_VK_INSTALL("vkDestroyInstance", DestroyInstanceTag, void, VkInstance, const VkAllocationCallbacks*)
-#undef MFG_VK_INSTALL
-    const auto destroySemaphore = GetProcAddress(module, "vkDestroySemaphore");
-    const auto importSemaphore = GetProcAddress(module, "vkImportSemaphoreWin32HandleKHR");
-    if (!destroySemaphore || !HookFamily<DestroySemaphoreTag, void, VkDevice, VkSemaphore,
-            const VkAllocationCallbacks*>::Installed(reinterpret_cast<void*>(destroySemaphore))
-        || (importSemaphore && !HookFamily<ImportSemaphoreTag, VkResult, VkDevice,
-            const VkImportSemaphoreWin32HandleInfoKHR*>::Installed(reinterpret_cast<void*>(importSemaphore))))
-        gSemaphoreCoverage.store(false, std::memory_order_release);
-    gVulkanHooked.store(HookFamily<GipaTag, PFN_vkVoidFunction, VkInstance, const char*>::Installed(), std::memory_order_release);
+    if (!name || reinterpret_cast<uintptr_t>(name) <= 0xFFFFu || !original
+        || name[0] != 'v' || name[1] != 'k') return original;
+    // Establish the public loader ABI in its exact image. All downstream
+    // layer/driver functions still come from that loader's GIPA/GDPA chain.
+    // Bind(false) pins each returned callable and never changes its code.
+    wchar_t path[32768]{};
+    const DWORD length = module ? GetModuleFileNameW(module, path, 32768) : 0;
+    if (!length || length >= 32768) return original;
+    const wchar_t* leaf = wcsrchr(path, L'\\');
+    if (_wcsicmp(leaf ? leaf+1 : path, L"vulkan-1.dll")
+        || !slots::ImageEntry(module, reinterpret_cast<void*>(original))) return original;
+    for (const char* symbol : {"vkGetInstanceProcAddr", "vkGetDeviceProcAddr",
+            "vkCreateInstance", "vkEnumeratePhysicalDevices", "vkCreateDevice"})
+        if (!slots::ImageEntry(module, reinterpret_cast<void*>(GetProcAddress(module, symbol))))
+            return original;
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(original), &pinned) || pinned != module) return original;
+    auto loader = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(module, "vkGetInstanceProcAddr"));
+    auto expected = static_cast<PFN_vkGetInstanceProcAddr>(nullptr);
+    if (!gLoaderGipa.compare_exchange_strong(expected, loader, std::memory_order_acq_rel)
+        && expected != loader) return original; // Never mix loader ownership.
+    const auto wrapped = reinterpret_cast<FARPROC>(Wrap(name, reinterpret_cast<PFN_vkVoidFunction>(original)));
+    if (wrapped != original) gVulkanHooked.store(true, std::memory_order_release);
+    return wrapped;
 }
 }
