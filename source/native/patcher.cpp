@@ -1,10 +1,14 @@
 #if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 #include "single_module.h"
 #include "single_overlay.h"
+#include "overlay_application_imports.h"
+#include "overlay_slots.h"
+#include "caller_scoped_import.h"
 #endif
 #include "shared.h"
 #include "build_variant.h"
 #include "unified_control_paths.h"
+#include "status_transport.h"
 #include "ui_status_json.h"
 #include "ui_input_coherence.h"
 #include "ampere_backend.h"
@@ -2014,7 +2018,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
 
     char json[16384]{};
     const int length = sprintf_s(json,
-        "{\"version\":" MFG_STATUS_VERSION ",\"pid\":%lu,\"heartbeat\":%llu,\"route\":\"%s\","
+        "{\"version\":" MFG_STATUS_VERSION ",\"pid\":%lu,\"processBirth\":%llu,\"heartbeat\":%llu,\"route\":\"%s\","
         "\"bridgeReady\":%s,\"liveHookInstalled\":%s,"
         "\"loaderCoreImported\":true,"
         "\"nvidiaCompatibilityResolved\":%s,"
@@ -2119,7 +2123,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"intervalSeenIndexMask\":%u,\"intervalLastCount\":%d,"
         "\"intervalLastIndex\":%d,\"intervalLastPositionNumerator\":%u,"
         "\"intervalLastPositionDenominator\":%u,"
-        "\"intervalLogFile\":\"" MFG_LOG_PREFIX "-intervals-%lu.csv\","
+        "\"intervalLogFile\":\"%ls\","
         "\"requestRevision\":%llu,\"appliedRevision\":%llu,"
         "\"applied\":%s,\"pending\":%s,\"gameFrameGenerationOn\":%s,"
         "\"appliedFrameGenerationOn\":%s,"
@@ -2174,6 +2178,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"frameGenerationOffAccepted\":%s,"
         "\"releaseObserved\":%s}\n",
         static_cast<unsigned long>(pid),
+        static_cast<unsigned long long>(diagnostic_paths::ProcessBirth()),
         static_cast<unsigned long long>(UnixTimeSeconds()), route,
         bridgeReady ? "true" : "false",
         (gLiveHookInstalled.load(std::memory_order_relaxed)
@@ -2328,7 +2333,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         intervalTrace.lastCount, intervalTrace.lastIndex,
         intervalTrace.lastPositionNumerator,
         intervalTrace.lastPositionDenominator,
-        static_cast<unsigned long>(pid),
+        temporal_interval_trace::FileName(),
         static_cast<unsigned long long>(desiredRevision),
         static_cast<unsigned long long>(appliedRevision),
         applied ? "true" : "false", pending ? "true" : "false",
@@ -2417,15 +2422,9 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     // ReShade reads concurrently. Publish a complete replacement so a reader
     // sees the previous snapshot until the new one is ready, never a truncated
     // or partially written status file.
-    const std::wstring temporary = gStatusPath + L".tmp";
-    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
-        return false;
-
     std::string serialized(json, static_cast<size_t>(length));
     const size_t gpuClosing = serialized.rfind('}');
-    if (gpuClosing == std::string::npos) { CloseHandle(file); return false; }
+    if (gpuClosing == std::string::npos) return false;
     char gpu[192]{};
     sprintf_s(gpu, ",\"product\":\"RTXMFG\",\"gpuFamily\":%u,\"gpuAdapterLuid\":%llu,\"gpuSelectionFailure\":%u",
         static_cast<uint32_t>(gpu_dispatch::Selected()),
@@ -2470,7 +2469,7 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     if (UseAmpere())
     {
         const size_t closing = serialized.rfind('}');
-        if (closing == std::string::npos) { CloseHandle(file); return false; }
+        if (closing == std::string::npos) return false;
         const auto diagnostic = ampere_backend::Diagnostics();
         char ampere[2048]{};
         sprintf_s(ampere, ",\"ampereProgramReadyMfg\":%s,"
@@ -2519,19 +2518,18 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
             ampere_backend::LegacySinglePreset() ? "true" : "false");
         serialized.insert(closing, ampere);
     }
-    DWORD written = 0;
-    const BOOL result = WriteFile(file, serialized.data(), static_cast<DWORD>(serialized.size()), &written, nullptr);
-    // This is transient status, not durable settings. Completed cached writes
-    // are visible to readers; do not force disk flushes on each heartbeat.
-    const BOOL complete = result && written == serialized.size();
-    CloseHandle(file);
-    if (!complete || !MoveFileExW(temporary.c_str(), gStatusPath.c_str(),
-            MOVEFILE_REPLACE_EXISTING))
-    {
-        DeleteFileW(temporary.c_str());
-        return false;
+    const auto publication=status_transport::Publish(gStatusPath,serialized);
+    static DWORD lastPrimaryError=ERROR_SUCCESS,lastFallbackError=ERROR_SUCCESS;
+    static bool lastFallback=false;
+    if(publication.primaryError!=lastPrimaryError||publication.fallbackError!=lastFallbackError
+        ||publication.fallback!=lastFallback){
+        Log(L"MFG_STATUS_TRANSPORT published=%d fallback=%d primaryError=%lu fallbackError=%lu path=%s",
+            publication.published,publication.fallback,publication.primaryError,publication.fallbackError,
+            (publication.fallback?status_transport::MemoryName(gStatusPath):gStatusPath).c_str());
+        lastPrimaryError=publication.primaryError;lastFallbackError=publication.fallbackError;
+        lastFallback=publication.fallback;
     }
-    return true;
+    return publication.published;
 }
 
 using ChainFindStatus = universal_route_policy::StructureStatus;
@@ -6580,6 +6578,7 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
         InspectLoadedModule(module, LoadedModulePath(module));
     if (resolved && gpu_dispatch::IsAda()) dlssg_preset::PrepareForExport(module, functionName);
 #if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    if (resolved) single_overlay::application_imports::ArmModule(module);
     resolved = single_overlay::ResolveProc(module, functionName, resolved);
 #endif
     if (!resolved || !functionName
@@ -6647,9 +6646,32 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
 bool InstallMainResolverDiscovery()
 {
     void* original = nullptr;
-    const bool installed = HookMainExecutableImport("KERNEL32.dll",
+    bool installed = HookMainExecutableImport("KERNEL32.dll",
         "GetProcAddress", reinterpret_cast<void*>(&HookMainGetProcAddress),
         original);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    if (!installed)
+    {
+        // GTA Enhanced has four-byte-aligned x64 imports. Preserve the strict
+        // pointer publisher and the IAT; intercept only main-executable callers
+        // at the identified public resolver entry instead.
+        HMODULE executable = GetModuleHandleW(nullptr);
+        single_overlay::slots::VisitImports(executable, [&](const char* name, void** slot) {
+            if (strcmp(name, "GetProcAddress")) return true;
+            void* target = nullptr;
+            memcpy(&target, slot, sizeof(target));
+            if (!caller_scoped_import::Eligible(executable, slot, target, name)) return true;
+            void* trampoline = nullptr;
+            const auto replacement = reinterpret_cast<void*>(&HookMainGetProcAddress);
+            if (caller_scoped_import::Prepare(executable, slot, target,replacement,name,trampoline)) {
+                gOriginalMainGetProcAddress.store(reinterpret_cast<GetProcAddressFn>(trampoline),std::memory_order_release);
+                installed = caller_scoped_import::Activate(target,replacement);
+                if (installed) original = trampoline;
+            }
+            return false;
+        });
+    }
+#endif
     if (original)
     {
         const auto candidate = reinterpret_cast<GetProcAddressFn>(original);
@@ -8003,6 +8025,9 @@ void InspectAlreadyLoadedModules()
         {
             HMODULE module = reinterpret_cast<HMODULE>(entry.modBaseAddr);
             loadedModules.push_back(module);
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+            single_overlay::application_imports::ArmModule(module);
+#endif
             InspectLoadedModule(module, entry.szExePath);
             entry.dwSize = sizeof(entry);
         } while (Module32NextW(snapshot, &entry));
@@ -8076,13 +8101,12 @@ DWORD WINAPI PatchWorker(void* context)
     EnsureAmpereFeatureLifetimeObserver();
     const DWORD pid = GetCurrentProcessId();
     wchar_t tempDirectory[MAX_PATH]{};
-    DWORD tempLength = GetTempPathW(_countof(tempDirectory), tempDirectory);
-    std::wstring logPath;
-    if (tempLength > 0 && tempLength < _countof(tempDirectory))
+    const DWORD tempLength = GetTempPathW(_countof(tempDirectory), tempDirectory);
+    if (!tempLength || tempLength >= _countof(tempDirectory))
+        tempDirectory[0] = L'\0';
+    const std::wstring logPath=diagnostic_paths::RuntimeLog();
+    if (!logPath.empty())
     {
-        wchar_t logName[64]{};
-        swprintf_s(logName, MFG_LOG_PREFIX_W L"-%lu.log", static_cast<unsigned long>(pid));
-        logPath = JoinPath(tempDirectory, logName);
         gLog = _wfsopen(logPath.c_str(), L"w, ccs=UTF-8", _SH_DENYWR);
     }
     gLogReady.store(gLog != nullptr, std::memory_order_release);
@@ -8114,8 +8138,9 @@ DWORD WINAPI PatchWorker(void* context)
             static_cast<HMODULE>(context), executableDirectory);
     }
     gStatusPath = ResolveStatusPath(gConfigPath, executableDirectory);
-    DeleteFileW(gStatusPath.c_str());
-    temporal_interval_trace::Initialize(tempDirectory, pid);
+    // The first atomic publication replaces the previous launch's snapshot.
+    // Never delete a file another live process may still own.
+    temporal_interval_trace::Initialize(tempDirectory, executablePath.c_str());
 #if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
     output_pull_telemetry::Initialize(tempDirectory, pid);
 #endif
@@ -8140,8 +8165,10 @@ DWORD WINAPI PatchWorker(void* context)
     }
 
     Log(L"Patch worker started for PID %lu", static_cast<unsigned long>(pid));
+    Log(L"Diagnostics reused per executable: log=%s status=%s processBirth=%llu executable=%s",
+        logPath.c_str(),gStatusPath.c_str(),static_cast<unsigned long long>(diagnostic_paths::ProcessBirth()),executablePath.c_str());
 #if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
-    Log(L"RTXMFG build=1.3.3 outputPullMask=%d occupancyHint=%d "
+    Log(L"RTXMFG build=1.3.3-hotfix.1 outputPullMask=%d occupancyHint=%d "
         L"uiInputs=framed-observations uiRecomposition=game-managed",
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,
         MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY);

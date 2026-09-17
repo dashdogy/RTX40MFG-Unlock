@@ -1,4 +1,4 @@
-# Building v1.3.3
+# Building v1.3.3-hotfix.1
 
 The release target is `RTXMFGUnified`, producing `Release/RTXMFG.dll`.
 Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK
@@ -37,7 +37,7 @@ actual paths and a fresh build directory:
     -StreamlineRoot 'C:/SDKs/streamline-sdk-v2.14.1' `
     -ImGuiRoot 'C:/SDKs/reshade-6.8.0/deps/imgui' `
     -NativeCacheRoot 'C:/BuildInputs/rtxmfg-sm86' `
-    -BuildDirectory "$PWD/build/v1.3.3" `
+    -BuildDirectory "$PWD/build/v1.3.3-hotfix.1" `
     -EnableNgxCreateResultDiagnostics
 ```
 

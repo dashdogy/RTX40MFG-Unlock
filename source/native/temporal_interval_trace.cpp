@@ -1,6 +1,7 @@
 #include "build_variant.h"
 #include "gpu_dispatch.h"
 #include "temporal_interval_trace.h"
+#include "diagnostic_paths.h"
 
 #include <nvsdk_ngx.h>
 
@@ -69,7 +70,7 @@ std::array<std::atomic<uint64_t>, kFirstSampleHandleCapacity>
 LARGE_INTEGER gQpcFrequency{};
 int64_t gLastWrittenQpc = 0;
 FILE* gTrace = nullptr;
-wchar_t gFileName[64]{};
+wchar_t gFileName[160]{};
 wchar_t gFilePath[32768]{};
 
 bool FullyInitialized() noexcept
@@ -243,7 +244,7 @@ bool RecordImpl(const NVSDK_NGX_Handle* handle,
 }
 }
 
-void Initialize(const wchar_t* tempDirectory, DWORD pid) noexcept
+void Initialize(const wchar_t* tempDirectory, const wchar_t* executablePath) noexcept
 {
     uint32_t expected = 0;
     if (!gInitializationState.compare_exchange_strong(expected, 1,
@@ -256,8 +257,8 @@ void Initialize(const wchar_t* tempDirectory, DWORD pid) noexcept
         InterlockedPushEntrySList(&gFreeEvents, &node.link);
     QueryPerformanceFrequency(&gQpcFrequency);
 
-    swprintf_s(gFileName, MFG_LOG_PREFIX_W L"-intervals-%lu.csv",
-        static_cast<unsigned long>(pid));
+    const auto name=diagnostic_paths::FileName(executablePath?executablePath:L"",L"-intervals.csv");
+    wcsncpy_s(gFileName,name.c_str(),_TRUNCATE);
     if (tempDirectory && *tempDirectory)
     {
         wcsncpy_s(gFilePath, tempDirectory, _TRUNCATE);

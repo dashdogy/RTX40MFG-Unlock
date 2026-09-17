@@ -821,6 +821,16 @@ FARPROC ResolveBoundedInput(HMODULE module, LPCSTR name, FARPROC original) noexc
     return thunk ? reinterpret_cast<FARPROC>(thunk) : original;
 }
 
+bool PublishBoundedInputOriginal(const char* name, void* target, void* trampoline) noexcept
+{
+    if (!strcmp(name,"GetAsyncKeyState")) return HookFamily<AsyncKeyTag,SHORT,int>::PublishForwarderOriginal(target,trampoline);
+    if (!strcmp(name,"GetKeyState")) return HookFamily<KeyTag,SHORT,int>::PublishForwarderOriginal(target,trampoline);
+    if (!strcmp(name,"GetKeyboardState")) return HookFamily<KeyboardTag,BOOL,PBYTE>::PublishForwarderOriginal(target,trampoline);
+    if (!strcmp(name,"SetCursorPos")) return HookFamily<CursorPositionTag,BOOL,int,int>::PublishForwarderOriginal(target,trampoline);
+    if (!strcmp(name,"ClipCursor")) return HookFamily<ClipTag,BOOL,const RECT*>::PublishForwarderOriginal(target,trampoline);
+    return false;
+}
+
 bool PrepareBoundedInput(HMODULE user32, slots::Batch& batch) noexcept
 {
     HMODULE executable = GetModuleHandleW(nullptr);
@@ -833,7 +843,15 @@ bool PrepareBoundedInput(HMODULE user32, slots::Batch& batch) noexcept
             single_module::Log(L"D3D12 UI: foreign input IAT slot retained; window messages remain available");
             return true;
         }
-        return batch.Add(executable, address, reinterpret_cast<void*>(original), reinterpret_cast<void*>(replacement));
+        const bool added=batch.Add(executable, address, reinterpret_cast<void*>(original), reinterpret_cast<void*>(replacement), name, &PublishBoundedInputOriginal);
+        if (!added) {
+            MEMORY_BASIC_INFORMATION memory{};VirtualQuery(address,&memory,sizeof(memory));
+            wchar_t line[256]{};
+            swprintf_s(line,L"MFG_PROXY_UI input preparation failed symbol=%hs slotRva=0x%llX protection=0x%lX",name,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address)-reinterpret_cast<uintptr_t>(executable)),memory.Protect);
+            single_module::Log(line);
+        }
+        return added;
     });
 }
 

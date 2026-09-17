@@ -1,5 +1,6 @@
 #include "build_variant.h"
 #include "unified_control_paths.h"
+#include "status_transport.h"
 #include "ampere_policy.h"
 #include "nvidia_mfg_policy.h"
 #include "ui_dynamic_mfg.h"
@@ -519,11 +520,13 @@ bool ValidNativeStatus(const std::string& status)
 {
     if (!ui_status_json::CompleteObject(status)) return false;
     uint32_t version = 0, pid = 0, maximum = 0;
-    uint64_t heartbeat = 0;
+    uint64_t heartbeat = 0, processBirth = 0;
     const uint64_t now = NativeStatusUnixSeconds();
     if (!ParseJsonInteger(status, "version", version)
         || version != MFG_STATUS_VERSION_NUMBER
         || !ParseJsonInteger(status, "pid", pid) || pid != GetCurrentProcessId()
+        || !ParseJsonInteger(status, "processBirth", processBirth)
+        || !processBirth || processBirth != diagnostic_paths::ProcessBirth()
         || !ParseJsonInteger(status, "heartbeat", heartbeat)
         || heartbeat > now || now-heartbeat > 5
         || !ParseJsonInteger(status, "safeMaximumMultiplier", maximum)
@@ -544,7 +547,17 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
     MfgUnlockReShadeSnapshot output{};
     const bool haveSavedControl = ReadNativeControlSnapshot(&output) != FALSE;
     std::string status;
-    if (!ReadTextFile(gNativeStatusPath, status) || !ValidNativeStatus(status)) return FALSE;
+    const auto statusSource=status_transport::Read(gNativeStatusPath,status,&ReadTextFile,&ValidNativeStatus);
+    if(statusSource==status_transport::Source::None)return FALSE;
+#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
+    static auto previousSource=status_transport::Source::None;
+    if(statusSource!=previousSource){
+        single_module::Log(statusSource==status_transport::Source::Fallback
+            ?L"MFG_STATUS_UI fresh snapshot source=process-memory"
+            :L"MFG_STATUS_UI fresh snapshot source=config-directory");
+        previousSource=statusSource;
+    }
+#endif
     {
         // A status heartbeat can precede the latest atomic config save. Saved
         // intent remains authoritative; applied state comes only from status.

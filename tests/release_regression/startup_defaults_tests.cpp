@@ -11,7 +11,7 @@ int wmain(int argc, wchar_t** argv)
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     const std::wstring mode=argv[1];
     const auto config=std::filesystem::current_path()/L"startup.json";
-    const auto status=std::filesystem::current_path()/(L"startup."+std::to_wstring(GetCurrentProcessId())+L".status.json");
+    const auto status=std::filesystem::current_path()/L"startup.status.json";
     SetEnvironmentVariableW(L"RTX_MFG_CONFIG_PATH",config.c_str());
     SetEnvironmentVariableW(L"RTX_MFG_STATUS_PATH",(std::filesystem::current_path()/L"startup.status.json").c_str());
     SetEnvironmentVariableW(L"RTX_MFG_ACTIVE_MULTIPLIER",mode==L"environment"?L"5":nullptr);

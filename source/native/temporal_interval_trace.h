@@ -39,7 +39,7 @@ struct Snapshot
 
 // Initializes a fixed, lock-free event pool. Record() never opens or writes a
 // file; the patch worker drains the queue through Flush().
-void Initialize(const wchar_t* tempDirectory, DWORD pid) noexcept;
+void Initialize(const wchar_t* tempDirectory, const wchar_t* executablePath) noexcept;
 void SetEnabled(bool enabled) noexcept;
 bool Enabled() noexcept;
 void Record(const NVSDK_NGX_Handle* handle,

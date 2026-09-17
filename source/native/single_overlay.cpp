@@ -5,9 +5,12 @@
 #include "overlay_dxgi_proxy.h"
 #include "overlay_vulkan.h"
 #include "overlay_native.h"
+#include "overlay_application_imports.h"
 #include <atomic>
 #include <array>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -40,7 +43,11 @@ template<class Tag,class Fn> struct Gateways {
 };
 struct Factory0; struct Factory1; struct Factory2;
 bool Eligible(HMODULE module,FARPROC original) noexcept {
-    wchar_t path[32768]{},system[MAX_PATH]{};
+    // Factory resolution may be called from small-stack engine workers too.
+    std::unique_ptr<wchar_t[]> storage(new(std::nothrow) wchar_t[32768]);
+    if (!storage) return false;
+    wchar_t* path=storage.get();
+    wchar_t system[MAX_PATH]{};
     const DWORD count=module?GetModuleFileNameW(module,path,32768):0;
     if (!count||count>=32768||!slots::ImageEntry(module,reinterpret_cast<void*>(original))) return false;
     const wchar_t* leaf=wcsrchr(path,L'\\'); leaf=leaf?leaf+1:path;
@@ -108,6 +115,7 @@ void ArmFactoryGateway() noexcept {
     wchar_t line[160]{};
     swprintf_s(line,L"MFG_PROXY_UI armed mainGraphicsImports=%zu graphicsProbes=0 nativeTableWrites=0",batch.published);
     single_module::Log(line);
+    application_imports::ArmStartupDependencies();
 }
 void InstallKnownModules() noexcept {
     if (single_module::OwnsBackend()) install::RequestInstall();

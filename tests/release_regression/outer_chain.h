@@ -17,6 +17,7 @@ public:
     ULONG STDMETHODCALLTYPE Release() override{const auto left=--refs;if(!left)delete this;return left;}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         if(!out)return E_POINTER;*out=nullptr;
+        if(mode==6&&iid==__uuidof(IDXGISwapChain4))return E_NOINTERFACE;
         if(iid==nativeGuid){
             if(mode==2){*out=static_cast<IDXGISwapChain4*>(this);AddRef();return S_OK;}
             if(mode==3||mode==5)return E_NOINTERFACE;

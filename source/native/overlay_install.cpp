@@ -30,7 +30,7 @@ void RequestInstall() noexcept {
 void FactoryReady() noexcept {
     const auto previous=state.exchange(State::Active,std::memory_order_acq_rel);
     if (previous!=State::Active)
-        single_module::Log(L"MFG_PROXY_UI state=active boundary=real-factory-return nativeTableWrites=0 executablePatches=0");
+        single_module::Log(L"MFG_PROXY_UI state=active boundary=real-factory-return nativeTableWrites=0 factoryEntryPatches=0");
 }
 void VulkanReady() noexcept {
     const auto previous=state.exchange(State::Active,std::memory_order_acq_rel);
@@ -56,6 +56,7 @@ bool PrepareInput() noexcept {
     inputs.store(static_cast<uint32_t>(batch.count),std::memory_order_release);
     OnBoundedInputActivated();
     inputState.store(2,std::memory_order_release);
+    wchar_t line[128]{};swprintf_s(line,L"MFG_PROXY_UI input ready imports=%zu",batch.count);single_module::Log(line);
     return true;
 #endif
 }

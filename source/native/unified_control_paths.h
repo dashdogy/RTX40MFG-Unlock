@@ -40,17 +40,9 @@ inline std::wstring Config(const std::wstring& executableDirectory)
 inline std::wstring ProcessStatusPath(const std::wstring& path, DWORD processId)
 {
     if (path.empty() || !processId) return {};
-    // A game and a helper loaded from the same directory can both own a
-    // backend. Their transient status (and its .tmp publication) must not
-    // replace each other. Settings remain shared across process restarts.
-    const std::filesystem::path requested(path);
-    const std::wstring name = requested.filename().wstring();
-    constexpr wchar_t suffix[] = L".status.json";
-    const size_t insertion = name.ends_with(suffix)
-        ? name.size() - (std::size(suffix) - 1)
-        : requested.stem().wstring().size();
-    return (requested.parent_path() / (name.substr(0, insertion) + L"."
-        + std::to_wstring(processId) + name.substr(insertion))).wstring();
+    // One reusable file; overlapping processes use the transport's lifetime
+    // lease and memory channel. Payload validation still checks process identity.
+    return path;
 }
 
 inline std::wstring Status(const std::wstring& configPath,

@@ -1,4 +1,4 @@
-# Universal RTXMFG — v1.3.3
+# Universal RTXMFG — v1.3.3 Hotfix 1
 
 DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
 with experimental RTX 30 support. The backend and menu are combined in one
@@ -14,6 +14,17 @@ Frame Generation pipeline can apply it.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
 
+## Changes in v1.3.3 Hotfix 1
+
+- Restores the GTA V Enhanced menu and its controls, including when the game locks
+  the status file, and fixes HDR swapchain forwarding during startup.
+- Detects renderer DLL imports used by games such as Dying Light 2. In-game
+  validation for Dying Light 2 is still pending.
+- Fixes the small-stack startup overflow identified in Subnautica 2. Regression
+  tests cover 64 KiB and 128 KiB worker threads; an in-game retest is still pending.
+- Reuses one runtime log and one status file per game installation, replacing
+  their contents on the next launch. Existing older PID-named files are left alone.
+
 ## Changes in v1.3.3
 
 **The mod UI has been rebuilt to resolve game crashes caused by the previous UI.**
@@ -25,12 +36,12 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 
 ## Install
 
-The v1.3.3 download contains **`RTXMFG.dll`**. The menu is built in; no separate
+The v1.3.3-hotfix.1 download contains **`RTXMFG.dll`**. The menu is built in; no separate
 ReShade or external loader installation is needed.
 
 1. Close the game. If upgrading from a split release, remove the old mod
    components as described below first.
-2. Download `RTXMFG-v1.3.3.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+2. Download `RTXMFG-v1.3.3-hotfix.1.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
    and extract it.
 3. Rename `RTXMFG.dll` to **one** supported filename below that the game loads
    early. Place it beside the **actual game executable**, not the launcher.
@@ -80,7 +91,7 @@ When upgrading from v1.2, move `RTX40MFGCore.dll`, `RTX40MFG.asi`, and
 Also remove older Universal/Bridge mod components or corresponding RTX 30 split
 files, if installed. Preserve unrelated mods and their loaders.
 
-v1.3.3 saves settings in `RTXMFG-Universal.json`. Older RTX40MFG/RTX30MFG settings
+v1.3.3 and its hotfixes save settings in `RTXMFG-Universal.json`. Older RTX40MFG/RTX30MFG settings
 are not imported automatically; reselect your preferences in the menu.
 
 For later single-DLL updates, replace only the installed RTXMFG DLL, keeping
@@ -122,7 +133,9 @@ changing presets. This is a reported workaround, not a fix for every game.
 
 For [bug reports](https://github.com/dashdogy/RTX40MFG-Unlock/issues), include
 the game, GPU, driver, proxy filename, multiplier and preset, plus the matching
-`%TEMP%\RTXMFG-<PID>.log` and `RTXMFG-Universal.<PID>.status.json`.
+`%TEMP%\RTXMFG-<game>-<path-hash>.log` and `RTXMFG-Universal.status.json`
+beside the mod settings. Each launch replaces the previous log/status contents.
+Optional interval tracing also reuses one file per game installation.
 
 ## Uninstall
 

@@ -3,6 +3,8 @@
 #include <sl_dlss_g.h>
 #include "ui_status_json.h"
 #include "build_variant.h"
+#include "status_transport.h"
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -11,13 +13,29 @@
 #include <cstdio>
 
 static bool ok=true;
+static bool lockedMode=false;
 static void Check(bool value,const char* what){printf("%s %s\n",value?"PASS":"FAIL",what);fflush(stdout);ok&=value;}
 template<class T>T Proc(HMODULE m,const char* name){return reinterpret_cast<T>(GetProcAddress(m,name));}
 static std::string Read(const std::filesystem::path& path){std::ifstream f(path);return {std::istreambuf_iterator<char>(f),{}};}
 static bool Has(const std::string& s,const char* key,const char* value){return s.find(std::string("\"")+key+"\":"+value)!=std::string::npos;}
 static std::string Wait(const std::filesystem::path& path,const char* key,const char* value){
     const ULONGLONG start=GetTickCount64();std::string s;
-    do{s=Read(path);if(ui_status_json::CompleteObject(s)&&Has(s,key,value))return s;Sleep(25);}while(GetTickCount64()-start<6000);
+    do{
+        if(lockedMode){
+            auto reader=[](const std::wstring& p,std::string& out){out=Read(p);return !out.empty();};
+            auto valid=[](const std::string& text){
+                if(!ui_status_json::CompleteObject(text)||!Has(text,"version",MFG_STATUS_VERSION)
+                    ||!Has(text,"pid",std::to_string(GetCurrentProcessId()).c_str())
+                    ||!Has(text,"processBirth",std::to_string(diagnostic_paths::ProcessBirth()).c_str()))return false;
+                const std::string key="\"heartbeat\":";const auto at=text.find(key);if(at==std::string::npos)return false;
+                uint64_t stamp=0;auto parsed=std::from_chars(text.data()+at+key.size(),text.data()+text.size(),stamp);
+                FILETIME time{};GetSystemTimeAsFileTime(&time);const auto now=((uint64_t(time.dwHighDateTime)<<32)|time.dwLowDateTime)/10000000ull-11644473600ull;
+                return parsed.ec==std::errc{}&&stamp<=now&&now-stamp<=5;
+            };
+            status_transport::Read(path.wstring(),s,reader,valid);
+        }else s=Read(path);
+        if(ui_status_json::CompleteObject(s)&&Has(s,key,value))return s;Sleep(25);
+    }while(GetTickCount64()-start<7000);
     return s;
 }
 struct Guarded {
@@ -29,14 +47,22 @@ int wmain(int argc,wchar_t** argv){
     if(argc<3)return 2;
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     auto cwd=std::filesystem::current_path();
-    auto status=cwd/(L"control."+std::to_wstring(GetCurrentProcessId())+L".status.json");
+    auto status=cwd/L"control.status.json";
     SetEnvironmentVariableW(L"RTX_MFG_STATUS_PATH",(cwd/L"control.status.json").c_str());
     SetEnvironmentVariableW(L"RTX_MFG_CONFIG_PATH",(cwd/L"config.json").c_str());
     std::ofstream(cwd/L"config.json")<<"{\"mode\":\"fixed\",\"multiplier\":4}";
     HMODULE core=LoadLibraryW(argv[2]);Check(core!=nullptr,"fresh integrated DLL loads");if(!core)return 1;
     auto initial=Wait(status,"mainResolverDiscoveryInstalled","true");
     Check(Has(initial,"version",MFG_STATUS_VERSION),"candidate status uses the matching policy protocol");
+    Check(Has(initial,"processBirth",std::to_string(diagnostic_paths::ProcessBirth()).c_str()),"snapshot identifies this exact process lifetime");
     Check(Has(initial,"mainResolverDiscoveryInstalled","true")&&Has(initial,"setOptionsSeen","false"),"initial state has no invented FG observation");
+    HANDLE statusLock=INVALID_HANDLE_VALUE;std::string lockedContent;
+    if(!wcscmp(argv[1],L"control-locked")){
+        statusLock=CreateFileW(status.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+        Check(statusLock!=INVALID_HANDLE_VALUE,"game-style handle locks the candidate's real status file");
+        if(statusLock==INVALID_HANDLE_VALUE)return 1;
+        lockedContent=Read(status);lockedMode=true;
+    }
     HMODULE interposer=LoadLibraryW(L"sl.interposer.dll");
     HMODULE wrapper=LoadLibraryW(L"ControlWrapperFixture.dll");
     Check(interposer&&wrapper,"controlled interposer and unsigned-layout wrapper fixtures load");if(!interposer||!wrapper)return 1;
@@ -96,5 +122,16 @@ int wmain(int argc,wchar_t** argv){
     Check(callSet(viewport,*options)==sl::Result::eOk,"unknown options version preserves the native result");
     auto unknown=Wait(status,"universalRouteFailure","5");
     Check(Has(unknown,"bridgeReady","false")&&Has(unknown,"universalRouteFailure","5"),"unknown structure version closes override eligibility");
+    if(lockedMode){
+        Check(Read(status)==lockedContent,"candidate does not overwrite the game's locked snapshot in place");
+        std::string alternate;
+        Check(status_transport::ReadMemory(status.wstring(),alternate)&&ui_status_json::CompleteObject(alternate),"exact loaded candidate publishes a complete memory snapshot across module boundaries");
+        std::ofstream(cwd/L"config.json")<<"{\"mode\":\"fixed\",\"multiplier\":3}";
+        auto updated=Wait(status,"multiplier","3");
+        Check(Has(updated,"multiplier","3"),"saved control changes still reach backend and alternate status");
+        CloseHandle(statusLock);lockedMode=false;
+        auto recovered=Wait(status,"multiplier","3");
+        Check(Has(recovered,"multiplier","3")&&recovered!=lockedContent,"primary publication recovers after lock release");
+    }
     printf("COMPLETE resolver control regression passed=%u\n",ok?1:0);return ok?0:1;
 }

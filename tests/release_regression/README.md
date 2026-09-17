@@ -12,7 +12,7 @@ cmake -S tests/release_regression -B build/release-tests `
     '-DVULKAN_LIBRARY=C:/VulkanSDK/1.2.176.1/Lib/vulkan-1.lib'
 cmake --build build/release-tests --config Release --parallel 6
 python tests/release_regression/run.py `
-    --dll build/v1.3.3/Release/RTXMFG.dll `
+    --dll build/v1.3.3-hotfix.1/Release/RTXMFG.dll `
     --harness-dir build/release-tests/Release `
     --output build/release-test-results `
     --provider C:/Fixtures/nvngx_dlssg.dll
@@ -35,7 +35,10 @@ clean/default and saved controls, renamed loader forwarding
 and duplicate ownership, observed wrapper controls, NVIDIA policy limits,
 first-launch menu pixels and persistence across relaunch, WARP presentation and
 layered swapchains, and Vulkan direct/dynamic/internal-Streamline/mixed routes.
-The first-launch case reuses its settings directory in a second process to
+Hotfix coverage also includes unaligned and writable/executable import tables,
+HDR interface forwarding, locked status files and process identity, renderer DLL
+imports and late loading, 64 KiB/128 KiB resolver threads, and log/status reuse
+across launches. The first-launch case reuses its settings directory in a second process to
 verify that the automatic menu does not reopen.
 
 These tests establish synthetic rendering, forwarding and CPU gate behavior.

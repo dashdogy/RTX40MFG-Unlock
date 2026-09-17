@@ -1,6 +1,7 @@
 #pragma once
 #include "protected_pointer.h"
 #include "overlay_build.h"
+#include "caller_scoped_import.h"
 #include <array>
 #include <algorithm>
 #include <cstdio>
@@ -19,8 +20,9 @@ inline bool Fault(const char* point) noexcept
 #endif
 }
 
-// Data-slot publication primitives. Production UI callers use application IAT
-// slots only; native COM tables and executable entries are never changed.
+// Aligned application IAT publication. Four-byte-aligned system input imports
+// can use caller-scoped public-entry detours; their IAT and native COM tables
+// remain untouched. All other unsuitable slots continue to fail closed.
 inline bool ImageSlot(HMODULE image, void** slot) noexcept
 {
     MEMORY_BASIC_INFORMATION m{};
@@ -71,7 +73,8 @@ inline bool Exchange(void** slot, void* expected, void* replacement, DWORD resto
 
 struct Batch
 {
-    struct Item { void** slot; void* expected; void* replacement; DWORD protection; };
+    using PublishOriginal = bool (*)(const char*, void*, void*) noexcept;
+    struct Item { void** slot; void* expected; void* replacement; DWORD protection; HMODULE owner; const char* symbol; bool scoped; PublishOriginal publishOriginal; };
     std::array<Item, 64> items{};
     size_t count = 0;
     size_t published = 0;
@@ -79,15 +82,17 @@ struct Batch
     size_t failureIndex = 0;
     unsigned disposition = 0;
 
-    bool Add(HMODULE owner, void** slot, void* expected, void* replacement) noexcept
+    bool Add(HMODULE owner, void** slot, void* expected, void* replacement, const char* symbol = nullptr, PublishOriginal publishOriginal = nullptr) noexcept
     {
-        if (!expected || !replacement || !ImageSlot(owner, slot) || count == items.size()
+        const bool aligned = ImageSlot(owner, slot);
+        const bool scoped = !aligned && publishOriginal && caller_scoped_import::Eligible(owner, slot, expected, symbol);
+        if (!expected || !replacement || (!aligned && !scoped) || count == items.size()
             || protected_pointer::ReadPointer(reinterpret_cast<uintptr_t>(slot)) != expected) return false;
         for (size_t i = 0; i < count; ++i)
             if (items[i].slot == slot) return items[i].expected == expected && items[i].replacement == replacement;
         DWORD protection = 0;
         if (!protected_pointer::QueryProtection(reinterpret_cast<uintptr_t>(slot), protection, sizeof(void*))) return false;
-        items[count++] = {slot, expected, replacement, protection};
+        items[count++] = {slot, expected, replacement, protection, owner, symbol, scoped, publishOriginal};
         return true;
     }
 
@@ -97,6 +102,11 @@ struct Batch
         while (attempted)
         {
             const auto& item = items[--attempted];
+            if (item.scoped) {
+                ok = caller_scoped_import::Deactivate(item.expected,item.replacement) && ok;
+                ok = protected_pointer::ReadPointer(reinterpret_cast<uintptr_t>(item.slot)) == item.expected && ok;
+                continue;
+            }
             auto observed = protected_pointer::ReadPointer(reinterpret_cast<uintptr_t>(item.slot));
             if (observed == item.replacement)
                 Exchange(item.slot, item.replacement, item.expected, item.protection);
@@ -117,7 +127,12 @@ struct Batch
             char fault[32]{};
             sprintf_s(fault, "publish-%zu", i);
             if (Fault(fault)) { Rollback(i); return false; }
-            const bool result = Exchange(item.slot, item.expected, item.replacement, item.protection);
+            void* trampoline = nullptr;
+            const bool result = item.scoped
+                ? caller_scoped_import::Prepare(item.owner,item.slot,item.expected,item.replacement,item.symbol,trampoline)
+                    && item.publishOriginal(item.symbol,item.expected,trampoline)
+                    && caller_scoped_import::Activate(item.expected,item.replacement)
+                : Exchange(item.slot, item.expected, item.replacement, item.protection);
             disposition = result ? 1 : 0;
             if (!result)
             { Rollback(i + 1); return false; }

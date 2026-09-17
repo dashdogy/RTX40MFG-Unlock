@@ -17,6 +17,18 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
 
 
+def runtime_log(executable):
+    normalized = str(executable).replace('/', '\\')
+    normalized = ''.join(chr(ord(c)+32) if 'A' <= c <= 'Z' else c for c in normalized)
+    identity = 14695981039346656037
+    raw = normalized.encode('utf-16-le')
+    for i in range(0, len(raw), 2):
+        identity = ((identity ^ int.from_bytes(raw[i:i+2], 'little')) * 1099511628211) & 0xffffffffffffffff
+    stem = executable.stem[:40].lower()
+    stem = ''.join(c if c.isascii() and (c.isalnum() or c in '-_') else '_' for c in stem)
+    return Path(tempfile.gettempdir())/f'RTXMFG-{stem}-{identity:016X}.log'
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dll', type=Path, required=True)
@@ -34,11 +46,24 @@ def main():
     cases += [('loader-version', 'ReleaseLoadCheck', 'loader', 'version.dll'),
               ('loader-winmm', 'ReleaseLoadCheck', 'loader', 'winmm.dll'),
               ('control', 'ControlResolverTests', 'control', 'winmm.dll'),
+              ('control-locked', 'ControlResolverTests', 'control-locked', 'winmm.dll'),
+              ('status-transport', 'StatusTransportTests', '', 'winmm.dll'),
+              ('scoped-import', 'ScopedImportTests', '', 'winmm.dll'),
               ('policy', 'NvidiaPolicyTests', '', 'winmm.dll'),
               ('dynamic-availability', 'DynamicAvailabilityTests', '', 'winmm.dll'),
               ('first-launch', 'WarpPresentHarness', 'first-launch-menu', 'winmm.dll'),
               ('startup-menu', 'WarpPresentHarness', 'startup-menu', 'winmm.dll'),
+              ('unaligned-menu', 'WarpPresentHarness', 'unaligned-menu', 'winmm.dll'),
+              ('rwx-unaligned-menu', 'WarpPresentHarness', 'rwx-unaligned-menu', 'winmm.dll'),
+              ('hdr-startup-menu', 'WarpPresentHarness', 'hdr-startup-menu', 'winmm.dll'),
+              ('hdr-unsupported-menu', 'WarpPresentHarness', 'hdr-unsupported-menu', 'winmm.dll'),
               ('layered-menu', 'WarpPresentHarness', 'layered-slinit-menu', 'winmm.dll')]
+    cases += [(name, 'EngineFactoryTests', name, 'winmm.dll') for name in
+              ('engine-direct', 'engine-dynamic', 'engine-late', 'engine-middleware', 'engine-external', 'engine-conflict')]
+    cases += [('engine-menu', 'WarpPresentHarness', 'engine-menu', 'winmm.dll')]
+    cases += [('small-stack-resolver', 'SmallStackResolverTests', 'small-stack', 'winmm.dll')]
+    cases += [('log-retention', 'LogRetentionTests', 'retention', 'winmm.dll')]
+    cases += [('interval-retention', 'LogRetentionTests', 'interval-retention', 'winmm.dll')]
     cases += [(name, executable, 'vulkan', 'winmm.dll') for name, executable in (
         ('vulkan-direct', 'VulkanMenuTests'), ('vulkan-dynamic', 'VulkanDynamicMenuTests'),
         ('vulkan-streamline', 'VulkanStreamlineMenuTests'), ('vulkan-mixed', 'VulkanMixedMenuTests'))]
@@ -53,8 +78,11 @@ def main():
     for name, executable, mode, proxy in cases:
         destination = Path(tempfile.mkdtemp(prefix=name+'-', dir=output))
         for filename in (executable+'.exe', 'sl.interposer.dll',
-                         'ControlWrapperFixture.dll', 'ExistingOverlayFixture.dll'):
+                         'ControlWrapperFixture.dll', 'ExistingOverlayFixture.dll', 'ScopedCallerFixture.dll', 'EngineFactoryFixture.dll'):
             shutil.copy2(harness/filename, destination/filename)
+        for filename in ('LateEngineFixture.dll', 'sl.enginefixture.dll'):
+            shutil.copy2(harness/'EngineFactoryFixture.dll', destination/filename)
+        shutil.copy2(harness/'EngineFactoryFixture.dll', output/'ExternalEngineFixture.dll')
         candidate = destination/proxy
         shutil.copy2(dll, candidate)
         if name != 'first-launch':
@@ -84,7 +112,7 @@ def main():
                     process.wait()
                     code = -1
             text = (destination/(label+'.stdout.txt')).read_text(encoding='utf-8', errors='replace')
-            logfile = Path(tempfile.gettempdir())/f'RTXMFG-{process.pid}.log'
+            logfile = runtime_log(Path(command[0]))
             if logfile.is_file():
                 shutil.copy2(logfile, destination/(label+'.runtime.log'))
             row = dict(name=label, pid=process.pid, exit=code,

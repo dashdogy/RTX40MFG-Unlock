@@ -281,7 +281,16 @@ public:
     HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F *pMatrix) override { Lease lease(this); return interfaces.As<IDXGISwapChain2>(2)->GetMatrixTransform(pMatrix); }
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { Lease lease(this); return interfaces.As<IDXGISwapChain3>(3)->GetCurrentBackBufferIndex(); }
     HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT *pColorSpaceSupport) override { Lease lease(this); return interfaces.As<IDXGISwapChain3>(3)->CheckColorSpaceSupport(ColorSpace,pColorSpaceSupport); }
-    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void *pMetaData) override { Lease lease(this); return interfaces.As<IDXGISwapChain4>(4)->SetHDRMetaData(Type,Size,pMetaData); }
+    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void *pMetaData) override {
+        Lease lease(this);
+        // GTA may call this method on the creation-return pointer before it
+        // requests revision 4 from our proxy. Acquire that public interface on
+        // first use, retaining the exact owning layer and normal cache lifetime.
+        // Never assume a revision-3 pointer provides revision-4 methods.
+        if (!interfaces.Acquire(4,chainIids[4],chainLast[4])) return E_NOINTERFACE;
+        auto* target=interfaces.As<IDXGISwapChain4>(4);
+        return target?target->SetHDRMetaData(Type,Size,pMetaData):E_NOINTERFACE;
+    }
 };
 
 void WrapSwapchain(IDXGISwapChain** output,IUnknown* queue,IDXGIFactory* parent) noexcept {

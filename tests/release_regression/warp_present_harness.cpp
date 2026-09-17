@@ -5,11 +5,15 @@
 //             (build B)
 #include "common.h"
 #include "existing_overlay.h"
+#include "unaligned_import_fixture.h"
+#include <fstream>
+#include <atomic>
 #include <dwmapi.h>
 #include <cmath>
 #include <mutex>
 #include <thread>
 #include <sl.h>
+extern "C" __declspec(dllimport) HRESULT WINAPI EngineCreateFactory(unsigned,REFIID,void**);
 
 namespace
 {
@@ -241,8 +245,22 @@ bool RenderReadPresent(WarpFixture& fixture, Chain& chain, float color[4], float
 }
 
 
-int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false)
+int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool engineFactory=false)
 {
+    HMODULE foreign=nullptr;
+    using ForeignLookup=FARPROC(WINAPI*)(HMODULE,LPCSTR);
+    using ForeignClip=BOOL(WINAPI*)(const RECT*);
+    ForeignLookup foreignLookup=nullptr;
+    ForeignClip foreignClip=nullptr;
+    FARPROC originalFactory=nullptr;
+    if(unaligned){
+        foreign=LoadLibraryW(L"ScopedCallerFixture.dll");
+        foreignLookup=foreign?reinterpret_cast<ForeignLookup>(GetProcAddress(foreign,"ForeignLookup")):nullptr;
+        foreignClip=foreign?reinterpret_cast<ForeignClip>(GetProcAddress(foreign,"ForeignClip")):nullptr;
+        originalFactory=GetProcAddress(SystemModule(L"dxgi.dll"),"CreateDXGIFactory1");
+        if(!Check(foreignLookup&&foreignClip&&originalFactory,"foreign-caller fixture and original factory captured"))return 1;
+        if(!Check(unaligned_fixture::Prepare(),"GTA-shaped unaligned KERNEL32 and USER32 import tables prepared"))return 1;
+    }
     // ---------------------------------------------------------------- setup
     // Enable validation before any candidate/fixture device can be retained.
     // Turning it on after slInit's probe would invalidate an existing device.
@@ -255,11 +273,37 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     if (coexist && !Check(existing.Load(), "pre-existing overlay installed on native exports and methods")) return 1;
     if(wrapped){
         const auto set=reinterpret_cast<void(WINAPI*)(unsigned)>(GetProcAddress(existing.module,"OverlayFixtureWrapper"));
-        if(!Check(set!=nullptr,"outer COM fixture available"))return 1;set(reshadeWrapped?5:layered?4:1);
+        if(!Check(set!=nullptr,"outer COM fixture available"))return 1;set(hdrStartup==2?6:reshadeWrapped?5:layered?4:1);
     }
     HMODULE module = raceStartup ? LoadCandidate(dll) : nullptr;
     HMODULE interposer=nullptr;
+    ComPtr<IDXGIFactory2> engineCreated;
+    if(engineFactory){
+        if(!Check(SUCCEEDED(EngineCreateFactory(1,IID_PPV_ARGS(&engineCreated)))
+            && Status(module).factoryWrappersCreated==1 && Status(module).overlayInstallState==2,
+            "renderer DLL factory activates UI before any executable factory call"))return 1;
+    }
     if (raceStartup && !Check(module != nullptr, "candidate loaded before the first factory/device")) return 1;
+    if(unaligned){
+        const auto status=std::filesystem::current_path()/L"RTXMFG-Universal.status.json";
+        bool ready=false;
+        for(unsigned i=0;i<320&&!ready;++i){
+            std::ifstream input(status);const std::string text{std::istreambuf_iterator<char>(input),{}};
+            ready=text.find("\"mainResolverDiscoveryInstalled\":true")!=std::string::npos;
+            if(!ready)Sleep(25);
+        }
+        if(!Check(ready,"unaligned main resolver becomes ready without rewriting its IAT"))return 1;
+        if(executableInputPages&&!Check(unaligned_fixture::MakeInputPagesExecutable(),"input import pages become executable after resolver startup as in GTA"))return 1;
+        Check(unaligned_fixture::Unchanged(),"unaligned resolver import bytes preserved");
+        Check(foreignLookup(SystemModule(L"dxgi.dll"),"CreateDXGIFactory1")==originalFactory,"foreign DLL resolver caller remains transparent");
+        std::atomic<bool> correct{true};
+        auto kernel=GetModuleHandleW(L"kernel32.dll");
+        const auto tick=foreignLookup(kernel,"GetTickCount64");
+        std::vector<std::thread> workers;
+        for(unsigned t=0;t<4;++t)workers.emplace_back([&]{for(unsigned n=0;n<1000;++n)if(GetProcAddress(kernel,"GetTickCount64")!=tick)correct.store(false);});
+        for(auto& worker:workers)worker.join();
+        Check(correct.load(),"concurrent unrelated resolver calls preserve native results");
+    }
     if(streamlineStartup){
         wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
         const auto path=std::filesystem::path(exe).parent_path()/L"sl.interposer.dll";
@@ -334,7 +378,8 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         using Factory=HRESULT(WINAPI*)(REFIID,void**);
         auto create=reinterpret_cast<Factory>(GetProcAddress(interposer,"CreateDXGIFactory1"));
         Check(create&&SUCCEEDED(create(IID_PPV_ARGS(&fixture.factory))),"Streamline exported factory gateway returns owned proxy");
-    }else Check(SUCCEEDED(applicationFactory.As(&fixture.factory)),"use intercepted application factory");
+    }else if(engineFactory){fixture.factory=engineCreated;engineCreated.Reset();}
+    else Check(SUCCEEDED(applicationFactory.As(&fixture.factory)),"use intercepted application factory");
     Chain chain;
     if (coexist) {
         Check(existing.intact(), "candidate preserved every existing overlay code patch");
@@ -345,6 +390,24 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
             menuMode ? "flip-sequential swapchain created (menu content validation)"
                      : "flip-model swapchain created"))
         return 1;
+
+    if(hdrStartup){
+        // GTA calls the public revision-4 method on its creation-return pointer
+        // before requesting revision 4 through the proxy's QueryInterface.
+        // Exercise that exact ordering before any Present can initialize UI.
+        auto* direct=static_cast<IDXGISwapChain4*>(chain.swapchain.Get());
+        const HRESULT directResult=direct->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE,0,nullptr);
+        ComPtr<IDXGISwapChain4> requested;
+        const HRESULT queried=chain.swapchain.As(&requested);
+        if(hdrStartup==2){
+            Check(directResult==E_NOINTERFACE,"uncached unsupported HDR method fails closed without dereferencing null");
+            Check(queried==E_NOINTERFACE&&!requested,"unsupported revision 4 remains unadvertised");
+        }else{
+            Check(directResult==S_OK,"uncached startup HDR clear forwards before the first Present");
+            Check(queried==S_OK&&requested,"explicit revision 4 lookup remains supported after first-use acquisition");
+            if(requested)Check(requested->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE,0,nullptr)==directResult,"cached HDR forwarding preserves the native result");
+        }
+    }
 
     if (raceStartup)
     {
@@ -614,6 +677,14 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         std::printf("NOTE input forwarding GetAsyncKeyState=%d GetKeyState=%d\n",
             static_cast<int>(async), static_cast<int>(state));
         Check(async==0&&state==0,"input exports suppress game keys while menu is open");
+        if(unaligned){
+            RECT testClip{30,30,230,230}, observed{};
+            const BOOL foreignResult=foreignClip(&testClip);
+            const BOOL observedResult=GetClipCursor(&observed);
+            foreignClip(nullptr);
+            Check(foreignResult&&observedResult&&EqualRect(&testClip,&observed),"foreign DLL cursor calls bypass game-only input suppression");
+            Check(unaligned_fixture::Unchanged(),"unaligned input import bytes preserved during menu rendering");
+        }
         unsigned keysBefore=receivedKeys;
         SendMessageW(window.window,WM_KEYDOWN,'A',0x001E0001);
         Check(receivedKeys==keysBefore,"open menu captures keyboard message before game WndProc");
@@ -736,7 +807,12 @@ int wmain(int argc, wchar_t** argv)
     if (mode == L"coexist-present") return RunPresentation(dll, false, 10,true,true);
     if (mode == L"wrapped-slinit-forward") return RunPresentation(dll,false,10,true,true,false,true,true);
     if (mode == L"menu") return RunPresentation(dll, true, 18);
+    if (mode == L"unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true);
+    if (mode == L"rwx-unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true);
+    if (mode == L"hdr-startup-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,1);
+    if (mode == L"hdr-unsupported-menu") return RunPresentation(dll,true,18,true,true,false,false,true,false,false,false,false,false,2);
     if (mode == L"startup-menu") return RunPresentation(dll, true, 18, true);
+    if (mode == L"engine-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,0,true);
     if (mode == L"first-launch-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,true);
     if (mode == L"coexist-menu") return RunPresentation(dll, true, 18, true, true);
     if (mode == L"dynamic-coexist-menu") return RunPresentation(dll,true,18,true,true,true);

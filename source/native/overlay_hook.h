@@ -63,6 +63,17 @@ struct HookFamily
         return false;
     }
 
+    static bool PublishForwarderOriginal(void* target, void* trampoline) noexcept
+    {
+        if (!target || !trampoline) return false;
+        std::lock_guard lock(mutex);
+        for (auto& slot : slots) if (slot.target == target) {
+            slot.original.store(reinterpret_cast<Fn>(trampoline), std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
+
     static Fn Bind(void* target, bool install) noexcept
     {
         if (!target) return nullptr;
