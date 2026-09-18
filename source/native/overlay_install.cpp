@@ -30,7 +30,7 @@ void RequestInstall() noexcept {
 void FactoryReady() noexcept {
     const auto previous=state.exchange(State::Active,std::memory_order_acq_rel);
     if (previous!=State::Active)
-        single_module::Log(L"MFG_PROXY_UI state=active boundary=real-factory-return nativeTableWrites=0 factoryEntryPatches=0");
+        single_module::Log(L"MFG_PROXY_UI state=active boundary=real-factory-return nativeTableWrites=0");
 }
 void VulkanReady() noexcept {
     const auto previous=state.exchange(State::Active,std::memory_order_acq_rel);

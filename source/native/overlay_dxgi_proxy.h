@@ -4,7 +4,9 @@
 namespace single_overlay::proxy {
 using FactoryFn=HRESULT (WINAPI*)(REFIID,void**);
 using Factory2Fn=HRESULT (WINAPI*)(UINT,REFIID,void**);
+using ParentFn=HRESULT (STDMETHODCALLTYPE*)(IDXGIObject*,REFIID,void**);
 HRESULT FactoryCall(FactoryFn,REFIID,void**) noexcept;
 HRESULT FactoryCall(Factory2Fn,UINT,REFIID,void**) noexcept;
+HRESULT ParentFactoryCall(ParentFn,IDXGIObject*,REFIID,void**) noexcept;
 void ReadStatus(MfgSingleModuleStatus&) noexcept;
 }

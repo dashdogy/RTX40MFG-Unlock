@@ -353,4 +353,10 @@ void ReadStatus(MfgSingleModuleStatus& status) noexcept {
     status.liveSwapchainWrappers=liveChains.load();
     status.internalFactoryCallsSkipped=skipped.load();
 }
+HRESULT ParentFactoryCall(ParentFn original,IDXGIObject* object,REFIID iid,void** output) noexcept {
+    Creation creation;
+    const HRESULT hr=original(object,iid,output);
+    if (SUCCEEDED(hr)&&creation.outer) WrapFactory(iid,output);
+    return hr;
+}
 }

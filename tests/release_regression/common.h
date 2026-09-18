@@ -122,7 +122,7 @@ struct WarpFixture
     UINT64 fenceValue = 0;
     bool debugLayer = false;
 
-    bool Initialize(bool requestDebugLayer)
+    bool Initialize(bool requestDebugLayer,IDXGIAdapter* selectedAdapter=nullptr,HMODULE deviceModule=nullptr)
     {
         if (requestDebugLayer)
         {
@@ -141,11 +141,13 @@ struct WarpFixture
         }
         ComPtr<IDXGIFactory4> factory4;
         ComPtr<IDXGIAdapter> warp;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4)))
-            || FAILED(factory4->EnumWarpAdapter(IID_PPV_ARGS(&warp))))
-            return false;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4)))) return false;
+        if(selectedAdapter)warp=selectedAdapter;
+        else if(FAILED(factory4->EnumWarpAdapter(IID_PPV_ARGS(&warp))))return false;
         if (FAILED(factory4.As(&factory))) return false;
-        if (FAILED(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+        using CreateDevice=HRESULT(WINAPI*)(IUnknown*,D3D_FEATURE_LEVEL,REFIID,void**);
+        const auto create=selectedAdapter?reinterpret_cast<CreateDevice>(GetProcAddress(deviceModule?deviceModule:SystemModule(L"d3d12.dll"),"D3D12CreateDevice")):&D3D12CreateDevice;
+        if (!create||FAILED(create(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
             return false;
         if (debugLayer)
         {

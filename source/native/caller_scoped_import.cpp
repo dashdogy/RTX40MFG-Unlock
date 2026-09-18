@@ -18,12 +18,14 @@ struct Entry {
     bool installed = false;
     std::array<unsigned char,5> published{};
 };
-std::array<Entry, 6> entries; // GetProcAddress and the five existing input APIs.
+std::array<Entry, 9> entries; // Resolver, five input APIs, three DXGI factories.
 std::mutex mutex;
 
 const wchar_t* OwnerName(const char* name) noexcept {
     if (!name) return nullptr;
     if (!strcmp(name,"GetProcAddress")) return L"kernel32.dll";
+    for (const char* factory : {"CreateDXGIFactory","CreateDXGIFactory1","CreateDXGIFactory2"})
+        if (!strcmp(name,factory)) return L"dxgi.dll";
     for (const char* input : {"GetAsyncKeyState","GetKeyState","GetKeyboardState","SetCursorPos","ClipCursor"})
         if (!strcmp(name,input)) return L"user32.dll";
     return nullptr;
@@ -154,7 +156,9 @@ bool Eligible(HMODULE importer, void** slot, void* expected, const char* name) n
         || (memory.Protect&(PAGE_GUARD|PAGE_NOACCESS))
         || memory.RegionSize<sizeof(void*)
         || address-reinterpret_cast<uintptr_t>(memory.BaseAddress)>memory.RegionSize-sizeof(void*)) return false;
-    if ((memory.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))
+    const auto* ownerName=OwnerName(name);
+    const bool factory=ownerName && !wcscmp(ownerName,L"dxgi.dll");
+    if ((factory || (memory.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)))
         && !DeclaredDataImport(importer,slot,name,end-begin)) return false;
     void* current=nullptr;
     memcpy(&current,slot,sizeof(current));

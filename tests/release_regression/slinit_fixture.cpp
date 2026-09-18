@@ -2,6 +2,7 @@
 #include <sl_core_types.h>
 #include <atomic>
 #include <dxgi1_6.h>
+#include <d3d12.h>
 #include <sl_dlss_g.h>
 static std::atomic<unsigned> calls{0};
 static bool cacheVulkan = false;
@@ -54,3 +55,13 @@ extern "C" __declspec(dllexport) HRESULT WINAPI FixtureFactory2(UINT flags,REFII
     using Fn=HRESULT(WINAPI*)(UINT,REFIID,void**);static auto fn=reinterpret_cast<Fn>(GetProcAddress(Dxgi(),"CreateDXGIFactory2"));return fn(flags,iid,out);
 }
 extern "C" __declspec(dllexport) HRESULT WINAPI FixtureFactory(REFIID iid,void** out){return FixtureFactory1(iid,out);}
+static std::atomic<unsigned> deviceCalls{0};
+static IUnknown* deviceAdapter=nullptr;
+extern "C" __declspec(dllexport) unsigned WINAPI FixtureDeviceCalls(){return deviceCalls.load();}
+extern "C" __declspec(dllexport) IUnknown* WINAPI FixtureDeviceAdapter(){return deviceAdapter;}
+extern "C" __declspec(dllexport) HRESULT WINAPI FixtureCreateDevice(IUnknown* adapter,D3D_FEATURE_LEVEL level,REFIID iid,void** out){
+    wchar_t path[MAX_PATH]{};GetSystemDirectoryW(path,MAX_PATH);wcscat_s(path,L"\\d3d12.dll");
+    using Fn=HRESULT(WINAPI*)(IUnknown*,D3D_FEATURE_LEVEL,REFIID,void**);
+    static auto fn=reinterpret_cast<Fn>(GetProcAddress(LoadLibraryW(path),"D3D12CreateDevice"));
+    ++deviceCalls;deviceAdapter=adapter;return fn(adapter,level,iid,out);
+}

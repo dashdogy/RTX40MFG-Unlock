@@ -44,11 +44,18 @@ def main():
     cases = [(f'default-{mode}', 'StartupDefaultsTests', mode, 'winmm.dll')
              for mode in ('clean', 'legacy', 'fixed', 'dynamic', 'follow', 'environment')]
     cases += [('loader-version', 'ReleaseLoadCheck', 'loader', 'version.dll'),
+              ('adapter-parent-menu','WarpPresentHarness','adapter-parent-menu','winmm.dll'),
+              ('adapter-parent-coexist-menu','WarpPresentHarness','adapter-parent-coexist-menu','winmm.dll'),
+              ('adapter-parent-unaligned-menu','WarpPresentHarness','adapter-parent-unaligned-menu','winmm.dll'),
               ('loader-winmm', 'ReleaseLoadCheck', 'loader', 'winmm.dll'),
               ('control', 'ControlResolverTests', 'control', 'winmm.dll'),
               ('control-locked', 'ControlResolverTests', 'control-locked', 'winmm.dll'),
               ('status-transport', 'StatusTransportTests', '', 'winmm.dll'),
               ('scoped-import', 'ScopedImportTests', '', 'winmm.dll'),
+              ('scoped-factory', 'ScopedFactoryTests', '', 'winmm.dll'),
+              ('unaligned-graphics-menu', 'WarpPresentHarness', 'unaligned-graphics-menu', 'winmm.dll'),
+              ('rwx-unaligned-graphics-menu', 'WarpPresentHarness', 'rwx-unaligned-graphics-menu', 'winmm.dll'),
+              ('unaligned-graphics-coexist-menu', 'WarpPresentHarness', 'unaligned-graphics-coexist-menu', 'winmm.dll'),
               ('policy', 'NvidiaPolicyTests', '', 'winmm.dll'),
               ('dynamic-availability', 'DynamicAvailabilityTests', '', 'winmm.dll'),
               ('first-launch', 'WarpPresentHarness', 'first-launch-menu', 'winmm.dll'),

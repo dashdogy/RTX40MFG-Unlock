@@ -245,7 +245,7 @@ bool RenderReadPresent(WarpFixture& fixture, Chain& chain, float color[4], float
 }
 
 
-int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool engineFactory=false)
+int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool engineFactory=false,bool unalignedGraphics=false,bool adapterParent=false)
 {
     HMODULE foreign=nullptr;
     using ForeignLookup=FARPROC(WINAPI*)(HMODULE,LPCSTR);
@@ -259,7 +259,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         foreignClip=foreign?reinterpret_cast<ForeignClip>(GetProcAddress(foreign,"ForeignClip")):nullptr;
         originalFactory=GetProcAddress(SystemModule(L"dxgi.dll"),"CreateDXGIFactory1");
         if(!Check(foreignLookup&&foreignClip&&originalFactory,"foreign-caller fixture and original factory captured"))return 1;
-        if(!Check(unaligned_fixture::Prepare(),"GTA-shaped unaligned KERNEL32 and USER32 import tables prepared"))return 1;
+        if(!Check(unaligned_fixture::Prepare(unalignedGraphics),"unaligned application import tables prepared"))return 1;
     }
     // ---------------------------------------------------------------- setup
     // Enable validation before any candidate/fixture device can be retained.
@@ -275,8 +275,38 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         const auto set=reinterpret_cast<void(WINAPI*)(unsigned)>(GetProcAddress(existing.module,"OverlayFixtureWrapper"));
         if(!Check(set!=nullptr,"outer COM fixture available"))return 1;set(hdrStartup==2?6:reshadeWrapped?5:layered?4:1);
     }
+    auto overlayIntact=existing.intact;
+    if(coexist&&unalignedGraphics){
+        overlayIntact=reinterpret_cast<ExistingOverlay::Install>(GetProcAddress(existing.module,"OverlayFixtureMethodCodeIntact"));
+        if(!Check(overlayIntact!=nullptr,"method-hook preservation probe available for chained public entries"))return 1;
+    }
+    if(unalignedGraphics&&executableInputPages)
+        if(!Check(unaligned_fixture::MakeGraphicsPagesExecutable(),"MSFS-shaped executable graphics import page prepared"))return 1;
+    ComPtr<IDXGIAdapter> selectedAdapter;
+    std::array<void*,12> adapterTable{};
+    using Parent=HRESULT(WINAPI*)(IDXGIObject*,REFIID,void**);
+    Parent cachedParent=nullptr,foreignParent=nullptr;
+    unsigned(WINAPI* parentOverlayCalls)()=nullptr;
+    if(adapterParent){
+        // MSFS selects its native adapter before slInit, then gets the factory
+        // from that adapter after D3D12CreateDevice. Retain that exact ordering.
+        ComPtr<IDXGIFactory4> earlyFactory;
+        if(!Check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&earlyFactory)))
+            &&SUCCEEDED(earlyFactory->EnumWarpAdapter(IID_PPV_ARGS(&selectedAdapter))),"native adapter selected before candidate startup"))return 1;
+        memcpy(adapterTable.data(),*reinterpret_cast<void***>(selectedAdapter.Get()),sizeof(adapterTable));
+        cachedParent=reinterpret_cast<Parent>(adapterTable[6]);
+        if(!foreign)foreign=LoadLibraryW(L"ScopedCallerFixture.dll");
+        foreignParent=reinterpret_cast<Parent>(GetProcAddress(foreign,"ForeignParent"));
+        if(!Check(foreignParent!=nullptr,"foreign adapter-parent fixture available"))return 1;
+        if(coexist){
+            const auto install=reinterpret_cast<BOOL(WINAPI*)(IDXGIObject*)>(GetProcAddress(foreign,"InstallParentOverlay"));
+            parentOverlayCalls=reinterpret_cast<unsigned(WINAPI*)()>(GetProcAddress(foreign,"ParentOverlayCalls"));
+            if(!Check(install&&parentOverlayCalls&&install(selectedAdapter.Get()),"pre-existing adapter-parent overlay installed"))return 1;
+        }
+    }
     HMODULE module = raceStartup ? LoadCandidate(dll) : nullptr;
     HMODULE interposer=nullptr;
+    HMODULE deviceModule=nullptr;
     ComPtr<IDXGIFactory2> engineCreated;
     if(engineFactory){
         if(!Check(SUCCEEDED(EngineCreateFactory(1,IID_PPV_ARGS(&engineCreated)))
@@ -284,7 +314,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
             "renderer DLL factory activates UI before any executable factory call"))return 1;
     }
     if (raceStartup && !Check(module != nullptr, "candidate loaded before the first factory/device")) return 1;
-    if(unaligned){
+    if(unaligned&&!unalignedGraphics){
         const auto status=std::filesystem::current_path()/L"RTXMFG-Universal.status.json";
         bool ready=false;
         for(unsigned i=0;i<320&&!ready;++i){
@@ -308,7 +338,8 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
         const auto path=std::filesystem::path(exe).parent_path()/L"sl.interposer.dll";
         HMODULE stub=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        if(!Check(stub!=nullptr,"local Streamline ABI fixture loaded"))return 1; interposer=stub;
+        if(!Check(stub!=nullptr,"local Streamline ABI fixture loaded"))return 1; if(!unalignedGraphics)interposer=stub;
+        if(adapterParent)deviceModule=stub;
         using Init=sl::Result(*)(const sl::Preferences&,uint64_t);
         const auto init=reinterpret_cast<Init>(GetProcAddress(stub,"slInit"));
         Check(init&&Status(module).overlayInstallState==1,"slInit lookup does no graphics work");
@@ -316,8 +347,29 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         const auto result=init?init(prefs,sl::kSDKVersion):sl::Result::eErrorNotInitialized;
         auto calls=reinterpret_cast<unsigned(WINAPI*)()>(GetProcAddress(stub,"FixtureInitCalls"));
         Check(result==sl::Result::eOk&&calls&&calls()==1&&prefs.flags==flags,"slInit result, single original call and caller preferences preserved");
-        if(!Check(Status(module).factoryWrappersCreated==0&&Status(module).swapchainWrappersCreated==0&&existing.count(4)==0,"slInit creates no graphics objects or swapchain hooks"))return 1;
-        Check(existing.intact(),"slInit startup preserved pre-existing overlay code");
+        if(!Check(Status(module).factoryWrappersCreated==0&&Status(module).swapchainWrappersCreated==0&&(!coexist||existing.count(4)==0),"slInit creates no graphics objects or swapchain hooks"))return 1;
+        if(coexist)Check(overlayIntact(),"slInit startup preserved pre-existing overlay method hooks");
+    }
+    if(unalignedGraphics){
+        using ForeignFactory=HRESULT(WINAPI*)(unsigned,UINT,REFIID,void**);
+        auto foreignFactory=reinterpret_cast<ForeignFactory>(foreignLookup(foreign,"ForeignFactory"));
+        if(!Check(foreignFactory!=nullptr,"foreign middleware factory fixture available"))return 1;
+        for(unsigned api=0;api<3;++api){
+            const auto before=Status(module);
+            ComPtr<IDXGIFactory> object;
+            if(!Check(SUCCEEDED(foreignFactory(api,0,IID_PPV_ARGS(&object)))&&object
+                &&Status(module).factoryGatewayCalls==before.factoryGatewayCalls,
+                "foreign factory call bypasses the application-only gateway"))return 1;
+            object.Reset();
+            const auto prior=coexist?existing.count(api):0;
+            const auto hr=api==0?CreateDXGIFactory(IID_PPV_ARGS(&object)):
+                api==1?CreateDXGIFactory1(IID_PPV_ARGS(&object)):CreateDXGIFactory2(0,IID_PPV_ARGS(&object));
+            if(!Check(SUCCEEDED(hr)&&object&&Status(module).factoryWrappersCreated==before.factoryWrappersCreated+1,
+                "direct unaligned graphics import returns a proxy before startup continues"))return 1;
+            if(coexist)Check(existing.count(api)==prior+1,"pre-existing public factory hook is forwarded exactly once");
+        }
+        Check(unaligned_fixture::Unchanged(),"direct graphics startup preserves unaligned IAT bytes and protection");
+        if(executableInputPages)Check(unaligned_fixture::MakeInputPagesExecutable(),"input pages become executable before first swapchain");
     }
     if(dynamicFactory){
         using Factory=HRESULT(WINAPI*)(REFIID,void**);
@@ -327,11 +379,16 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         if(!Check(factory&&SUCCEEDED(factory(IID_PPV_ARGS(&created)))&&Status(module).overlayInstallState==2,"dynamic factory gateway completes startup before returning to game"))return 1;
     }
     WarpFixture fixture;
-    if (!Check(fixture.Initialize(true), "WARP device, queue and factory created"
+    if (!Check(fixture.Initialize(true,selectedAdapter.Get(),deviceModule), "WARP device, queue and factory created"
             " (debug layer when available)"))
         return 1;
     if (!fixture.debugLayer)
         std::printf("NOTE D3D12 debug layer unavailable on this machine; validation reduced\n");
+    if(deviceModule){
+        const auto count=reinterpret_cast<unsigned(WINAPI*)()>(GetProcAddress(deviceModule,"FixtureDeviceCalls"));
+        const auto adapter=reinterpret_cast<IUnknown*(WINAPI*)()>(GetProcAddress(deviceModule,"FixtureDeviceAdapter"));
+        Check(count&&adapter&&count()==1&&adapter()==selectedAdapter.Get(),"interposer device creation receives original adapter exactly once");
+    }
 
     RestoreForeground previousForeground;
     TestWindow window(L"BoundedWarp", 640, 480,GameWindowProc);
@@ -374,7 +431,23 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     }
     // Use a real post-load factory. The old harness accidentally retained a
     // pre-install factory; shared-table changes masked that coverage error.
-    if(interposer){
+    if(adapterParent){
+        const auto before=Status(module).factoryWrappersCreated;
+        ComPtr<IDXGIFactory2> foreignFactory;
+        if(!Check(SUCCEEDED(foreignParent(selectedAdapter.Get(),IID_PPV_ARGS(&foreignFactory)))
+            &&Status(module).factoryWrappersCreated==before,"foreign GetParent caller retains native behavior"))return 1;
+        const GUID invalid={0x11223344,0x5566,0x7788,{1,2,3,4,5,6,7,8}};
+        void* foreignOutput=nullptr;void* ownOutput=nullptr;
+        const auto foreignResult=foreignParent(selectedAdapter.Get(),invalid,&foreignOutput);
+        const auto ownResult=cachedParent(selectedAdapter.Get(),invalid,&ownOutput);
+        Check(foreignResult==ownResult&&!foreignOutput&&!ownOutput&&Status(module).factoryWrappersCreated==before,"unsupported parent IID preserves native HRESULT and output");
+        const auto prior=parentOverlayCalls?parentOverlayCalls():0;
+        fixture.factory.Reset();
+        if(!Check(SUCCEEDED(cachedParent(selectedAdapter.Get(),IID_PPV_ARGS(&fixture.factory)))
+            &&Status(module).factoryWrappersCreated==before+1,"cached native adapter GetParent returns the overlay factory"))return 1;
+        if(parentOverlayCalls)Check(parentOverlayCalls()==prior+1,"existing parent hook forwarded exactly once");
+        Check(!memcmp(adapterTable.data(),*reinterpret_cast<void***>(selectedAdapter.Get()),sizeof(adapterTable)),"native adapter pointer and vtable entries preserved");
+    }else if(interposer){
         using Factory=HRESULT(WINAPI*)(REFIID,void**);
         auto create=reinterpret_cast<Factory>(GetProcAddress(interposer,"CreateDXGIFactory1"));
         Check(create&&SUCCEEDED(create(IID_PPV_ARGS(&fixture.factory))),"Streamline exported factory gateway returns owned proxy");
@@ -382,7 +455,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     else Check(SUCCEEDED(applicationFactory.As(&fixture.factory)),"use intercepted application factory");
     Chain chain;
     if (coexist) {
-        Check(existing.intact(), "candidate preserved every existing overlay code patch");
+        Check(overlayIntact(), unalignedGraphics?"candidate preserves method hooks while chaining public factory entries":"candidate preserved every existing overlay code patch");
         existing.reset();
     }
     if (!Check(chain.Create(fixture, window.window, 640, 480, menuMode ? 2 : 3,
@@ -776,7 +849,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     }
     std::printf("COMPLETE mode=%ls\n", menuMode ? L"menu" : L"present");
     if (coexist) {
-        Check(existing.intact(), "existing overlay code unchanged after menu, resize and teardown");
+        Check(overlayIntact(), unalignedGraphics?"existing overlay method hooks unchanged after menu, resize and teardown":"existing overlay code unchanged after menu, resize and teardown");
         Check(existing.restored(),"all native tables and protections unchanged");
         Check(existing.count(13)==0&&existing.count(14)==0&&existing.count(15)>0,"stateful overlay initializes before nested Release without a missing binding");
         Check(existing.count(4) > 0 && existing.count(7) > 0 && existing.count(8) > 0
@@ -807,6 +880,12 @@ int wmain(int argc, wchar_t** argv)
     if (mode == L"coexist-present") return RunPresentation(dll, false, 10,true,true);
     if (mode == L"wrapped-slinit-forward") return RunPresentation(dll,false,10,true,true,false,true,true);
     if (mode == L"menu") return RunPresentation(dll, true, 18);
+    if (mode == L"adapter-parent-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,0,false,false,true);
+    if (mode == L"adapter-parent-coexist-menu") return RunPresentation(dll,true,18,true,true,false,false,false,false,false,false,false,false,0,false,false,true);
+    if (mode == L"adapter-parent-unaligned-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,false,true,true);
+    if (mode == L"unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,false,true);
+    if (mode == L"rwx-unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,true,0,false,true);
+    if (mode == L"unaligned-graphics-coexist-menu") return RunPresentation(dll,true,18,true,true,false,true,false,false,false,false,true,false,0,false,true);
     if (mode == L"unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true);
     if (mode == L"rwx-unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true);
     if (mode == L"hdr-startup-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,1);

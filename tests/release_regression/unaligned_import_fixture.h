@@ -8,17 +8,26 @@
 // IATs, so the candidate must catch real public-entry calls rather than merely
 // overwriting the synthetic slots. No game file is used or changed.
 namespace unaligned_fixture {
-alignas(16) inline std::array<std::array<unsigned char,32768>,2> storage{};
-inline std::array<size_t,2> sizes{};
-inline std::array<std::array<unsigned char,32768>,2> baseline{};
+alignas(16) inline std::array<std::array<unsigned char,32768>,3> storage{};
+inline std::array<size_t,3> sizes{};
+inline std::array<std::array<unsigned char,32768>,3> baseline{};
 inline DWORD inputProtection = 0;
+inline DWORD graphicsProtection = 0;
+inline size_t tables = 2;
 inline bool MakeInputPagesExecutable() {
     DWORD previous=0;
     if(!sizes[1]||!VirtualProtect(storage[1].data()+4,sizes[1],PAGE_EXECUTE_READWRITE,&previous))return false;
     inputProtection=PAGE_EXECUTE_READWRITE;
     return true;
 }
-inline bool Prepare() {
+inline bool MakeGraphicsPagesExecutable() {
+    DWORD previous=0;
+    if(!sizes[2]||!VirtualProtect(storage[2].data()+4,sizes[2],PAGE_EXECUTE_READWRITE,&previous))return false;
+    graphicsProtection=PAGE_EXECUTE_READWRITE;
+    return true;
+}
+inline bool Prepare(bool graphics=false) {
+    tables=graphics?3:2;
     auto* base=reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
     const auto* dos=reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     const auto* nt=reinterpret_cast<IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
@@ -26,7 +35,7 @@ inline bool Prepare() {
     unsigned found=0;
     for(auto* imp=imports;imp->Name;++imp) {
         const auto* name=reinterpret_cast<char*>(base+imp->Name);
-        const int index=!_stricmp(name,"KERNEL32.dll")?0:!_stricmp(name,"USER32.dll")?1:-1;
+        const int index=!_stricmp(name,"KERNEL32.dll")?0:!_stricmp(name,"USER32.dll")?1:graphics&&!_stricmp(name,"dxgi.dll")?2:-1;
         if(index<0)continue;
         auto* original=reinterpret_cast<uint64_t*>(base+imp->FirstThunk);
         size_t count=0;while(count<4090&&original[count])++count;
@@ -43,13 +52,17 @@ inline bool Prepare() {
         if(reinterpret_cast<uintptr_t>(storage[index].data()+4)%8!=4)return false;
         ++found;
     }
-    return found==2;
+    return found==tables;
 }
 inline bool Unchanged(){
-    for(size_t i=0;i<2;++i)if(!sizes[i]||memcmp(storage[i].data()+4,baseline[i].data(),sizes[i]))return false;
+    for(size_t i=0;i<tables;++i)if(!sizes[i]||memcmp(storage[i].data()+4,baseline[i].data(),sizes[i]))return false;
     if(inputProtection){
         MEMORY_BASIC_INFORMATION memory{};
         if(!VirtualQuery(storage[1].data()+4,&memory,sizeof(memory))||memory.Protect!=inputProtection)return false;
+    }
+    if(graphicsProtection){
+        MEMORY_BASIC_INFORMATION memory{};
+        if(!VirtualQuery(storage[2].data()+4,&memory,sizeof(memory))||memory.Protect!=graphicsProtection)return false;
     }
     return true;
 }

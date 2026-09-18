@@ -125,6 +125,10 @@ extern "C" __declspec(dllexport) BOOL WINAPI OverlayFixtureInstall() {
     chain3.Reset();chain.Reset();DestroyWindow(window);UnregisterClassW(wc.lpszClassName,self);
     return ok;
 }
+extern "C" __declspec(dllexport) BOOL WINAPI OverlayFixtureMethodCodeIntact() {
+    for(unsigned i=3;i<13;++i)if(!targets[i]||memcmp(patched[i],targets[i],16))return FALSE;
+    return TRUE;
+}
 extern "C" __declspec(dllexport) BOOL WINAPI OverlayFixtureCodeIntact() {
     for(unsigned i=0;i<13;++i) if(!targets[i]||memcmp(patched[i],targets[i],16)) return FALSE;
     return TRUE;

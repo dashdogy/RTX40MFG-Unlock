@@ -2,3 +2,4 @@ EXPORTS
 CreateDXGIFactory=FixtureFactory
 CreateDXGIFactory1=FixtureFactory1
 CreateDXGIFactory2=FixtureFactory2
+D3D12CreateDevice=FixtureCreateDevice

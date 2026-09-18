@@ -20,7 +20,7 @@ inline bool Fault(const char* point) noexcept
 #endif
 }
 
-// Aligned application IAT publication. Four-byte-aligned system input imports
+// Aligned application IAT publication. Four-byte-aligned system input/factory imports
 // can use caller-scoped public-entry detours; their IAT and native COM tables
 // remain untouched. All other unsuitable slots continue to fail closed.
 inline bool ImageSlot(HMODULE image, void** slot) noexcept

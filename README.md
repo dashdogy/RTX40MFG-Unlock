@@ -1,4 +1,4 @@
-# Universal RTXMFG — v1.3.3 Hotfix 1
+# Universal RTXMFG — v1.3.3 Hotfix 2
 
 DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
 with experimental RTX 30 support. The backend and menu are combined in one
@@ -14,34 +14,29 @@ Frame Generation pipeline can apply it.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
 
-## Changes in v1.3.3 Hotfix 1
+## Changes in v1.3.3 Hotfix 2
 
-- Restores the GTA V Enhanced menu and its controls, including when the game locks
-  the status file, and fixes HDR swapchain forwarding during startup.
-- Detects renderer DLL imports used by games such as Dying Light 2. In-game
-  validation for Dying Light 2 is still pending.
-- Fixes the small-stack startup overflow identified in Subnautica 2. Regression
-  tests cover 64 KiB and 128 KiB worker threads; an in-game retest is still pending.
-- Reuses one runtime log and one status file per game installation, replacing
-  their contents on the next launch. Existing older PID-named files are left alone.
+- Restores missing menus in MSFS 2024 and GTA V Enhanced, including HDR and
+  locked-status-file handling. The MSFS menu fix is confirmed in-game.
+- Improves renderer detection and fixes the small-stack startup overflow.
+- Reuses one log and one status file per installation, overwritten on launch.
+
+Dying Light 2 and Subnautica 2 in-game retests remain pending.
 
 ## Changes in v1.3.3
 
-**The mod UI has been rebuilt to resolve game crashes caused by the previous UI.**
-
-- Fixed MFG getting stuck at 2x and related freezing, flickering and black screens.
-- Improved Frame Generation detection, multiplier limits and Vulkan menu support.
-- New installs default to **Follow game** and open the menu on first launch.
-- Dynamic now correctly shows **Unavailable** when unsupported.
+- Rebuilt the UI and fixed MFG getting stuck at 2x, freezes and black screens.
+- Improved FG detection, multiplier limits and experimental Vulkan menus.
+- New installs use **Follow game**; unsupported Dynamic modes show **Unavailable**.
 
 ## Install
 
-The v1.3.3-hotfix.1 download contains **`RTXMFG.dll`**. The menu is built in; no separate
+The v1.3.3-hotfix.2 download contains **`RTXMFG.dll`**. The menu is built in; no separate
 ReShade or external loader installation is needed.
 
 1. Close the game. If upgrading from a split release, remove the old mod
    components as described below first.
-2. Download `RTXMFG-v1.3.3-hotfix.1.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+2. Download `RTXMFG-v1.3.3-hotfix.2.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
    and extract it.
 3. Rename `RTXMFG.dll` to **one** supported filename below that the game loads
    early. Place it beside the **actual game executable**, not the launcher.
