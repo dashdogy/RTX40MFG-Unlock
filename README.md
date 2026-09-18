@@ -21,8 +21,6 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 - Improves renderer detection and fixes the small-stack startup overflow.
 - Reuses one log and one status file per installation, overwritten on launch.
 
-Dying Light 2 and Subnautica 2 in-game retests remain pending.
-
 ## Changes in v1.3.3
 
 - Rebuilt the UI and fixed MFG getting stuck at 2x, freezes and black screens.
